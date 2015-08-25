@@ -42,7 +42,7 @@ from swift.common.exceptions import ConnectionTimeout, DiskFileQuarantined, \
     DiskFileDeviceUnavailable, DiskFileExpired, ChunkReadTimeout, \
     ChunkReadError, DiskFileXattrNotSupported
 from swift.obj import ssync_receiver
-from swift.common.http import is_success
+from swift.common.http import is_success, HTTP_MOVED_PERMANENTLY
 from swift.common.base_storage_server import BaseStorageServer
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.request_helpers import get_name_and_placement, \
@@ -52,7 +52,7 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPCreated, \
     HTTPPreconditionFailed, HTTPRequestTimeout, HTTPUnprocessableEntity, \
     HTTPClientDisconnect, HTTPMethodNotAllowed, Request, Response, \
     HTTPInsufficientStorage, HTTPForbidden, HTTPException, HTTPConflict, \
-    HTTPServerError
+    HTTPServerError, HTTPMovedPermanently
 from swift.obj.diskfile import DATAFILE_SYSTEM_META, DiskFileRouter
 
 
@@ -237,6 +237,11 @@ class ObjectController(BaseStorageServer):
                     response.read()
                     if is_success(response.status):
                         return
+                    elif response.status == HTTP_MOVED_PERMANENTLY and \
+                            response.getheader('X-Backend-Pivot-Container'):
+                        # We have received a Permanent Move on a sharded
+                        # container. Which means we need to redirect
+                        return response
                     else:
                         self.logger.error(_(
                             'ERROR Container update failed '
@@ -255,6 +260,44 @@ class ObjectController(BaseStorageServer):
                                     headers_out.get('x-timestamp'))
         self._diskfile_router[policy].pickle_async_update(
             objdevice, account, container, obj, data, timestamp, policy)
+
+    def _container_update(self, op, account, container, obj, headers_out,
+                          objdevice, updates, contpartition, policy):
+
+        try:
+            for conthost, contdevice in updates:
+                redirect = self.async_update(
+                    op, account, container, obj, conthost, contpartition,
+                    contdevice, headers_out, objdevice, policy,
+                    logger_thread_locals=self.logger.thread_locals)
+                if redirect:
+                    raise HTTPMovedPermanently(
+                        headers=dict(redirect.getheaders()))
+        except (HTTPMovedPermanently, HTTPException) as ex:
+            piv_acc = ex.headers.get('X-Backend-Pivot-Account')
+            piv_cont = ex.headers.get('X-Backend-Pivot-Container')
+            if not piv_acc or not piv_cont:
+                # there has been an error so log it and return
+                self.logger.error(_('ERROR Container update failed: %s/%s '
+                                    'possibly sharded but couldn\'t find '
+                                    'determine shard container location.')
+                                  % (account, container))
+                return
+
+            conthosts = [h.strip() for h in
+                         ex.headers.get('X-Container-Host', '').split(',')]
+            contdevices = [d.strip() for d in
+                           ex.headers.get('X-Container-Device', '').split(',')]
+            contpartition = ex.headers.get('X-Container-Partition', '')
+
+            if contpartition:
+                updates = zip(conthosts, contdevices)
+            else:
+                updates = []
+            self._container_update(op, piv_acc, piv_cont, obj, headers_out,
+                                   objdevice, updates, contpartition, policy)
+
+
 
     def container_update(self, op, account, container, obj, request,
                          headers_out, objdevice, policy):
@@ -296,13 +339,10 @@ class ObjectController(BaseStorageServer):
         headers_out['x-trans-id'] = headers_in.get('x-trans-id', '-')
         headers_out['referer'] = request.as_referer()
         headers_out['X-Backend-Storage-Policy-Index'] = int(policy)
-        update_greenthreads = []
-        for conthost, contdevice in updates:
-            gt = spawn(self.async_update, op, account, container, obj,
-                       conthost, contpartition, contdevice, headers_out,
-                       objdevice, policy,
-                       logger_thread_locals=self.logger.thread_locals)
-            update_greenthreads.append(gt)
+
+        gt = spawn(self._container_update, op, account, container, obj,
+                   headers_out, objdevice, updates, contpartition, policy)
+
         # Wait a little bit to see if the container updates are successful.
         # If we immediately return after firing off the greenthread above, then
         # we're more likely to confuse the end-user who does a listing right
@@ -311,8 +351,7 @@ class ObjectController(BaseStorageServer):
         # one slow container server doesn't make the entire request lag.
         try:
             with Timeout(self.container_update_timeout):
-                for gt in update_greenthreads:
-                    gt.wait()
+                gt.wait()
         except Timeout:
             # updates didn't go through, log it and return
             self.logger.debug(

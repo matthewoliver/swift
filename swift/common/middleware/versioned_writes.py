@@ -497,8 +497,7 @@ class VersionedWritesMiddleware(object):
         resp = None
         is_enabled = config_true_value(allow_versioned_writes)
         if req.method in ('PUT', 'DELETE'):
-            container_info = get_container_info(
-                req.environ, self.app)
+            container_info = get_container_info(req.environ, self.app)
         elif req.method == 'COPY' and 'Destination' in req.headers:
             if 'Destination-Account' in req.headers:
                 account_name = req.headers.get('Destination-Account')

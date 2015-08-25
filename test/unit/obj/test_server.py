@@ -4385,9 +4385,6 @@ class TestObjectController(unittest.TestCase):
                      'X-Container-Device': 'sdb1'})
         with mock.patch.object(object_server, 'spawn',
                                local_fake_spawn):
-            with mock.patch.object(self.object_controller,
-                                   'async_update',
-                                   local_fake_async_update):
                 resp = req.get_response(self.object_controller)
         # check the response is completed and successful
         self.assertEqual(resp.status_int, 201)
@@ -4399,7 +4396,10 @@ class TestObjectController(unittest.TestCase):
             greenthreads.append(gt)
         # wait for the greenthreads to finish
         for gt in greenthreads:
-            gt.wait()
+            with mock.patch.object(self.object_controller,
+                                   'async_update',
+                                   local_fake_async_update):
+                gt.wait()
         # check that the calls to async_update have happened
         headers_out = {'X-Size': '0',
                        'X-Content-Type': 'application/burrito',

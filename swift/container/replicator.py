@@ -34,6 +34,11 @@ from swift.common.utils import (Timestamp, hash_path,
                                 storage_directory, majority_size)
 
 
+def other_items_hook(broker):
+    pivot_ranges = broker.get_pivot_ranges()
+    return broker.pivot_nodes_to_items(pivot_ranges)
+
+
 class ContainerReplicator(db_replicator.Replicator):
     server_type = 'container'
     brokerclass = ContainerBroker
@@ -260,6 +265,16 @@ class ContainerReplicator(db_replicator.Replicator):
             self.replicate_reconcilers()
         return rv
 
+    def _in_sync(self, rinfo, info, broker, local_sync):
+        if len(broker.get_pivot_ranges()) > 0:
+            return False
+
+        return super(ContainerReplicator, self)._in_sync(
+            rinfo, info, broker, local_sync)
+
+    def _other_items_hook(self, broker):
+        return other_items_hook(broker)
+
 
 class ContainerReplicatorRpc(db_replicator.ReplicatorRpc):
 
@@ -290,3 +305,6 @@ class ContainerReplicatorRpc(db_replicator.ReplicatorRpc):
                 timestamp=status_changed_at)
             info = broker.get_replication_info()
         return info
+
+    def _other_items_hook(self, broker):
+        return other_items_hook(broker)
