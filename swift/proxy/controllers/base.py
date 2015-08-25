@@ -297,7 +297,8 @@ def get_container_info(env, app, swift_source=None):
     """
     (version, account, container, unused) = \
         split_path(env['PATH_INFO'], 3, 4, True)
-    info = get_info(app, env, account, container, ret_not_found=True,
+    tmp_env = env.copy()
+    info = get_info(app, tmp_env, account, container, ret_not_found=True,
                     swift_source=swift_source)
     if not info:
         info = headers_to_container_info({}, 0)

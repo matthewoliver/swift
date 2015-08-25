@@ -17,16 +17,16 @@ from swift import gettext_ as _
 import time
 
 from six.moves.urllib.parse import unquote
-from swift.common.utils import public, csv_append, Timestamp
+from swift.common.utils import public, csv_append, Timestamp, config_true_value
 from swift.common.constraints import check_metadata
 from swift.common import constraints
 from swift.common.http import HTTP_ACCEPTED, is_success
+from swift.common.request_helpers import get_sys_meta_prefix
 from swift.proxy.controllers.base import Controller, delay_denial, \
     cors_validation, clear_info_cache
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, \
     HTTPNotFound
-
 
 class ContainerController(Controller):
     """WSGI controller for container requests"""
@@ -35,7 +35,7 @@ class ContainerController(Controller):
     # Ensure these are all lowercase
     pass_through_headers = ['x-container-read', 'x-container-write',
                             'x-container-sync-key', 'x-container-sync-to',
-                            'x-versions-location']
+                            'x-versions-location', 'x-container-sharding']
 
     def __init__(self, app, account_name, container_name, **kwargs):
         Controller.__init__(self, app)

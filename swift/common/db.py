@@ -528,13 +528,15 @@ class DatabaseBroker(object):
                 result.append({'remote_id': row[0], 'sync_point': row[1]})
             return result
 
-    def get_max_row(self):
+    def get_max_row(self, table=None):
+        if not table:
+            table = self.db_contains_type
         query = '''
             SELECT SQLITE_SEQUENCE.seq
             FROM SQLITE_SEQUENCE
             WHERE SQLITE_SEQUENCE.name == '%s'
             LIMIT 1
-        ''' % (self.db_contains_type)
+        ''' % (table)
         with self.get() as conn:
             row = conn.execute(query).fetchone()
         return row[0] if row else -1

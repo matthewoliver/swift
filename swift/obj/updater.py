@@ -28,11 +28,12 @@ from swift.common.exceptions import ConnectionTimeout
 from swift.common.ring import Ring
 from swift.common.utils import get_logger, renamer, write_pickle, \
     dump_recon_cache, config_true_value, ismount
+from swift.common.swob import HeaderKeyDict
 from swift.common.daemon import Daemon
 from swift.common.storage_policy import split_policy_string, PolicyError
 from swift.obj.diskfile import get_tmp_dir, ASYNCDIR_BASE
 from swift.common.http import is_success, HTTP_NOT_FOUND, \
-    HTTP_INTERNAL_SERVER_ERROR
+    HTTP_INTERNAL_SERVER_ERROR, HTTP_MOVED_PERMANENTLY
 
 
 class ObjectUpdater(Daemon):
@@ -218,13 +219,14 @@ class ObjectUpdater(Daemon):
         part, nodes = self.get_container_ring().get_nodes(
             update['account'], update['container'])
         obj = '/%s/%s/%s' % \
-              (update['account'], update['container'], update['obj'])
+            (update['account'], update['container'], update['obj'])
         headers_out = update['headers'].copy()
         headers_out['user-agent'] = 'object-updater %s' % os.getpid()
         headers_out.setdefault('X-Backend-Storage-Policy-Index',
                                str(int(policy)))
         events = [spawn(self.object_update,
-                        node, part, update['op'], obj, headers_out)
+                        node, part, update['op'], update['account'],
+                        update['container'], update['obj'], headers_out)
                   for node in nodes if node['id'] not in successes]
         success = True
         new_successes = False
@@ -252,26 +254,51 @@ class ObjectUpdater(Daemon):
                 write_pickle(update, update_path, os.path.join(
                     device, get_tmp_dir(policy)))
 
-    def object_update(self, node, part, op, obj, headers_out):
+    def object_update(self, node, part, op, acct, cont, obj, headers_out):
         """
         Perform the object update to the container
 
         :param node: node dictionary from the container ring
         :param part: partition that holds the container
         :param op: operation performed (ex: 'PUT' or 'DELETE')
+        :param acct: account being updated
+        :param cont: container being updated
         :param obj: object name being updated
         :param headers_out: headers to send with the update
         """
         try:
+            obj_path = '/%s/%s/%s' % (acct, cont, obj)
             with ConnectionTimeout(self.conn_timeout):
                 conn = http_connect(node['ip'], node['port'], node['device'],
-                                    part, op, obj, headers_out)
+                                    part, op, obj_path, headers_out)
             with Timeout(self.node_timeout):
                 resp = conn.getresponse()
                 resp.read()
                 success = (is_success(resp.status) or
                            resp.status == HTTP_NOT_FOUND)
-                return (success, node['id'])
+
+            if resp.status == HTTP_MOVED_PERMANENTLY:
+                rheaders = HeaderKeyDict(resp.getheaders())
+                piv_acc = rheaders.get('X-Backend-Pivot-Account')
+                piv_cont = rheaders.get('X-Backend-Pivot-Container')
+                if not piv_acc or not piv_cont:
+                    # there has been an error so log it and return
+                    self.logger.error(_('ERROR Container update failed: %s '
+                                        'possibly sharded but couldn\'t '
+                                        'find determine shard container '
+                                        'location.') % obj)
+                    return False, node['id']
+                piv_host = rheaders.get('X-Container-Host')
+                piv_node = {
+                    'ip': piv_host.split(':')[0],
+                    'port': int(piv_host.split(':')[1]),
+                    'device': rheaders.get('X-Container-Device'),
+                    'id': node['id']}
+                piv_part = rheaders.get('X-Container-Partition')
+                return self.object_update(piv_node, piv_part, op, piv_acc,
+                                          piv_cont, obj, headers_out)
+
+            return success, node['id']
         except (Exception, Timeout):
             self.logger.exception(_('ERROR with remote server '
                                     '%(ip)s:%(port)s/%(device)s'), node)
