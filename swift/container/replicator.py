@@ -246,6 +246,13 @@ class ContainerReplicator(db_replicator.Replicator):
             self.replicate_reconcilers()
         return rv
 
+    def _in_sync(self, rinfo, info, broker, local_sync):
+        if len(broker.get_pivot_points()) > 0:
+            return False
+
+        return super(ContainerReplicator, self)._in_sync(
+            rinfo, info, broker, local_sync)
+
     def _other_items_hook(self, broker):
         return other_items_hook(broker)
 

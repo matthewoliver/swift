@@ -34,8 +34,8 @@ from swift.common.http import is_success
 from swift.common.constraints import CONTAINER_LISTING_LIMIT, \
     SHARD_CONTAINER_SIZE
 from swift.common.ring.utils import is_local_device
-from swift.common.utils import get_logger, audit_location_generator, \
-    config_true_value, dump_recon_cache, whataremyips, hash_path, \
+from swift.common.utils import get_logger, config_true_value, \
+    dump_recon_cache, whataremyips, hash_path, \
     storage_directory, Timestamp, PivotTree, pivot_to_pivot_container, \
     pivot_container_to_pivot, GreenAsyncPile, ismount
 from swift.common.wsgi import ConfigString
@@ -180,7 +180,7 @@ class ContainerSharder(ContainerReplicator):
         try:
             resp = self.swift.make_request('GET', path, headers,
                                            acceptable_statuses=(2,))
-        except internal_client.UnexpectedResponse as ex:
+        except internal_client.UnexpectedResponse:
             self.logger.error(_("Failed to get pivot points from %s/%s"),
                               account, container)
             return None
@@ -461,7 +461,7 @@ class ContainerSharder(ContainerReplicator):
         return account, container
 
     def _post_replicate_hook(self, broker, info, responses):
-            return
+        return
 
     def delete_db(self, broker):
         """
@@ -585,9 +585,6 @@ class ContainerSharder(ContainerReplicator):
         :param reported:
         """
         self._zero_stats()
-        all_locs = audit_location_generator(self.devices, DATADIR, '.db',
-                                            mount_check=self.mount_check,
-                                            logger=self.logger)
         self.logger.info(_('Starting container sharding pass'))
         dirs = []
         self.shard_brokers = dict()
@@ -679,10 +676,10 @@ class ContainerSharder(ContainerReplicator):
 
         self.logger.info(_('Finished container sharding pass'))
 
-        #all_locs = audit_location_generator(self.devices, DATADIR, '.db',
+        # all_locs = audit_location_generator(self.devices, DATADIR, '.db',
         #                                    mount_check=self.mount_check,
         #                                    logger=self.logger)
-        #for path, device, partition in all_locs:
+        # for path, device, partition in all_locs:
         #    self.container_audit(path)
         #    if time.time() - reported >= 3600:  # once an hour
         #        self.logger.info(
@@ -701,26 +698,26 @@ class ContainerSharder(ContainerReplicator):
         #        self.container_failures = 0
         #    self.containers_running_time = ratelimit_sleep(
         #        self.containers_running_time, self.max_containers_per_second)
-        #return reported
+        # return reported
 
     def _send_request(self, ip, port, contdevice, partition, op, path,
                       headers_out={}):
-            if 'user-agent' not in headers_out:
-                headers_out['user-agent'] = 'container-sharder %s' % \
-                                            os.getpid()
-            if 'X-Timestamp' not in headers_out:
-                headers_out['X-Timestamp'] = Timestamp(time.time()).normal
-            try:
-                with ConnectionTimeout(self.conn_timeout):
-                        conn = http_connect(ip, port, contdevice, partition,
-                                            op, path, headers_out)
-                with Timeout(self.node_timeout):
-                    response = conn.getresponse()
-                    return response
-            except (Exception, Timeout) as x:
-                self.logger.info(str(x))
-                # Need to do something here.
-                return None
+        if 'user-agent' not in headers_out:
+            headers_out['user-agent'] = 'container-sharder %s' % \
+                                        os.getpid()
+        if 'X-Timestamp' not in headers_out:
+            headers_out['X-Timestamp'] = Timestamp(time.time()).normal
+        try:
+            with ConnectionTimeout(self.conn_timeout):
+                conn = http_connect(ip, port, contdevice, partition,
+                                    op, path, headers_out)
+            with Timeout(self.node_timeout):
+                response = conn.getresponse()
+                return response
+        except (Exception, Timeout) as x:
+            self.logger.info(str(x))
+            # Need to do something here.
+            return None
 
     def _find_pivot_point(self, broker):
         self.logger.info(_('Started searching for best pivot point for %s/%s'),
@@ -904,7 +901,7 @@ class ContainerSharder(ContainerReplicator):
                 marker = ''
 
             try:
-                part, new_broker, node_id = \
+                new_part, new_broker, node_id = \
                     self._get_and_fill_shard_broker(
                         pivot, weight, items, root_account, root_container,
                         policy_index)
@@ -923,7 +920,7 @@ class ContainerSharder(ContainerReplicator):
             self.logger.info(_('Replicating new shard container %s/%s'),
                              new_broker.account, new_broker.container)
             self.cpool.spawn(
-                self._replicate_object, part, new_broker.db_file, node_id)
+                self._replicate_object, new_part, new_broker.db_file, node_id)
             any(self.cpool)
 
         # Make sure the new distributed node has been added, to do this we need
@@ -945,11 +942,10 @@ class ContainerSharder(ContainerReplicator):
 
         # Now replicate the container we are working on
         self.logger.info(_('Replicating container %s/%s'),
-                             broker.account, broker.container)
+                         broker.account, broker.container)
         self.cpool.spawn(
             self._replicate_object, part, broker.db_file, node_id)
         any(self.cpool)
-
 
         self.logger.info(_('Finished sharding %s/%s, new shard '
                            'containers %s/%s and %s/%s. Sharded at pivot %s.'),
