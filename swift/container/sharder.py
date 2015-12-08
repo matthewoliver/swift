@@ -850,12 +850,13 @@ class ContainerSharder(ContainerReplicator):
                     return
             self.tree_cache[''] = tree
 
-        # Make sure the account exists by running a container PUT
+        # Make sure the account exists and the 2 new container entries
+        # are added by running a container PUTs of the new containers.
         try:
             policy = POLICIES.get_by_index(broker.storage_policy_index)
             headers = {'X-Storage-Policy': policy.name}
-            self.swift.create_container(new_acct, new_left_cont,
-                                        headers=headers)
+            for c in (new_left_cont, new_right_cont):
+                self.swift.create_container(new_acct, c, headers=headers)
         except internal_client.UnexpectedResponse as ex:
             self.logger.warning(_('Failed to put container: %s'),
                                 str(ex))
