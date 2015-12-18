@@ -463,10 +463,11 @@ class ContainerBroker(DatabaseBroker):
             self.account = data['account']
             self.container = data['container']
 
-            if len(self.get_pivot_points()) == 0:
+            if not self.get_pivot_points(connection=conn):
                 # This container can have objects, so find the current pivot
                 # point.
-                data['pivot_point'] = self.get_possible_pivot_point()
+                data['pivot_point'] = \
+                    self.get_possible_pivot_point(connection=conn)
             else:
                 data['pivot_point'] = ''
 
@@ -989,7 +990,7 @@ class ContainerBroker(DatabaseBroker):
             CONTAINER_STAT_VIEW_SCRIPT +
             'COMMIT;')
 
-    def get_pivot_points(self, padded=False):
+    def get_pivot_points(self, padded=False, connection=None):
         """
 
         :param padded: Add extra empty string results to it matches a standard
@@ -997,8 +998,8 @@ class ContainerBroker(DatabaseBroker):
                        container listings.
         :return:
         """
-        self._commit_puts_stale_ok()
-        with self.get() as conn:
+
+        def _get_pivot_points(conn):
             try:
                 if padded:
                     sql = "SELECT name, created_at, level, '', ''"
@@ -1016,6 +1017,13 @@ class ContainerBroker(DatabaseBroker):
                 if 'no such table: pivot_points' in str(err):
                     self.create_pivot_points_table(conn)
             return []
+
+        self._commit_puts_stale_ok()
+        if connection:
+            return _get_pivot_points(connection)
+        else:
+            with self.get() as conn:
+                return _get_pivot_points(conn)
 
     def pivot_nodes_to_items(self, nodes):
         result = list()
@@ -1042,7 +1050,7 @@ class ContainerBroker(DatabaseBroker):
             tree.add(node[0], node[1])
         return tree
 
-    def get_possible_pivot_point(self):
+    def get_possible_pivot_point(self, connection=None):
         """
         Finds the middle entry of the table that could be used as a pivot
         point when sharding. It finds the middle object and returns it.
@@ -1052,8 +1060,7 @@ class ContainerBroker(DatabaseBroker):
 
         :return: The middle object in the container.
         """
-        self._commit_puts_stale_ok()
-        with self.get() as conn:
+        def _get_possible_pivot_points(conn):
             try:
                 data = conn.execute('''
                     SELECT name
@@ -1069,3 +1076,10 @@ class ContainerBroker(DatabaseBroker):
                     return ''
             except Exception:
                 return ''
+
+        self._commit_puts_stale_ok()
+        if connection:
+            return _get_possible_pivot_points(connection)
+        else:
+            with self.get() as conn:
+                return _get_possible_pivot_points(conn)

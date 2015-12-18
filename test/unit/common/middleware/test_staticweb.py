@@ -57,7 +57,7 @@ meta_map = {
 }
 
 
-def mock_get_container_info(env, app, swift_source='SW'):
+def mock_get_container_info(env, app, swift_source='SW', skip_sharding=True):
     container = env['PATH_INFO'].rstrip('/').split('/')[3]
     container_info = meta_map[container]
     container_info.setdefault('status', 200)

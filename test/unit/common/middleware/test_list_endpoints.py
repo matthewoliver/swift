@@ -102,7 +102,7 @@ class TestListEndpoints(unittest.TestCase):
     def tearDown(self):
         rmtree(self.testdir, ignore_errors=1)
 
-    def FakeGetInfo(self, env, app, swift_source=None):
+    def FakeGetInfo(self, env, app, swift_source=None, skip_sharding=True):
         info = {'status': 0, 'sync_key': None, 'meta': {},
                 'cors': {'allow_origin': None, 'expose_headers': None,
                          'max_age': None},
