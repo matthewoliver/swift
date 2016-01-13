@@ -3709,10 +3709,16 @@ class PivotTree(object):
           ('f', 'l')
 
         That is to say, anything > 'f' and < 'l'
+        Note: None represets either -inf or +inf depending on the side it is
+
+        These bounds are with respect to the level of the pivot. That is, a
+        pivot contains all the elements of its lower pivots. Hence, the root
+        pivot will always return (None, None) because it contains all the
+        elements in the container.
 
         :rtype : object
         """
-        pivot, weight = self.get(pivot)
+        pivot, weight = self.get(pivot, leaf=False)
         gt = lt = None
 
         if pivot is None or pivot.parent is None:

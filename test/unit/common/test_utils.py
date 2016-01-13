@@ -4983,5 +4983,48 @@ class TestPairs(unittest.TestCase):
                               (50, 60)]))
 
 
+class TestPivotTree(unittest.TestCase):
+    def _build_tree(self, *args):
+        tree = utils.PivotTree()
+        for node in args:
+            tree.add(node)
+        return tree
+
+    def test_bounds(self):
+        #   c
+        #  b d
+        #     e
+        tree = self._build_tree('c', 'b', 'd','e')
+        bounds = tree.get_pivot_bounds('e')
+        self.assertEqual(bounds, ('d', None))
+        bounds = tree.get_pivot_bounds('d')
+        self.assertEqual(bounds, ('c', None))
+
+        #   d
+        #  c e
+        # b
+        tree = self._build_tree('d', 'c', 'b','e')
+        bounds = tree.get_pivot_bounds('b')
+        self.assertEqual(bounds, (None, 'c'))
+        bounds = tree.get_pivot_bounds('c')
+        self.assertEqual(bounds, (None, 'd'))
+
+        #   c
+        #  b
+        tree = self._build_tree('c', 'b')
+        bounds = tree.get_pivot_bounds('b')
+        self.assertEqual(bounds, (None, 'c'))
+        bounds = tree.get_pivot_bounds('c')
+        self.assertEqual(bounds, (None, None))
+
+        #   b
+        #    c
+        tree = self._build_tree('b', 'c')
+        bounds = tree.get_pivot_bounds('c')
+        self.assertEqual(bounds, ('b', None))
+        bounds = tree.get_pivot_bounds('b')
+        self.assertEqual(bounds, (None, None))
+
+
 if __name__ == '__main__':
     unittest.main()
