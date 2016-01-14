@@ -267,7 +267,7 @@ class Application(object):
         if account and not valid_api_version(version):
             raise APIVersionError('Invalid path')
         if obj and container and account:
-            info = get_container_info(req.environ, self, skip_sharding=True)
+            info = get_container_info(req.environ, self)
             policy_index = req.headers.get('X-Backend-Storage-Policy-Index',
                                            info['storage_policy'])
             policy = POLICIES.get_by_index(policy_index)

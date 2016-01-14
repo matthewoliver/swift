@@ -192,8 +192,7 @@ class _StaticWebContext(WSGIContext):
         """
         self._index = self._error = self._listings = self._listings_css = \
             self._dir_type = None
-        container_info = get_container_info(env, self.app, swift_source='SW',
-                                            skip_sharding=True)
+        container_info = get_container_info(env, self.app, swift_source='SW')
         if is_success(container_info['status']):
             meta = container_info.get('meta', {})
             self._index = meta.get('web-index', '').strip()

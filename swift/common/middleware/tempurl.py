@@ -426,8 +426,7 @@ class TempURL(object):
         account_info = get_account_info(env, self.app, swift_source='TU')
         account_keys = get_tempurl_keys_from_metadata(account_info['meta'])
 
-        container_info = get_container_info(env, self.app, swift_source='TU',
-                                            skip_sharding=True)
+        container_info = get_container_info(env, self.app, swift_source='TU')
         container_keys = get_tempurl_keys_from_metadata(
             container_info.get('meta', []))
 

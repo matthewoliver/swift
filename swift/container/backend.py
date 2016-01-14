@@ -24,7 +24,7 @@ import six.moves.cPickle as pickle
 from six.moves import range
 import sqlite3
 
-from swift.common.utils import Timestamp, PivotTree
+from swift.common.utils import Timestamp, PivotTree, verify_pivot_usage_header
 from swift.common.db import DatabaseBroker, utf8encode
 
 
@@ -262,6 +262,8 @@ class ContainerBroker(DatabaseBroker):
                     ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT,
                     level INTEGER,
+                    object_count TEXT DEFAULT '0/0',
+                    bytes_used TEXT DEFAULT '0/0',
                     created_at TEXT,
                     deleted INTEGER DEFAULT 0
                 );
@@ -301,18 +303,35 @@ class ContainerBroker(DatabaseBroker):
     def _commit_puts_load(self, item_list, entry):
         """See :func:`swift.common.db.DatabaseBroker._commit_puts_load`"""
         data = pickle.loads(entry.decode('base64'))
-        (name, timestamp, size, content_type, etag, deleted) = data[:6]
-        storage_policy_index = data[6] if len(data) > 6 else 0
-        record_type = data[7] if len(data) > 7 else RECORD_TYPE_OBJECT
+        record_type = None
+        if len(data) >= 7:
+            record_type = data[7]
+        if record_type and record_type == RECORD_TYPE_PIVOT_NODE:
+            (name, timestamp, level, object_count, bytes_used, deleted) = \
+                data[:6]
+            item = {
+                'name': name,
+                'created_at': timestamp,
+                'level': level,
+                'object_count': object_count,
+                'bytes_used': bytes_used,
+                'deleted': deleted,
+                'storage_policy_index': 0,
+                'record_type': record_type}
+        else:
+            (name, timestamp, size, content_type, etag, deleted) = data[:6]
+            storage_policy_index = data[6] if len(data) > 6 else 0
+            record_type = data[7] if len(data) > 7 else RECORD_TYPE_OBJECT
 
-        item_list.append({'name': name,
-                          'created_at': timestamp,
-                          'size': size,
-                          'content_type': content_type,
-                          'etag': etag,
-                          'deleted': deleted,
-                          'storage_policy_index': storage_policy_index,
-                          'record_type': record_type})
+            item = {'name': name,
+                    'created_at': timestamp,
+                    'size': size,
+                    'content_type': content_type,
+                    'etag': etag,
+                    'deleted': deleted,
+                    'storage_policy_index': storage_policy_index,
+                    'record_type': record_type}
+        item_list.append(item)
 
     def empty(self):
         """
@@ -345,12 +364,17 @@ class ContainerBroker(DatabaseBroker):
                         deleted=1, storage_policy_index=storage_policy_index)
 
     def make_tuple_for_pickle(self, record):
+        if record['record_type'] == RECORD_TYPE_PIVOT_NODE:
+            return (record['name'], record['created_at'], record['level'],
+                    record['object_count'], record['bytes_used'],
+                    record['deleted'], 0, record['record_type'])
         return (record['name'], record['created_at'], record['size'],
                 record['content_type'], record['etag'], record['deleted'],
                 record['storage_policy_index'], record['record_type'])
 
     def put_object(self, name, timestamp, size, content_type, etag, deleted=0,
-                   storage_policy_index=0, record_type=RECORD_TYPE_OBJECT):
+                   storage_policy_index=0, level=None, object_count=0,
+                   bytes_used=0, record_type=RECORD_TYPE_OBJECT):
         """
         Creates an object in the DB with its metadata.
 
@@ -365,11 +389,17 @@ class ContainerBroker(DatabaseBroker):
         :param record_type: The type of record this is (either references
                             object data or a pivot point)
         """
-        record = {'name': name, 'created_at': timestamp, 'size': size,
-                  'content_type': content_type, 'etag': etag,
-                  'deleted': deleted,
-                  'storage_policy_index': storage_policy_index,
-                  'record_type': record_type}
+        if record_type == RECORD_TYPE_PIVOT_NODE:
+            record = {'name': name, 'created_at': timestamp, 'level': level,
+                      'object_count': object_count, 'bytes_used': bytes_used,
+                      'deleted': deleted, 'storage_policy_index': 0,
+                      'record_type': record_type}
+        else:
+            record = {'name': name, 'created_at': timestamp, 'size': size,
+                      'content_type': content_type, 'etag': etag,
+                      'deleted': deleted,
+                      'storage_policy_index': storage_policy_index,
+                      'record_type': record_type}
         self.put_record(record)
 
     def _is_deleted_info(self, object_count, put_timestamp, delete_timestamp,
@@ -742,6 +772,49 @@ class ContainerBroker(DatabaseBroker):
         item_list = [item for item in item_list
                      if item['record_type'] == RECORD_TYPE_OBJECT]
 
+        def merge_data(data1, data2):
+            if data1 and data2:
+                # Merge
+                prefix = False
+                prefix_str = ''
+                if '+' in data1 or '-' in data1:
+                    prefix = True
+                data1 = int(data1) + int(data2)
+                if prefix:
+                    prefix_str = '-' if data1 < 0 else '+'
+                else:
+                    # Can't be -'ve
+                    if data1 < 0:
+                        data1 = 0
+                return ("%s%d" % (prefix_str, data1), prefix)
+            elif data1:
+                return data1, None
+            elif data2:
+                return data2, None
+            else:
+                # Both missing
+                return '', True
+
+        def merge_pivots(item1, item2):
+            if item1['created_at'] > item2['created_at']:
+                item1, item2 = (item2, item1)
+            for col in ('object_count', 'bytes_used'):
+                if '-' not in item2[col] and '+' not in item2[col] and \
+                        len(item2[col].split('/')) == 2:
+                    # item2 is a definite definition, so just use it.
+                    continue
+                # It is an increment/decrement so we need to merge with item1
+                left1, right1 = self._get_pivot_usage_parts(item1[col])
+                left2, right2 = self._get_pivot_usage_parts(item2[col])
+                result = []
+                for d1, d2 in ((left1, left2), (right1, right2)):
+                    d2, prefixed = merge_data(d1, d2)
+                    if prefixed:
+                        item2['prefixed'] = True
+                    result.append(d2)
+                item2[col] = '/'.join(result)
+            return item2
+
         def _merge_items_by_type(curs, rec_type='object'):
             obj = rec_type == 'object'
             if obj:
@@ -778,10 +851,22 @@ class ContainerBroker(DatabaseBroker):
                     if item_ident in created_at:  # exists with older timestamp
                         to_delete[item_ident] = item
                     if item_ident in to_add:  # duplicate entries in item_list
-                        to_add[item_ident] = max(item, to_add[item_ident],
-                                                 key=lambda i: i['created_at'])
+                        if obj:
+                            to_add[item_ident] = max(
+                                    item, to_add[item_ident],
+                                    key=lambda i: i['created_at'])
+                        else:
+                            to_add[item_ident] = merge_pivots(
+                                    to_add[item_ident], item)
                     else:
                         to_add[item_ident] = item
+            if not obj:
+                # Now that all the to_add items are merged, they are either in
+                # the form of incremented '+|-<count>/+|-<count>' or absolute
+                # '<count>/<count>'. If the former we need to increment before
+                # we delete the current values.
+                for item in [i for i in to_add if i.get('prefixed')]:
+                    self.update_pivot_usage(item)
             if to_delete:
                 sql = 'DELETE FROM %s WHERE ' % rec_type
                 sql += query_mod + 'name=? '
@@ -807,9 +892,12 @@ class ContainerBroker(DatabaseBroker):
                     # Note: 'size' is storing the level.
                     curs.executemany(
                         'INSERT INTO pivot_points (name, created_at, level, '
-                        'deleted)'
-                        'VALUES (?, ?, ?, ?)',
-                        ((rec['name'], rec['created_at'], rec['size'],
+                        'object_count, bytes_used, deleted)'
+                        'VALUES (?, ?, ?, ?, ?, ?)',
+                        ((rec['name'], rec['created_at'],
+                          rec.get('level', rec['size']),
+                          rec.get('object_count', 0),
+                          rec.get('bytes_used', 0),
                           rec['deleted'])
                          for rec in to_add.itervalues()))
 
@@ -990,7 +1078,8 @@ class ContainerBroker(DatabaseBroker):
             CONTAINER_STAT_VIEW_SCRIPT +
             'COMMIT;')
 
-    def get_pivot_points(self, padded=False, connection=None):
+
+    def get_pivot_points(self, connection=None):
         """
 
         :param padded: Add extra empty string results to it matches a standard
@@ -1001,15 +1090,12 @@ class ContainerBroker(DatabaseBroker):
 
         def _get_pivot_points(conn):
             try:
-                if padded:
-                    sql = "SELECT name, created_at, level, '', ''"
-                else:
-                    sql = "SELECT name, created_at, level"
-                sql += '''
-                    FROM pivot_points
-                    WHERE deleted=0
-                    ORDER BY level;
-                    '''
+                sql = '''
+                SELECT name, created_at, level, object_count, bytes_used
+                FROM pivot_points
+                WHERE deleted=0
+                ORDER BY level;
+                '''
                 data = conn.execute(sql)
                 data.row_factory = None
                 return [row for row in data]
@@ -1025,6 +1111,101 @@ class ContainerBroker(DatabaseBroker):
             with self.get() as conn:
                 return _get_pivot_points(conn)
 
+    def _get_pivot_usage_parts(self, value):
+            left = right = None
+            parts = value.split('/')
+            if len(parts) > 1:
+                left, right = parts
+            else:
+                if value.startswith('/'):
+                    right = parts[0]
+                else:
+                    left = parts[0]
+            return left, right
+
+    def update_pivot_usage(self, item):
+
+        def update_usage(current, new_data):
+            if not current:
+                current = '0/0'
+            left, right = self._get_pivot_usage_parts(new_data)
+            current_left, current_right = self._get_pivot_usage_parts(current)
+
+            if left:
+                if left.startswith('-') or left.startswith('+'):
+                    left = int(left)
+                    current_left = int(current_left)
+                    left += current_left
+                    if left < 0:
+                        left = 0
+                else:
+                    left = current_left
+
+            if right:
+                if right.startswith('-') or right.startswith('+'):
+                    right = int(right)
+                    current_right = int(current_right)
+                    right += current_right
+                    if right < 0:
+                        right = 0
+            else:
+                right = current_right
+
+            return "%d/%d" % (left, right)
+
+        with self.get() as conn:
+            # we need the current value.
+            try:
+                sql = '''
+                SELECT object_count, bytes_used
+                FROM pivot_points
+                WHERE deleted=0 AND
+                created_at < ? AND
+                name == ?;
+                '''
+                data = conn.execute(sql, item['created_at'], item['name'])
+                row = data.fetchone()
+                if not row:
+                    row = (None, None)
+            except sqlite3.OperationalError:
+                row = (None, None)
+
+            item['object_count'] = update_usage(row[0], item['object_count'])
+            item['bytes_used'] = update_usage(row[1], item['bytes_used'])
+
+    def get_pivot_usage(self):
+        self._commit_puts_stale_ok()
+        def get_counts(value):
+            if not value:
+                left = right = 0
+            parts = value.split('/')
+            if len(parts) > 1:
+                left, right = parts
+                left = int(left)
+                right = int(right)
+
+            return left + right
+
+        with self.get() as conn:
+            try:
+                sql = '''
+                SELECT object_count, bytes_used
+                FROM pivot_points
+                WHERE deleted=0;
+                '''
+                data = conn.execute(sql)
+                data.row_factory = None
+                bytes_used = object_count = 0
+                for row in data:
+                    object_count += get_counts(row[0])
+                    bytes_used += get_counts(row[1])
+                return {'bytes_used': bytes_used,
+                        'object_count': object_count}
+            except sqlite3.OperationalError as err:
+                if 'no such table: pivot_points' in str(err):
+                    self.create_pivot_points_table(conn)
+            return {'bytes_used': 0, 'object_count': 0}
+
     def pivot_nodes_to_items(self, nodes):
         result = list()
         for item in nodes:
@@ -1032,10 +1213,10 @@ class ContainerBroker(DatabaseBroker):
                 obj = {
                     'name': item[0],
                     'created_at': item[1],
-                    'size': item[2], # <- Storing the level in size.
-                    'content_type': '',
-                    'etag': '',
-                    'deleted': item[3] if len(item) > 3 else 0,
+                    'level': item[2],
+                    'object_count': item[3],
+                    'bytes_used': item[4],
+                    'deleted': item[5] if len(item) > 5 else 0,
                     'storage_policy_index': 0,
                     'record_type': RECORD_TYPE_PIVOT_NODE}
                 result.append(obj)

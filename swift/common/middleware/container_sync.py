@@ -91,8 +91,7 @@ class ContainerSync(object):
                         'cs:no-local-realm-key')
                 else:
                     info = get_container_info(
-                        req.environ, self.app, swift_source='CS',
-                        skip_sharding=True)
+                        req.environ, self.app, swift_source='CS')
                     user_key = info.get('sync_key')
                     if not user_key:
                         req.environ.setdefault('swift.log_info', []).append(

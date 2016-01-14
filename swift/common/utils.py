@@ -66,6 +66,7 @@ from six.moves.configparser import ConfigParser, NoSectionError, \
     NoOptionError, RawConfigParser
 from six.moves.queue import Queue, Empty
 from six.moves import range
+from six import string_types
 
 from swift import gettext_ as _
 import swift.common.exceptions
@@ -3919,3 +3920,32 @@ def pivot_container_to_pivot(root_container, container):
         weight = 1
 
     return pivot, weight
+
+
+def verify_pivot_usage_header(value):
+    """
+    Takes in the value of a pivot usage header (X-Backend-Pivot-Used-Bytes or
+    X-Backend-Pivot-Object-Count), which takes the form of:
+
+    "[+-]<int>/[+-]<int>"
+
+    The + or - allows to increment the existing count, without these it's
+    setting to total counts. If one of the counts is missing (ending or
+    starting with a '/', then that side is ignored.
+
+    :param value: The header value.
+    :return: True if its a valid header, False otherwise.
+    """
+    if not isinstance(value, string_types):
+        return False
+    if '/' not in value:
+        return False
+    parts = value.split('/')
+    if 0 == len(parts) > 2:
+        return False
+    for count in parts:
+        try:
+            int(count)
+        except ValueError:
+            return False
+    return True

@@ -217,7 +217,7 @@ class ListEndpointsMiddleware(object):
         if obj is not None:
             container_info = get_container_info(
                 {'PATH_INFO': '/v1/%s/%s' % (account, container)},
-                self.app, swift_source='LE', skip_sharding=True)
+                self.app, swift_source='LE')
             storage_policy_index = container_info['storage_policy']
             obj_ring = self.get_object_ring(storage_policy_index)
             partition, nodes = obj_ring.get_nodes(

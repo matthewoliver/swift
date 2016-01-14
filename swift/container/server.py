@@ -24,7 +24,8 @@ from operator import itemgetter
 from random import shuffle
 
 import swift.common.db
-from swift.container.backend import ContainerBroker, DATADIR
+from swift.container.backend import ContainerBroker, DATADIR, \
+    RECORD_TYPE_PIVOT_NODE
 from swift.container.replicator import ContainerReplicatorRpc
 from swift.common import ring
 from swift.common.db import DatabaseAlreadyExists
@@ -412,11 +413,31 @@ class ContainerController(BaseStorageServer):
                     pass
             if not os.path.exists(broker.db_file):
                 return HTTPNotFound()
-            broker.put_object(obj, req_timestamp.internal,
-                              int(req.headers['x-size']),
-                              req.headers['x-content-type'],
-                              req.headers['x-etag'], 0,
-                              obj_policy_index)
+            record_type = req.headers.get('x-backend-record-type')
+            if record_type == RECORD_TYPE_PIVOT_NODE:
+                # Pivot point items has different information that needs to
+                # be passed. This should only come from the backend.
+                obj_count = req.headers.get('x-backend-pivot-objects')
+                bytes_used = req.headers.get('x-backend-pivot-bytes')
+
+                # Level is required when putting a pivot point.
+                level = req.headers.get('x-backend-pivot-level')
+                if not level:
+                    raise HTTPBadRequest()
+                try:
+                    level = int(level)
+                except ValueError:
+                    raise HTTPBadRequest()
+                broker.put_object(
+                    obj, req_timestamp.internal,
+                    int(req.headers['x-size']), '', '', 0,
+                    level=level, object_count=obj_count, bytes_used=bytes_used)
+            else:
+                broker.put_object(obj, req_timestamp.internal,
+                                  int(req.headers['x-size']),
+                                  req.headers['x-content-type'],
+                                  req.headers['x-etag'], 0,
+                                  obj_policy_index)
             return HTTPCreated(request=req)
         else:   # put container
             if requested_policy_index is None:
@@ -486,12 +507,9 @@ class ContainerController(BaseStorageServer):
             return HTTPNotFound(request=req, headers=headers)
         self._add_metadata(headers, broker.metadata)
         headers['Content-Type'] = out_content_type
-        if len(broker.get_pivot_points()) > 0 and \
-                not 'swift.skip_sharding' in req.environ:
-            return self.GETorHEAD_sharded(req, broker, headers)
         return HTTPNoContent(request=req, headers=headers, charset='utf-8')
 
-    def update_data_record(self, record):
+    def update_data_record(self, record, pivot=False):
         """
         Perform any mutations to container listing records that are common to
         all serialization formats, and returns it as a dict.
@@ -499,24 +517,31 @@ class ContainerController(BaseStorageServer):
         Converts created time to iso timestamp.
         Replaces size with 'swift_bytes' content type parameter.
 
-        :params record: object entry record
+        :param record: object entry record
+        :param pivot: Is this a pivot node, if so it uses a different
+                      dictionary
         :returns: modified record
         """
         if isinstance(record, dict):
             # Conversion has already happened (e.g. from a sharded node)
             return record
-        (name, created, size, content_type, etag) = record[:5]
-        if content_type is None:
-            return {'subdir': name}
-        response = {'bytes': size, 'hash': etag, 'name': name,
-                    'content_type': content_type}
+        if pivot:
+            (name, created, level, object_count, bytes_used) = record[:5]
+            response = {'name': name, 'level': level,
+                        'object_count': object_count,
+                        'bytes_used': bytes_used}
+        else:
+            (name, created, size, content_type, etag) = record[:5]
+            if content_type is None:
+                return {'subdir': name}
+            response = {'bytes': size, 'hash': etag, 'name': name,
+                        'content_type': content_type}
         response['last_modified'] = Timestamp(created).isoformat
         override_bytes_from_content_type(response, logger=self.logger)
         return response
 
-    def GETorHEAD_sharded(self, req, broker, headers, marker='',
-                          end_marker='', prefix='',
-                          limit=constraints.CONTAINER_LISTING_LIMIT):
+    def GET_sharded(self, req, broker, headers, marker='', end_marker='',
+                    prefix='', limit=constraints.CONTAINER_LISTING_LIMIT):
 
         def _send_request(node, part, op, path, params):
             try:
@@ -550,6 +575,7 @@ class ContainerController(BaseStorageServer):
         object_bytes = 0
         objects = list()
         params = req.params.copy()
+        params.update({'format': 'json', 'limit': str(limit)})
         for leaf, leaf_weight in tree.leaves_iter():
             if not start and spiv:
                 if leaf.key == spiv.key and sw == leaf_weight:
@@ -563,8 +589,6 @@ class ContainerController(BaseStorageServer):
             piv_acct, piv_cont = pivot_to_pivot_container(
                 broker.account, broker.container, leaf.key, leaf_weight)
             path = '/%s/%s' % (piv_acct, piv_cont)
-            if req.method == 'GET':
-                params.update({'format': 'json', 'limit': str(limit)})
             part, nodes = self.ring.get_nodes(piv_acct, piv_cont)
             shuffle(nodes)
             for node in nodes:
@@ -574,24 +598,20 @@ class ContainerController(BaseStorageServer):
                         int(resp.getheader('X-Container-Object-Count')) or 0
                     object_bytes += \
                         int(resp.getheader('X-Container-Bytes-Used')) or 0
-                    if req.method == 'GET':
-                        try:
-                            objs = json.load(resp)
-                        except ValueError as ex:
-                            objs = []
-                        if objs:
-                            objects.extend(objs)
-                            limit -= len(objs)
-                        else:
-                            end = True
+                    try:
+                        objs = json.load(resp)
+                    except ValueError as ex:
+                        objs = []
+                    if objs:
+                        objects.extend(objs)
+                        limit -= len(objs)
+                    else:
+                        end = True
                     break
             if end:
                 break
         headers['X-Container-Object-Count'] = object_count
         headers['X-Container-Bytes-Used'] = object_bytes
-
-        if req.method == 'HEAD':
-            return HTTPNoContent(request=req, headers=headers, charset='utf-8')
 
         out_content_type = get_listing_content_type(req)
         return self.create_listing(req, out_content_type, {}, headers,
@@ -632,11 +652,11 @@ class ContainerController(BaseStorageServer):
         if is_deleted:
             return HTTPNotFound(request=req, headers=resp_headers)
         if nodes and nodes.lower() == "pivot":
-            container_list = broker.get_pivot_points(padded=True)
+            container_list = broker.get_pivot_points()
         elif len(broker.get_pivot_points()) > 0:
-            # Sharded container so we need to pass to GETorHEAD_sharded
-            return self.GETorHEAD_sharded(req, broker, resp_headers, marker,
-                                          end_marker, prefix, limit)
+            # Sharded container so we need to pass to GET_sharded
+            return self.GET_sharded(req, broker, resp_headers, marker,
+                                    end_marker, prefix, limit)
         else:
             container_list = broker.list_objects_iter(
                 limit, marker, end_marker, prefix, delimiter, path,
@@ -645,15 +665,19 @@ class ContainerController(BaseStorageServer):
                                    broker.metadata, container_list, container)
 
     def create_listing(self, req, out_content_type, info, resp_headers,
-                       metadata, container_list, container):
+                       metadata, container_list, container, pivot=False):
         self._add_metadata(resp_headers, metadata)
         ret = Response(request=req, headers=resp_headers,
                        content_type=out_content_type, charset='utf-8')
         if out_content_type == 'application/json':
-            ret.body = json.dumps([self.update_data_record(record)
+            ret.body = json.dumps([self.update_data_record(record, pivot)
                                    for record in container_list])
         elif out_content_type.endswith('/xml'):
             doc = Element('container', name=container.decode('utf-8'))
+            fields = ["name", "hash", "bytes", "content_type", "last_modified"]
+            if pivot:
+                fields = ["name", "level", "object_count", "bytes_used",
+                          "last_modified"]
             for obj in container_list:
                 record = self.update_data_record(obj)
                 if 'subdir' in record:
@@ -662,8 +686,7 @@ class ContainerController(BaseStorageServer):
                     SubElement(sub, 'name').text = name
                 else:
                     obj_element = SubElement(doc, 'object')
-                    for field in ["name", "hash", "bytes", "content_type",
-                                  "last_modified"]:
+                    for field in fields:
                         SubElement(obj_element, field).text = str(
                             record.pop(field)).decode('utf-8')
                     for field in sorted(record):

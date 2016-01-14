@@ -259,8 +259,7 @@ class VersionedWritesContext(WSGIContext):
             # we're about to start making COPY requests - need to validate the
             # write access to the versioned container
             if 'swift.authorize' in req.environ:
-                container_info = get_container_info(
-                    req.environ, self.app, skip_sharding=True)
+                container_info = get_container_info(req.environ, self.app)
                 req.acl = container_info.get('write_acl')
                 aresp = req.environ['swift.authorize'](req)
                 if aresp:
@@ -390,8 +389,7 @@ class VersionedWritesMiddleware(object):
         resp = None
         is_enabled = config_true_value(allow_versioned_writes)
         if req.method in ('PUT', 'DELETE'):
-            container_info = get_container_info(
-                req.environ, self.app, skip_sharding=True)
+            container_info = get_container_info(req.environ, self.app)
         elif req.method == 'COPY' and 'Destination' in req.headers:
             if 'Destination-Account' in req.headers:
                 account_name = req.headers.get('Destination-Account')
@@ -399,8 +397,7 @@ class VersionedWritesMiddleware(object):
             container_name, object_name = check_destination_header(req)
             req.environ['PATH_INFO'] = "/%s/%s/%s/%s" % (
                 version, account_name, container_name, object_name)
-            container_info = get_container_info(
-                req.environ, self.app, skip_sharding=True)
+            container_info = get_container_info(req.environ, self.app)
 
         if not container_info:
             return self.app
