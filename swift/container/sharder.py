@@ -282,7 +282,8 @@ class ContainerSharder(ContainerReplicator):
         return objs
 
     def _get_and_fill_shard_broker(self, pivot, weight, items, account,
-                                   container, policy_index, delete=False):
+                                   container, policy_index, delete=False,
+                                   level=None):
         """
         Go grabs or creates a new container broker in a handoff partition
         to use as the new shard for the container. It then sets the required
@@ -311,7 +312,8 @@ class ContainerSharder(ContainerReplicator):
             timestamp = Timestamp(time.time()).internal
             broker.update_metadata({
                 'X-Container-Sysmeta-Shard-Account': (account, timestamp),
-                'X-Container-Sysmeta-Shard-Container': (container, timestamp)})
+                'X-Container-Sysmeta-Shard-Container': (container, timestamp),
+                'X-Container-Sysmeta-Shard-Level': (level, timestamp)})
 
         objects = self._generate_object_list(items, policy_index, delete)
         broker.merge_items(objects)
@@ -546,6 +548,7 @@ class ContainerSharder(ContainerReplicator):
         tree.add(pivot)
         level = tree.get_level(pivot)
         pivot_point = [(pivot, timestamp, level)]
+        broker.update_metadata({'X-Container-Sysmeta-Shard-Level': (level, timestamp)})
         if not parent_ok:
             # Update parent
             if parent:
@@ -833,22 +836,10 @@ class ContainerSharder(ContainerReplicator):
         new_acct, new_right_cont = pivot_to_pivot_container(
             root_account, root_container, pivot, 1)
 
-        # pivot points to parent and root, Se we need to make sure we can grab
-        # the root tree before we move anything.
-        tree = self.tree_cache.get('')
-        if not tree:
-            if is_root:
-                tree = broker.build_pivot_tree()
-            else:
-                tree = self._get_pivot_tree(root_account, root_container, True)
-                if tree is None:
-                    self.logger.error(
-                        _("Since the audit run of this container and "
-                          "now we can't access the root container "
-                          "%s/%s aborting."),
-                        root_account, root_container)
-                    return
-            self.tree_cache[''] = tree
+        # Grab the level from the parent for later saving in pivot table
+        # and child metadata
+        level = broker.metadata.get('X-Container-Sysmeta-Shard-Level')
+        level = int(level[0]) + 1 if level else 0
 
         # Make sure the account exists and the 2 new container entries
         # are added by running a container PUTs of the new containers.
@@ -905,7 +896,7 @@ class ContainerSharder(ContainerReplicator):
                 new_part, new_broker, node_id = \
                     self._get_and_fill_shard_broker(
                         pivot, weight, items, root_account, root_container,
-                        policy_index)
+                        policy_index, level=level)
 
                 # Delete the same items from current broker (while we have the
                 # same state)
@@ -923,11 +914,6 @@ class ContainerSharder(ContainerReplicator):
             self.cpool.spawn(
                 self._replicate_object, new_part, new_broker.db_file, node_id)
             any(self.cpool)
-
-        # Make sure the new distributed node has been added, to do this we need
-        # to know what level it is. To get this we add it to the tree
-        tree.add(pivot)
-        level = tree.get_level(pivot)
 
         timestamp = Timestamp(time.time()).internal
         pivot_point = [(pivot, timestamp, level)]
