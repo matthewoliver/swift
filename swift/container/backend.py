@@ -1088,8 +1088,7 @@ class ContainerBroker(DatabaseBroker):
                 sql = '''
                 SELECT lower, created_at, upper, object_count, bytes_used
                 FROM pivot_ranges
-                WHERE deleted=0
-                ORDER BY level;
+                WHERE deleted=0;
                 '''
                 data = conn.execute(sql)
                 data.row_factory = None

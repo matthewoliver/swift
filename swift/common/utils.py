@@ -3759,7 +3759,7 @@ def pivot_to_pivot_container(account, container, lower=None, upper=None,
         if not upper and not lower:
             return account, container
         acc = ".sharded_%s" % account
-        cont = "%s_%s_%s" % (container, lower, upper)
+        cont = "%s_%s_to_%s" % (container, lower, upper)
         return acc, cont
 
 
