@@ -33,8 +33,8 @@ from swift.common.utils import (json, Timestamp, hash_path,
 
 
 def other_items_hook(broker):
-    pivot_points = broker.get_pivot_points()
-    return broker.pivot_nodes_to_items(pivot_points)
+    pivot_ranges = broker.get_pivot_ranges()
+    return broker.pivot_nodes_to_items(pivot_ranges)
 
 
 class ContainerReplicator(db_replicator.Replicator):

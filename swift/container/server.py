@@ -35,7 +35,8 @@ from swift.common.request_helpers import get_param, get_listing_content_type, \
 from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, validate_sync_to, \
     config_true_value, json, timing_stats, replication, \
-    override_bytes_from_content_type, get_log_line, pivot_to_pivot_container
+    override_bytes_from_content_type, get_log_line, pivot_to_pivot_container, \
+    find_pivot_range
 from swift.common.constraints import check_mount, valid_timestamp, check_utf8
 from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
@@ -272,7 +273,7 @@ class ContainerController(BaseStorageServer):
                 try:
                     # This is a sharded root container, so we need figure out
                     # where the obj should live and return a 301.
-                    pivotTrie = broker.build_pivot_tree()
+                    pivotTrie = broker.build_pivot_ranges()
                     node, weight = pivotTrie.get(obj)
                     piv_acc, piv_cont = pivot_to_pivot_container(
                         account, container, node.key, weight)
@@ -373,7 +374,7 @@ class ContainerController(BaseStorageServer):
         broker = self._get_container_broker(drive, part, account, container)
         if obj:     # put container object
             if os.path.exists(broker.db_file) and \
-                            len(broker.get_pivot_points()) > 0:
+                            len(broker.get_pivot_ranges()) > 0:
                 try:
                     # This is a sharded root container, so we need figure out
                     # where the obj should live and return a 301.
@@ -387,13 +388,16 @@ class ContainerController(BaseStorageServer):
                     if not idx:
                         raise HTTPInternalServerError()
                     idx = idx[0]
-                    pivotTree = broker.build_pivot_tree()
-                    node, weight = pivotTree.get(obj)
+                    ranges = broker.build_pivot_ranges()
+                    piv_range = find_pivot_range(obj, ranges)
                     piv_acc, piv_cont = pivot_to_pivot_container(
-                        account, container, node.key, weight)
+                        account, container, pivot_range=piv_range)
 
                     part, nodes = self.ring.get_nodes(piv_acc, piv_cont)
+                    location = "http://%(ip)s:%(port)d/%(device)s" % nodes[idx]
+                    location += "/%s/%s/%s/%s" % (part, piv_acc, piv_cont, obj)
                     headers = {
+                        'Location': location,
                         'X-Backend-Pivot-Account': piv_acc,
                         'X-Backend-Pivot-Container': piv_cont,
                         'X-Container-Host': "%(ip)s:%(port)d" % nodes[idx],
@@ -421,17 +425,13 @@ class ContainerController(BaseStorageServer):
                 bytes_used = req.headers.get('x-backend-pivot-bytes')
 
                 # Level is required when putting a pivot point.
-                level = req.headers.get('x-backend-pivot-level')
-                if not level:
-                    raise HTTPBadRequest()
-                try:
-                    level = int(level)
-                except ValueError:
+                upper = req.headers.get('x-backend-pivot-upper')
+                if not upper:
                     raise HTTPBadRequest()
                 broker.put_object(
                     obj, req_timestamp.internal,
                     int(req.headers['x-size']), '', '', 0,
-                    level=level, object_count=obj_count, bytes_used=bytes_used)
+                    upper=upper, object_count=obj_count, bytes_used=bytes_used)
             else:
                 broker.put_object(obj, req_timestamp.internal,
                                   int(req.headers['x-size']),
@@ -505,6 +505,13 @@ class ContainerController(BaseStorageServer):
         headers = gen_resp_headers(info, is_deleted=is_deleted)
         if is_deleted:
             return HTTPNotFound(request=req, headers=headers)
+        if len(broker.get_pivot_ranges()) > 0:
+            # Sharded, so lets ask the ranges table how many objects and bytes
+            # are used.
+            usage = broker.get_pivot_usage()
+            headers.update(
+                    {'X-Container-Object-Count': usage.get('object_count', 0),
+                     'X-Container-Bytes-Used': usage.get('bytes_used', 0)})
         self._add_metadata(headers, broker.metadata)
         headers['Content-Type'] = out_content_type
         return HTTPNoContent(request=req, headers=headers, charset='utf-8')
@@ -558,17 +565,17 @@ class ContainerController(BaseStorageServer):
 
         # Firstly we need the requested container's, the root container, pivot
         # tree.
-        tree = broker.build_pivot_tree()
+        ranges = broker.build_pivot_ranges()
 
         # Now we need to find out where to start from.
         start = True
-        spiv = sw = epiv = ew = None
+        spiv = epiv = None
         if marker or prefix:
-            spiv, sw = tree.get(max(marker, prefix))
+            spiv = find_pivot_range(max(marker, prefix), ranges)
             start = False
 
         if end_marker:
-            epiv, ew = tree.get(end_marker)
+            epiv = find_pivot_range(end_marker, ranges)
         end = False
 
         object_count = 0
@@ -576,18 +583,18 @@ class ContainerController(BaseStorageServer):
         objects = list()
         params = req.params.copy()
         params.update({'format': 'json', 'limit': str(limit)})
-        for leaf, leaf_weight in tree.leaves_iter():
+        for piv_range in ranges:
             if not start and spiv:
-                if leaf.key == spiv.key and sw == leaf_weight:
+                if piv_range == spiv:
                     start = True
                 else:
                     continue
 
-            if epiv and leaf.key == epiv.key and ew == leaf_weight:
+            if epiv and piv_range == epiv:
                 end = True
 
             piv_acct, piv_cont = pivot_to_pivot_container(
-                broker.account, broker.container, leaf.key, leaf_weight)
+                broker.account, broker.container, pivot_range=piv_range)
             path = '/%s/%s' % (piv_acct, piv_cont)
             part, nodes = self.ring.get_nodes(piv_acct, piv_cont)
             shuffle(nodes)
@@ -652,8 +659,8 @@ class ContainerController(BaseStorageServer):
         if is_deleted:
             return HTTPNotFound(request=req, headers=resp_headers)
         if nodes and nodes.lower() == "pivot":
-            container_list = broker.get_pivot_points()
-        elif len(broker.get_pivot_points()) > 0:
+            container_list = broker.get_pivot_ranges()
+        elif len(broker.get_pivot_ranges()) > 0:
             # Sharded container so we need to pass to GET_sharded
             return self.GET_sharded(req, broker, resp_headers, marker,
                                     end_marker, prefix, limit)
@@ -676,7 +683,7 @@ class ContainerController(BaseStorageServer):
             doc = Element('container', name=container.decode('utf-8'))
             fields = ["name", "hash", "bytes", "content_type", "last_modified"]
             if pivot:
-                fields = ["name", "level", "object_count", "bytes_used",
+                fields = ["lower", "upper", "object_count", "bytes_used",
                           "last_modified"]
             for obj in container_list:
                 record = self.update_data_record(obj)

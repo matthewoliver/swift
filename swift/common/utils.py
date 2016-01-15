@@ -3662,264 +3662,105 @@ def get_md5_socket():
 
     return md5_sockfd
 
-class PivotTree(object):
-    def __init__(self, root=None, disable_timestamps=False):
-        self._disable_timestamps = disable_timestamps
-        if root:
-            if isinstance(root, PivotNode):
-                self._root = root
-            else:
-                self._root = PivotNode(root)
-        else:
-            self._root = None
+class PivotRange(object):
+    def __init__(self, lower=None, upper=None):
+        self._lower = lower
+        self._upper = upper
 
-    def add(self, key, timestamp=None):
-        if self._disable_timestamps:
-            timestamp = None
-        elif not timestamp:
-            timestamp = Timestamp(time.time()).internal
+    @property
+    def lower(self):
+        return self._lower
 
-        if not self._root:
-            self._root = PivotNode(key, timestamp)
+    @lower.setter
+    def lower_setter(self, lower):
+        self._lower = lower
+
+    @property
+    def upper(self):
+        return self._upper
+
+    @upper.setter
+    def upper_setter(self, upper):
+        self._upper = upper
+
+    def __contains__(self, item):
+        if not self._lower and not self._upper:
+            # No limits so must match
             return True
-        return self._root.add(key, timestamp)
-
-    def get(self, key, leaf=True):
-        if not self._root:
-            return None, None
-        return self._root.get(key, leaf)
-
-    def __getitem__(self, item):
-        return self.get(item)
-
-    def get_level(self, key):
-        node, _weight = self.get(key)
-        return node.level
-
-    def leaves_iter(self, reverse=False):
-        for leaf in self._root.leaves_iter(reverse):
-            yield leaf
-
-    def get_pivot_bounds(self, pivot):
-        """
-        Returns the bounds that should be stored in the specified pivot.
-
-        Returns a Tuple of pivots that represent the bounds (>, <):
-
-          get_pivot_bounds('i')
-          ('f', 'l')
-
-        That is to say, anything > 'f' and < 'l'
-
-        :rtype : object
-        """
-        pivot, weight = self.get(pivot)
-        gt = lt = None
-
-        if pivot is None or pivot.parent is None:
-            # Empty pivot tree or the root pivot, return with (None, None)
-            return None, None
-
-        # Now to find the boundaries, visiting the parent will give us one of
-        # the two, depending on what side of the parent this pivot lives.
-        if pivot.key > pivot.parent.key:
-            gt = pivot.parent.key
+        elif not self._lower:
+            return item <= self._upper
+        elif not self._upper:
+            return self.lower < item
         else:
-            lt = pivot.parent.key
+            return self.lower < item <= self._upper
 
-        # Now we need to find other, this will be whenever the side of the
-        # pivot changes or till we hit the root.
-        node = pivot.parent
-        while not gt or not lt:
-            if node.parent == None:
-                # At root, so if we haven't found the corresponding boundary
-                # then there isn't one.
-                break
-            if node.key > node.parent.key and not gt:
-                gt = node.parent.key
-            elif node.key < node.parent.key and not lt:
-                lt = node.parent.key
-            node = node.parent
-
-        return gt, lt
-
-class PivotNode(object):
-    def __init__(self, key, timestamp=None, parent=None):
-        self._key = key
-        self._parent = parent
-        self._timestamp = timestamp if timestamp else \
-            Timestamp(time.time()).internal
-        self._left = self._right = None
-        self._level = parent.level + 1 if parent else 0
-
-    @property
-    def key(self):
-        return self._key
-
-    @key.setter
-    def key(self, key):
-        self._key = key
-
-    @property
-    def parent(self):
-        return self._parent
-
-    @parent.setter
-    def parent(self, parent):
-        self._parent = parent
-
-    @property
-    def timestamp(self):
-        return self._timestamp
-
-    @timestamp.setter
-    def timestamp(self, timestamp):
-        self._timestamp = timestamp
-
-    @property
-    def left(self):
-        return self._left
-
-    @left.setter
-    def left(self, left):
-        self._left = left
-
-    @property
-    def right(self):
-        return self._right
-
-    @right.setter
-    def right(self, right):
-        self._right = right
-
-    @property
-    def level(self):
-        return self._level
-
-    def __iter__(self):
-        yield self
-        for node in (self._left, self._right):
-            if node:
-                for c in node:
-                    yield c
-
-    def leaves_iter(self, reverse=False):
-        """
-        A leaf iterator.
-
-        This method is an iterator which iterates through all the leaf nodes
-        of the trie. Because each node represents a pivot point, along with
-        the node it returns which side of the Pivot is the leaf.
-        The iterator returns a (node, weight) tuple. Where wieght indicates
-        which side of the node is a leaf, ie:
-
-          -1: The left side (< node.key)
-           1: The right side (> node.key)
-
-        :param reverse: Reverse the iteration of the tree (high -> low)
-        """
-        order = [(self._left, -1), (self._right, 1)]
-        if reverse:
-            order.reverse()
-        for node, weight in order:
-            if node:
-                for n, w in node.leaves_iter(reverse):
-                    yield n, w
-            else:
-                yield self, weight
-
-    def add(self, key, timestamp=None):
-        if not isinstance(key, unicode):
-            key = unicode(key)
-        if key < self.key:
-            if self._left:
-                return self._left.add(key, timestamp)
-            else:
-                self._left = PivotNode(key, timestamp, parent=self)
-                return True
-        elif key > self.key:
-            if self._right:
-                return self._right.add(key, timestamp)
-            else:
-                self._right = PivotNode(key, timestamp, parent=self)
-                return True
-        if key == self.key or key in (self._right.key, self._left.key):
-            # Key already exists
-            return False
-
-    def _return_int(self, key):
-        if self._key == key:
-            return 0
-        elif self._key < key:
-            return 1
+    def __lt__(self, other):
+        if isinstance(other, PivotRange):
+            return self._upper < other.lower or self._lower < other.lower
         else:
-            return -1
+            if self._upper is None:
+                return False
+            return self._upper < other
 
-    def get(self, key, leaf=True):
-        """
-        Given the key, return the PivotNode (where the object (key) will be
-        stored) and an int representing where the key lies in relation to the
-        pivot point. Where the int is either:
-
-          -1: key is before the pivot point
-           0: key is equal to the pivot point
-           1: key is bigger then the pivot point
-
-        :rtype : Tuple of PivitNode and int (node, int) where the int's
-                 value represents the keys relation to the pivot point.
-        """
-        if leaf:
-            if key <= self._key:
-                if self._left:
-                    return self._left.get(key)
+    def __gt__(self, other):
+        if isinstance(other, PivotRange):
+            return self._lower >= other.upper or self._upper > other.upper
         else:
-            if key < self._key:
-                if self._left:
-                    return self._left.get(key, leaf)
-        if key > self._key:
-            if self._right:
-                return self._right.get(key, leaf)
-        return self, self._return_int(key)
+            if self._lower is None:
+                return False
+            return self._lower >= other
 
-    def __getitem__(self, item):
-        return self.get(item)
+    def __eq__(self, other):
+        return self._lower == other.lower and self._upper == other.upper
 
 
-def pivot_to_pivot_container(account, container, pivot_point, weight):
+def find_pivot_range(item, ranges):
+    """
+
+    :param item: The item that that need to be placed
+    :param ranges: Byte order sorted list of ranges.
+    :return:
+    """
+    index = len(ranges) / 2
+    try:
+        while item not in ranges[index]:
+            if ranges[index] < item:
+                index += (len(ranges) - index) / 2
+            else:
+                index = index / 2
+
+        return ranges[index]
+    except Exception:
+        return None
+
+
+def pivot_to_pivot_container(account, container, lower=None, upper=None,
+                             pivot_range=None):
         """
-        Using a specified pivot_point and weight, generate the required sharded
-        account and container name.
+        Using a specified lower and upper boundry, generate the required
+        sharded account and container name.
 
-        Given something like ``acc, cont, orange, -1`` it will return:
+        Given something like ``acc, cont, orange, tomato`` it will return:
 
-            .sharded_acc cont<-orange
+            .sharded_acc cont_orange_tomato
 
         :param account: The root container's account
         :param container: The root container
-        :param pivot_point: The pivot point
-        :param weight: The weight as provided by the PivotTrie (-1, 0, 1)
+        :param lower: The lower boundry
+        :param upper: The upper boundry
+        :param pivot_range: specify a pivotRange object to use
         :return: A tuple of (account, container) representing the sharded
                  container.
         """
-        if not pivot_point and not weight:
+        if pivot_range:
+            upper = pivot_range.upper
+            lower = pivot_range.lower
+
+        if not upper and not lower:
             return account, container
-        weight_to_str = {-1: '.le.', 0: '.le.', 1: '.gt.'}
         acc = ".sharded_%s" % account
-        cont = "%s%s%s" % (container, weight_to_str[weight], pivot_point)
+        cont = "%s_%s_%s" % (container, lower, upper)
         return acc, cont
-
-
-def pivot_container_to_pivot(root_container, container):
-    if root_container == container:
-        return None, None
-    pivot = container[len(root_container) + 4:]
-    weight = container[len(root_container):len(container) + 4]
-    if weight.startswith('.le.'):
-        weight = -1
-    else:
-        weight = 1
-
-    return pivot, weight
 
 
 def verify_pivot_usage_header(value):
@@ -3927,25 +3768,18 @@ def verify_pivot_usage_header(value):
     Takes in the value of a pivot usage header (X-Backend-Pivot-Used-Bytes or
     X-Backend-Pivot-Object-Count), which takes the form of:
 
-    "[+-]<int>/[+-]<int>"
+    "[+-]<int>"
 
     The + or - allows to increment the existing count, without these it's
-    setting to total counts. If one of the counts is missing (ending or
-    starting with a '/', then that side is ignored.
+    setting to total counts.
 
     :param value: The header value.
     :return: True if its a valid header, False otherwise.
     """
     if not isinstance(value, string_types):
         return False
-    if '/' not in value:
+    try:
+        int(value)
+    except ValueError:
         return False
-    parts = value.split('/')
-    if 0 == len(parts) > 2:
-        return False
-    for count in parts:
-        try:
-            int(count)
-        except ValueError:
-            return False
     return True

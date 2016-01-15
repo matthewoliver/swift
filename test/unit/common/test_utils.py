@@ -2949,6 +2949,69 @@ cluster_dfw1 = http://dfw1.host/v1/
             if tempdir:
                 shutil.rmtree(tempdir)
 
+    def test_pivot_range(self):
+        # first test infinite range (no boundries)
+        inf_pr = utils.PivotRange()
+        self.assertIsNone(inf_pr.upper)
+        self.assertIsNone(inf_pr.lower)
+
+        for x in range(100):
+            self.assertTrue(x in inf_pr)
+
+        for x in ('a', 'z', 'zzzz', '124fsdf', '', 1234):
+            self.assertTrue(x in inf_pr)
+
+        # test basic boundries
+        atof = utils.PivotRange('a', 'f')
+        ftol = utils.PivotRange('f', 'l')
+        ltor = utils.PivotRange('l', 'r')
+        rtoz = utils.PivotRange('r', 'z')
+
+        # test range > and <
+        self.assertTrue(atof < ftol)
+        self.assertTrue(ltor > ftol)
+        self.assertFalse(rtoz < atof)
+        self.assertFalse(ltor > rtoz)
+
+        # test range < and > to an item
+        # range is > lower and <= upper to lower boundry is't
+        # actually included
+        self.assertTrue(ftol > 'f')
+        self.assertFalse(atof < 'f')
+        self.assertTrue(ltor < 'y')
+
+        # Now test ranges with only 1 boundry
+        lplus = utils.PivotRange('l', None)
+        lminus = utils.PivotRange(None, 'l')
+
+        for x in ('l', 'm', 'z', 'zzz1231sd'):
+            if x == 'l':
+                self.assertFalse(x in lplus)
+                self.assertFalse(lminus < x)
+            else:
+                self.assertTrue(x in lplus)
+                self.assertTrue(lminus < x)
+
+        # Now test some of the range to range checks with missing boundries
+        self.assertFalse(atof < lminus)
+        self.assertFalse(lminus < inf_pr)
+
+    def test_find_pivot_range(self):
+        atof = utils.PivotRange('a', 'f')
+        ftol = utils.PivotRange('f', 'l')
+        ltor = utils.PivotRange('l', 'r')
+        rtoz = utils.PivotRange('r', 'z')
+        ranges = [atof, ftol, ltor, rtoz]
+
+        range = utils.find_pivot_range('b', ranges)
+        self.assertEqual(range, atof)
+        range = utils.find_pivot_range('f', ranges)
+        self.assertEqual(range, atof)
+        range = utils.find_pivot_range('x', ranges)
+        self.assertEqual(range, rtoz)
+        range = utils.find_pivot_range('r', ranges)
+        self.assertEqual(range, ltor)
+
 
 class ResellerConfReader(unittest.TestCase):
 
