@@ -493,7 +493,7 @@ class ContainerBroker(DatabaseBroker):
             self.account = data['account']
             self.container = data['container']
 
-            if not self.get_pivot_points(connection=conn):
+            if not self.get_pivot_ranges(connection=conn):
                 # This container can have objects, so find the current pivot
                 # point.
                 data['pivot_point'] = \
@@ -824,7 +824,7 @@ class ContainerBroker(DatabaseBroker):
             created_at = {}
             column = 'name' if obj else 'lower'
             for offset in range(0, len(rec_list), SQLITE_ARG_LIMIT):
-                chunk = [rec['name'] for rec in
+                chunk = [rec[column] for rec in
                          rec_list[offset:offset + SQLITE_ARG_LIMIT]]
                 sql = 'SELECT %s, ' % column
                 sql += 'storage_policy_index' if obj else '0'

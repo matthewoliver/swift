@@ -269,7 +269,7 @@ class ContainerController(BaseStorageServer):
         if not os.path.exists(broker.db_file):
             return HTTPNotFound()
         if obj:     # delete object
-            if len(broker.get_pivot_points()) > 0:
+            if len(broker.get_pivot_ranges()) > 0:
                 try:
                     # This is a sharded root container, so we need figure out
                     # where the obj should live and return a 301.
