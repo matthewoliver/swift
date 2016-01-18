@@ -533,8 +533,8 @@ class ContainerController(BaseStorageServer):
             # Conversion has already happened (e.g. from a sharded node)
             return record
         if pivot:
-            (name, created, level, object_count, bytes_used) = record[:5]
-            response = {'name': name, 'level': level,
+            (lower, created, upper, object_count, bytes_used) = record[:5]
+            response = {'lower': lower, 'upper': upper,
                         'object_count': object_count,
                         'bytes_used': bytes_used}
         else:
@@ -544,7 +544,8 @@ class ContainerController(BaseStorageServer):
             response = {'bytes': size, 'hash': etag, 'name': name,
                         'content_type': content_type}
         response['last_modified'] = Timestamp(created).isoformat
-        override_bytes_from_content_type(response, logger=self.logger)
+        if not pivot:
+            override_bytes_from_content_type(response, logger=self.logger)
         return response
 
     def GET_sharded(self, req, broker, headers, marker='', end_marker='',
@@ -658,8 +659,10 @@ class ContainerController(BaseStorageServer):
         resp_headers = gen_resp_headers(info, is_deleted=is_deleted)
         if is_deleted:
             return HTTPNotFound(request=req, headers=resp_headers)
+        kargs = {}
         if nodes and nodes.lower() == "pivot":
             container_list = broker.get_pivot_ranges()
+            kargs.update(dict(pivot=True))
         elif len(broker.get_pivot_ranges()) > 0:
             # Sharded container so we need to pass to GET_sharded
             return self.GET_sharded(req, broker, resp_headers, marker,
@@ -669,7 +672,8 @@ class ContainerController(BaseStorageServer):
                 limit, marker, end_marker, prefix, delimiter, path,
                 storage_policy_index=info['storage_policy_index'])
         return self.create_listing(req, out_content_type, info, resp_headers,
-                                   broker.metadata, container_list, container)
+                                   broker.metadata, container_list, container,
+                                   **kargs)
 
     def create_listing(self, req, out_content_type, info, resp_headers,
                        metadata, container_list, container, pivot=False):
@@ -686,7 +690,7 @@ class ContainerController(BaseStorageServer):
                 fields = ["lower", "upper", "object_count", "bytes_used",
                           "last_modified"]
             for obj in container_list:
-                record = self.update_data_record(obj)
+                record = self.update_data_record(obj, pivot)
                 if 'subdir' in record:
                     name = record['subdir'].decode('utf-8')
                     sub = SubElement(doc, 'subdir', name=name)

@@ -256,7 +256,7 @@ class ContainerSharder(ContainerReplicator):
                     timestamp = ts.internal
                 obj = {
                     'created_at': timestamp or item[1]}
-                if len(item) > 3:
+                if isinstance(item[2], int):
                     # object item
                     obj.update({
                         'name': item[0],
@@ -423,9 +423,13 @@ class ContainerSharder(ContainerReplicator):
             return None
 
         lower = broker.metadata.get('X-Container-Sysmeta-Shard-Lower')
+        if lower:
+            lower = lower[0]
         upper = broker.metadata.get('X-Container-Sysmeta-Shard-Upper')
+        if upper:
+            upper = upper[0]
 
-        if not lower or not upper:
+        if not lower and not upper:
             return None
 
         if not lower:
@@ -778,7 +782,7 @@ class ContainerSharder(ContainerReplicator):
                              broker.container)
 
         # Now that we have quorum we can split.
-        self.logger.info(_('sharding at from container %s on pivot %s'),
+        self.logger.info(_('sharding container %s on pivot %s'),
                          broker.container, pivot)
 
         current_piv = ContainerSharder.get_pivot_range(broker)
@@ -900,6 +904,12 @@ class ContainerSharder(ContainerReplicator):
         if not is_root:
             # Push the new pivot range to the root container,
             # we do this so we can short circuit PUTs.
+
+            # blank out the current stats in root of this contianer now
+            # that it has been blanked.
+            pivot_ranges.append((current_piv.lower, timestamp,
+                                 current_piv.upper, 0, 0))
+
             self._push_pivot_ranges_to_container(None, root_account,
                                                  root_container, pivot_ranges,
                                                  broker.storage_policy_index)

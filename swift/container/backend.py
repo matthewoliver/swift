@@ -258,7 +258,7 @@ class ContainerBroker(DatabaseBroker):
         """
         try:
             conn.executescript("""
-                CREATE TABLE pivot_range (
+                CREATE TABLE pivot_ranges (
                     ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
                     lower TEXT,
                     upper TEXT,
@@ -763,8 +763,10 @@ class ContainerBroker(DatabaseBroker):
         """
         for item in item_list:
             item.setdefault('record_type', RECORD_TYPE_OBJECT)
-            if isinstance(item['name'], unicode):
-                item['name'] = item['name'].encode('utf-8')
+            cols = ['name'] if item.get('name') else ['lower', 'upper']
+            for col in cols:
+                if isinstance(item[col], unicode):
+                    item[col] = item[col].encode('utf-8')
 
         pivot_range_list = [item for item in item_list
                             if item['record_type'] == RECORD_TYPE_PIVOT_NODE]
@@ -799,6 +801,8 @@ class ContainerBroker(DatabaseBroker):
             if item1['created_at'] > item2['created_at']:
                 item1, item2 = (item2, item1)
             for col in ('object_count', 'bytes_used'):
+                item1[col] = str(item1[col])
+                item2[col] = str(item2[col])
                 if '-' not in item2[col] and '+' not in item2[col]:
                     # item2 is a definite definition, so just use it.
                     continue
@@ -857,10 +861,11 @@ class ContainerBroker(DatabaseBroker):
                         to_add[item_ident] = item
             if not obj:
                 # Now that all the to_add items are merged, they are either in
-                # the form of incremented '+|-<count>/+|-<count>' or absolute
-                # '<count>/<count>'. If the former we need to increment before
+                # the form of incremented '+|-<count>' or absolute
+                # '<count>'. If the former we need to increment before
                 # we delete the current values.
-                for item in [i for i in to_add if i.get('prefixed')]:
+                for item in [i for i in to_add.itervalues()
+                             if i.get('prefixed')]:
                     self.update_pivot_usage(item)
             if to_delete:
                 sql = 'DELETE FROM %s WHERE ' % rec_type
@@ -884,13 +889,12 @@ class ContainerBroker(DatabaseBroker):
                          rec['storage_policy_index'])
                          for rec in to_add.itervalues()))
                 else:
-                    # Note: 'size' is storing the level.
                     curs.executemany(
                         'INSERT INTO pivot_ranges (lower, created_at, upper, '
                         'object_count, bytes_used, deleted)'
                         'VALUES (?, ?, ?, ?, ?, ?)',
                         ((rec[column], rec['created_at'],
-                          rec.get('upper', rec['size']),
+                          rec.get('upper'),
                           rec.get('object_count', 0),
                           rec.get('bytes_used', 0),
                           rec['deleted'])
