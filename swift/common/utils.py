@@ -3692,7 +3692,7 @@ class PivotRange(object):
         elif not self._upper:
             return self.lower < item
         else:
-            return self.lower < item <= self._upper
+            return self.lower < item and item <= self._upper
 
     def __lt__(self, other):
         if isinstance(other, PivotRange):

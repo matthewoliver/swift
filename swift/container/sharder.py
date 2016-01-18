@@ -256,7 +256,7 @@ class ContainerSharder(ContainerReplicator):
                     timestamp = ts.internal
                 obj = {
                     'created_at': timestamp or item[1]}
-                if len(item) > 3:
+                if len(item) > 5:
                     # object item
                     obj.update({
                         'name': item[0],
