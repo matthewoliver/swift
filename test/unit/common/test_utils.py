@@ -2967,6 +2967,14 @@ cluster_dfw1 = http://dfw1.host/v1/
         ltor = utils.PivotRange('l', 'r')
         rtoz = utils.PivotRange('r', 'z')
 
+        # overlapping ranges
+        dtof = utils.PivotRange('d', 'f')
+        dtom = utils.PivotRange('d', 'm')
+
+        # nones
+        nonetol = utils.PivotRange(None, 'l')
+        ltonone = utils.PivotRange('l', None)
+
         # test range > and <
         self.assertTrue(atof < ftol)
         self.assertTrue(ltor > ftol)
@@ -2995,6 +3003,16 @@ cluster_dfw1 = http://dfw1.host/v1/
         # Now test some of the range to range checks with missing boundries
         self.assertFalse(atof < lminus)
         self.assertFalse(lminus < inf_pr)
+
+        # Now test PivotRange.overlaps(other)
+        self.assertFalse(atof.overlaps(ftol))
+        self.assertFalse(ftol.overlaps(atof))
+        self.assertTrue(atof.overlaps(dtof))
+        self.assertTrue(dtof.overlaps(atof))
+        self.assertFalse(dtof.overlaps(ftol))
+        self.assertTrue(dtom.overlaps(ftol))
+        self.assertTrue(ftol.overlaps(dtom))
+        self.assertFalse(nonetol.overlaps(ltonone))
 
     def test_find_pivot_range(self):
         atof = utils.PivotRange('a', 'f')

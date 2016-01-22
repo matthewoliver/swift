@@ -296,8 +296,26 @@ class ContainerController(BaseStorageServer):
                     return HTTPMovedPermanently(headers=headers)
                 except Exception:
                     return HTTPInternalServerError()
-            broker.delete_object(obj, req.headers.get('x-timestamp'),
-                                 obj_policy_index)
+            record_type = req.headers.get('x-backend-record-type')
+            if record_type == RECORD_TYPE_PIVOT_NODE:
+                # Pivot point items has different information that needs to
+                # be passed. This should only come from the backend.
+                obj_count = req.headers.get('x-backend-pivot-objects')
+                bytes_used = req.headers.get('x-backend-pivot-bytes')
+                obj_timestamp = req.headers.get('x-backend-timestamp')
+                req_timestamp = obj_timestamp or req.headers.get('x-timestamp')
+
+                # Level is required when putting a pivot point.
+                upper = req.headers.get('x-backend-pivot-upper')
+                if not upper:
+                    raise HTTPBadRequest()
+                broker.delete_object(
+                    obj, req_timestamp,
+                    obj_policy_index, upper=upper, object_count=obj_count,
+                    bytes_used=bytes_used, record_type=record_type)
+            else:
+                broker.delete_object(obj, req.headers.get('x-timestamp'),
+                                     obj_policy_index)
             return HTTPNoContent(request=req)
         else:
             # delete container
@@ -423,6 +441,8 @@ class ContainerController(BaseStorageServer):
                 # be passed. This should only come from the backend.
                 obj_count = req.headers.get('x-backend-pivot-objects')
                 bytes_used = req.headers.get('x-backend-pivot-bytes')
+                obj_timestamp = req.headers.get('x-backend-timestamp')
+                req_timestamp = obj_timestamp or req_timestamp
 
                 # Level is required when putting a pivot point.
                 upper = req.headers.get('x-backend-pivot-upper')
@@ -431,7 +451,8 @@ class ContainerController(BaseStorageServer):
                 broker.put_object(
                     obj, req_timestamp.internal,
                     int(req.headers['x-size']), '', '', 0,
-                    upper=upper, object_count=obj_count, bytes_used=bytes_used)
+                    upper=upper, object_count=obj_count,
+                    bytes_used=bytes_used, record_type=record_type)
             else:
                 broker.put_object(obj, req_timestamp.internal,
                                   int(req.headers['x-size']),
@@ -536,7 +557,8 @@ class ContainerController(BaseStorageServer):
             (lower, created, upper, object_count, bytes_used) = record[:5]
             response = {'lower': lower, 'upper': upper,
                         'object_count': object_count,
-                        'bytes_used': bytes_used}
+                        'bytes_used': bytes_used,
+                        'created_at': created}
         else:
             (name, created, size, content_type, etag) = record[:5]
             if content_type is None:

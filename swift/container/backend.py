@@ -353,15 +353,23 @@ class ContainerBroker(DatabaseBroker):
                     'SELECT object_count from container_stat').fetchone()
             return (row[0] == 0)
 
-    def delete_object(self, name, timestamp, storage_policy_index=0):
+    def delete_object(self, name, timestamp, storage_policy_index=0,
+                      upper=None, object_count=0, bytes_used=0,
+                      record_type=RECORD_TYPE_OBJECT):
         """
         Mark an object deleted.
 
         :param name: object name to be deleted
         :param timestamp: timestamp when the object was marked as deleted
         """
+
+        kargs = {}
+        if record_type != RECORD_TYPE_OBJECT:
+            kargs.update(dict(upper=upper, object_count=object_count,
+                              bytes_used=bytes_used, record_type=record_type))
         self.put_object(name, timestamp, 0, 'application/deleted', 'noetag',
-                        deleted=1, storage_policy_index=storage_policy_index)
+                        deleted=1, storage_policy_index=storage_policy_index,
+                        **kargs)
 
     def make_tuple_for_pickle(self, record):
         if record['record_type'] == RECORD_TYPE_PIVOT_NODE:
@@ -390,6 +398,8 @@ class ContainerBroker(DatabaseBroker):
                             object data or a pivot point)
         """
         if record_type == RECORD_TYPE_PIVOT_NODE:
+            if name == 'None':
+                name = None
             record = {'lower': name, 'created_at': timestamp, 'upper': upper,
                       'object_count': object_count, 'bytes_used': bytes_used,
                       'deleted': deleted, 'storage_policy_index': 0,

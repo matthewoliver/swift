@@ -3663,9 +3663,10 @@ def get_md5_socket():
     return md5_sockfd
 
 class PivotRange(object):
-    def __init__(self, lower=None, upper=None):
+    def __init__(self, lower=None, upper=None, timestamp=None):
         self._lower = lower
         self._upper = upper
+        self._timestamp = timestamp
 
     @property
     def lower(self):
@@ -3682,6 +3683,10 @@ class PivotRange(object):
     @upper.setter
     def upper_setter(self, upper):
         self._upper = upper
+
+    @property
+    def timestamp(self):
+        return self._timestamp
 
     def __contains__(self, item):
         if not self._lower and not self._upper:
@@ -3712,6 +3717,33 @@ class PivotRange(object):
 
     def __eq__(self, other):
         return self._lower == other.lower and self._upper == other.upper
+
+    def entire_namespace(self):
+        return self._lower is None and self._upper is None
+
+    def overlaps(self, other):
+        if self.lower is None and other.lower is None:
+            return True
+        elif self.upper is None and other.upper is None:
+            return True
+        elif self.entire_namespace() or other.entire_namespace():
+            return True
+        elif self.upper is None:
+            return other.upper > self.lower
+        elif other.upper is None:
+            return self.upper > other.lower
+        return other.upper > self._upper > other.lower or \
+               other.upper > self._lower > other.lower or \
+               self._upper > other.upper > self._lower or \
+               self._upper > other.lower > self._lower or \
+               (self._upper > other.upper and self._lower < other.lower) or \
+               (other.lower < self._lower and other.upper > self._upper)
+
+    def newer(self, other):
+        if self._timestamp:
+            return self._timestamp > other.timestamp
+        else:
+            return False
 
 
 def find_pivot_range(item, ranges):

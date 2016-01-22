@@ -190,7 +190,8 @@ class ContainerSharder(ContainerReplicator):
             for pivot in json.loads(resp.body):
                 lower = pivot.get('lower') or None
                 upper = pivot.get('upper') or None
-                ranges.append(PivotRange(lower, upper))
+                created_at = pivot.get('created_at') or None
+                ranges.append(PivotRange(lower, upper, created_at))
         except ValueError:
             # Failed to decode the json response
             return None
@@ -416,7 +417,7 @@ class ContainerSharder(ContainerReplicator):
         self.logger.info('Finished misplaced shard replication')
 
     @staticmethod
-    def get_pivot_range(broker):
+    def get_pivot_range(broker, timestamp=None):
         account, container = ContainerSharder.get_shard_root_path(broker)
         if account == broker.account:
             # This is the root container, so doesn't represent a range
@@ -437,7 +438,7 @@ class ContainerSharder(ContainerReplicator):
         if not upper:
             upper = None
 
-        return PivotRange(lower, upper)
+        return PivotRange(lower, upper, timestamp)
 
     @staticmethod
     def get_shard_root_path(broker):
@@ -485,6 +486,10 @@ class ContainerSharder(ContainerReplicator):
 
     def _audit_shard_container(self, broker, pivot, root_account=None,
                                root_container=None):
+        # TODO We will need to audit the root (make sure there are no missing
+        #      gaps in the ranges.
+        # TODO Search for overlaps if you find some, keep the newest and
+        #      attempt to correct (remove the older one).
 
         self.logger.info(_('Auditing %s/%s'), broker.account, broker.container)
         continue_with_container = True
@@ -494,15 +499,27 @@ class ContainerSharder(ContainerReplicator):
 
         if root_container == broker.container:
             # This is the root container, and therefore the tome of knowledge,
-            # So we must assume it's correct (though I may need to think about
-            # this some more).
+            # all we can do is check there is nothing screwy with the range
+            ranges = broker.get_pivot_ranges()
+            ranges = [PivotRange(r[0], r[2], r[1]) for r in ranges]
+            overlaps = self._find_overlapping_ranges(ranges)
+            if overlaps:
+                newest = max(overlaps, key=lambda x: x.timestamp)
+                older = set(newest).difference(overlaps)
+
+                # now delete the older overlaps, keeping only the newest
+                timestamp = Timestamp(newest.timestamp)
+                timestamp.offset += 1
+                pivots = [(r.lower, timestamp.internal, r.upper, 0, 0)
+                          for r in older]
+                self._update_pivot_ranges(root_account, root_container,
+                                          'DELETE', pivots)
+                continue_with_container = False
             return continue_with_container
 
-        root_ok = False
-        parent = None
         # Get the root view of the world.
         ranges = self._get_pivot_ranges(root_account, root_container,
-                                      newest=True)
+                                        newest=True)
         if ranges is None:
             # failed to get the root tree. Error out for now.. we may need to
             # quarantine the container.
@@ -510,23 +527,40 @@ class ContainerSharder(ContainerReplicator):
                                   "container %s/%s, it may not exist."),
                                 root_account, root_container)
             return False
-        if pivot in ranges:
-            root_ok = True
-
-        if root_ok:
-            # short circuit
+        if pivot in ranges or broker.is_deleted() or \
+                len(broker.get_pivot_ranges()):
+            # If pivot exists or is a parent container that has already been
+            # deleted, then let it continue. In the case of the latter, we let
+            # it through, in case it has misplaced objects to deal with.
             return continue_with_container
 
-        # We need to quarantine
-        # We may actually never get here.. this needs to be re-thought.
-        self.logger.warning(_("Shard container '%s/%s' is being "
-                              "quarantined, neither the root container "
-                              "'%s/%s' or it's parent knows of it's "
-                              "existance"), broker.account,
-                            broker.container, root_account, root_container)
-        # TODO quarantine the container
-        continue_with_container = False
+        # pivot isn't in ranges, if it overlaps with an item, were in trouble
+        # if it doesn't then it might not be updated yet, so just let it
+        # continue (or maybe we shouldn't?).
+        if any([r for r in ranges if r.overlaps(pivot)]) and False:
+            # the pivot overlaps something in the root. Not good
+            self.logger.error(_('The range of objects stored in this container'
+                                ' (%s/%s) overlaps with another pivot'),
+                              broker.account, broker.container)
+            # TODO do something here (qurantine?) Also this might be bad cause
+            # this might always hit when the root hasn't been updated so Falsed
+            # it.
+            continue_with_container = False
+            return continue_with_container
+
+        # pivot doesn't exist in the root containers ranges, but doesn't
+        # overlap with anything
         return continue_with_container
+
+    def _update_pivot_counts(self, root_account, root_container, broker):
+        if broker.container == root_container:
+            return
+        timestamp = Timestamp(time.time())
+        pivot = self.get_pivot_range(broker, timestamp)
+        tmp_info = broker.get_info()
+        pivot = (pivot.lower, pivot.timestamp, pivot.upper,
+                 tmp_info['object_count'], tmp_info['bytes_used'])
+        self._update_pivot_ranges(root_account, root_container, 'PUT', [pivot])
 
     def _one_shard_pass(self, reported):
         """
@@ -569,9 +603,6 @@ class ContainerSharder(ContainerReplicator):
             if not sharded:
                 # Not a shard container
                 continue
-            if broker.is_deleted():
-                # This container is deleted so we can skip it.
-                continue
             self.range_cache = {}
             root_account, root_container = \
                 ContainerSharder.get_shard_root_path(broker)
@@ -591,6 +622,12 @@ class ContainerSharder(ContainerReplicator):
             # now look and deal with misplaced objects.
             self._misplaced_objects(broker, root_account, root_container,
                                     pivot)
+
+            if broker.is_deleted():
+                # This container is deleted so we can skip it. We still want
+                # deleted containers to go via misplaced items, cause they may
+                # have new objects in sitting in them that may need to move.
+                continue
 
             self.shard_brokers = dict()
             self.shard_cleanups = dict()
@@ -618,6 +655,8 @@ class ContainerSharder(ContainerReplicator):
                     obj_count = broker.get_info()['object_count']
                     if obj_count > self.shard_container_size:
                         self._find_pivot_point(broker)
+                    self._update_pivot_counts(root_account, root_container,
+                                              broker)
 
         # wipe out the cache do disable bypass in delete_db
         cleanups = self.shard_cleanups
@@ -675,6 +714,39 @@ class ContainerSharder(ContainerReplicator):
             self.logger.info(str(x))
             # Need to do something here.
             return None
+
+    def _update_pivot_ranges(self, account, container, op, pivots):
+        path = "/%s/%s" % (account, container)
+        part, nodes = self.ring.get_nodes(account, container)
+
+        for pivot in pivots:
+            # (piv.lower, timestamp, piv.upper, object_count, bytes_used)
+            obj = pivot[0]
+            if not obj:
+                obj = 'None'
+            path += '/%s' % obj
+            headers = {
+                'x-backend-record-type': RECORD_TYPE_PIVOT_NODE,
+                'x-backend-pivot-objects': pivot[3],
+                'x-backend-pivot-bytes': pivot[4],
+                'x-backend-pivot-upper': pivot[2],
+                'x-backend-timestamp': pivot[1]}
+
+            for node in nodes:
+                self.cpool.spawn(
+                    self._send_request, node['ip'], node['port'],
+                    node['device'], part, op, path, headers)
+
+    def _find_overlapping_ranges(self, ranges):
+        result = set()
+        for range in ranges:
+            res = [r for r in ranges if range != r and range.overlaps(r)]
+            if res:
+                res.append(range)
+                res.sort()
+                result.add(tuple(res))
+
+        return result
 
     def _find_pivot_point(self, broker):
         self.logger.info(_('Started searching for best pivot point for %s/%s'),
@@ -823,6 +895,10 @@ class ContainerSharder(ContainerReplicator):
         except internal_client.UnexpectedResponse as ex:
             self.logger.warning(_('Failed to put container: %s'),
                                 str(ex))
+            self.logger.error(_('PUT of new shard containers failed, cancelling'
+                                ' split of %s/%s. Will try again next pass'),
+                              broker.account, broker.container)
+            return
 
         policy_index = broker.storage_policy_index
         query = dict(marker='', end_marker='', prefix='', delimiter='',
@@ -904,15 +980,19 @@ class ContainerSharder(ContainerReplicator):
         if not is_root:
             # Push the new pivot range to the root container,
             # we do this so we can short circuit PUTs.
+            self._update_pivot_ranges(root_account, root_container, 'PUT',
+                                      pivot_ranges)
 
             # blank out the current stats in root of this contianer now
             # that it has been blanked.
-            pivot_ranges.append((current_piv.lower, timestamp,
-                                 current_piv.upper, 0, 0))
+            piv = (current_piv.lower, timestamp, current_piv.upper, 0, 0)
+            self._update_pivot_ranges(root_account, root_container, 'DELETE',
+                                      [piv])
+            broker.delete_db(timestamp)
 
-            self._push_pivot_ranges_to_container(None, root_account,
-                                                 root_container, pivot_ranges,
-                                                 broker.storage_policy_index)
+            # self._push_pivot_ranges_to_container(None, root_account,
+            #                                     root_container, pivot_ranges,
+            #                                     broker.storage_policy_index)
 
         # Now replicate the container we are working on
         self.logger.info(_('Replicating container %s/%s'),
