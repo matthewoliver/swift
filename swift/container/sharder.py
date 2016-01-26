@@ -503,9 +503,9 @@ class ContainerSharder(ContainerReplicator):
             ranges = broker.get_pivot_ranges()
             ranges = [PivotRange(r[0], r[2], r[1]) for r in ranges]
             overlaps = self._find_overlapping_ranges(ranges)
-            if overlaps:
-                newest = max(overlaps, key=lambda x: x.timestamp)
-                older = set(newest).difference(overlaps)
+            for overlap in overlaps:
+                newest = max(overlap, key=lambda x: x.timestamp)
+                older = set(overlap).difference(set([newest]))
 
                 # now delete the older overlaps, keeping only the newest
                 timestamp = Timestamp(newest.timestamp)
@@ -515,6 +515,7 @@ class ContainerSharder(ContainerReplicator):
                 self._update_pivot_ranges(root_account, root_container,
                                           'DELETE', pivots)
                 continue_with_container = False
+
             return continue_with_container
 
         # Get the root view of the world.
@@ -724,7 +725,7 @@ class ContainerSharder(ContainerReplicator):
             obj = pivot[0]
             if not obj:
                 obj = 'None'
-            path += '/%s' % obj
+            obj_path = '%s/%s' % (path, obj)
             headers = {
                 'x-backend-record-type': RECORD_TYPE_PIVOT_NODE,
                 'x-backend-pivot-objects': pivot[3],
@@ -735,7 +736,7 @@ class ContainerSharder(ContainerReplicator):
             for node in nodes:
                 self.cpool.spawn(
                     self._send_request, node['ip'], node['port'],
-                    node['device'], part, op, path, headers)
+                    node['device'], part, op, obj_path, headers)
 
     def _find_overlapping_ranges(self, ranges):
         result = set()
