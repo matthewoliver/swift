@@ -731,7 +731,8 @@ class ContainerSharder(ContainerReplicator):
                 'x-backend-pivot-objects': pivot[3],
                 'x-backend-pivot-bytes': pivot[4],
                 'x-backend-pivot-upper': pivot[2],
-                'x-backend-timestamp': pivot[1]}
+                'x-backend-timestamp': pivot[1],
+                'x-size': 0}
 
             for node in nodes:
                 self.cpool.spawn(
@@ -840,7 +841,7 @@ class ContainerSharder(ContainerReplicator):
 
         successes = 1
         for resp in self.cpool:
-            if not is_success(resp.status):
+            if not resp or not is_success(resp.status):
                 continue
             if resp.getheader('X-Container-Sysmeta-Shard-Pivot') == pivot:
                 successes += 1
