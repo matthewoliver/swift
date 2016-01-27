@@ -247,6 +247,44 @@ class ContainerController(BaseStorageServer):
         else:
             return None
 
+    def _find_shard_location(self, req, broker, drive, root_account,
+                             root_container, obj, redirect=False):
+        try:
+            # This is a sharded root container, so we need figure out
+            # where the obj should live and return a 301.
+            ranges = broker.build_pivot_ranges()
+            containing_range = find_pivot_range(obj, ranges)
+            acct, cont = pivot_to_pivot_container(root_account, root_container,
+                                                  pivot_range=containing_range)
+
+            _, nodes = self.ring.get_nodes(root_account, root_container)
+            ip, port = req.host.split(':')
+            indicies = [node['index'] for node in nodes
+                        if node['ip'] == ip and
+                           node['port'] == int(port) and
+                           node['device'] == drive]
+            if not indicies:
+                raise HTTPInternalServerError()
+
+            part, nodes = self.ring.get_nodes(acct, cont)
+            node = nodes[indicies[0]]
+            headers = {
+                'X-Backend-Pivot-Account': acct,
+                'X-Backend-Pivot-Container': cont,
+                'X-Container-Host': "%(ip)s:%(port)d" % node,
+                'X-Container-Device': node['device'],
+                'X-Container-Partition': part}
+
+            if redirect:
+                location = "http://%(ip)s:%(port)d/%(device)s" % node
+                location += "/%s/%s/%s/%s" % (part, acct, cont, obj)
+                headers['Location'] = location
+
+            return HTTPMovedPermanently(headers=headers)
+
+        except Exception:
+            return HTTPInternalServerError()
+
     @public
     @timing_stats()
     def DELETE(self, req):
@@ -269,35 +307,8 @@ class ContainerController(BaseStorageServer):
         if not os.path.exists(broker.db_file):
             return HTTPNotFound()
         if obj:     # delete object
-            if len(broker.get_pivot_ranges()) > 0:
-                try:
-                    # This is a sharded root container, so we need figure out
-                    # where the obj should live and return a 301.
-                    pivotTrie = broker.build_pivot_ranges()
-                    node, weight = pivotTrie.get(obj)
-                    piv_acc, piv_cont = pivot_to_pivot_container(
-                        account, container, node.key, weight)
-
-                    part, nodes = self.ring.get_nodes(account, container)
-                    l_ip, l_port = req.host.split(':')
-                    idx = [node['index'] for node in nodes
-                           if node['ip'] == l_ip and node['port'] == int(l_port)
-                           and node['device'] == drive]
-                    if not idx:
-                        raise HTTPInternalServerError()
-                    idx = idx[0]
-                    part, nodes = self.ring.get_nodes(piv_acc, piv_cont)
-                    headers = {
-                        'X-Backend-Pivot-Account': piv_acc,
-                        'X-Backend-Pivot-Container': piv_cont,
-                        'X-Container-Host': "%(ip)s:%(port)d" % nodes[idx],
-                        'X-Container-Device': nodes[idx]['device'],
-                        'X-Container-Partition': part}
-                    return HTTPMovedPermanently(headers=headers)
-                except Exception:
-                    return HTTPInternalServerError()
             record_type = req.headers.get('x-backend-record-type')
-            if record_type == RECORD_TYPE_PIVOT_NODE:
+            if record_type == str(RECORD_TYPE_PIVOT_NODE):
                 # Pivot point items has different information that needs to
                 # be passed. This should only come from the backend.
                 obj_count = req.headers.get('x-backend-pivot-objects')
@@ -312,7 +323,12 @@ class ContainerController(BaseStorageServer):
                 broker.delete_object(
                     obj, req_timestamp,
                     obj_policy_index, upper=upper, object_count=obj_count,
-                    bytes_used=bytes_used, record_type=record_type)
+                    bytes_used=bytes_used, record_type=int(record_type))
+
+            elif len(broker.get_pivot_ranges()) > 0:
+                # cannot put to a root shard container, find actual container
+                return self._find_shard_location(req, broker, drive, account,
+                                                 container, obj)
             else:
                 broker.delete_object(obj, req.headers.get('x-timestamp'),
                                      obj_policy_index)
@@ -390,40 +406,8 @@ class ContainerController(BaseStorageServer):
             return HTTPInsufficientStorage(drive=drive, request=req)
         requested_policy_index = self.get_and_validate_policy_index(req)
         broker = self._get_container_broker(drive, part, account, container)
-        if obj:     # put container object
-            if os.path.exists(broker.db_file) and \
-                            len(broker.get_pivot_ranges()) > 0:
-                try:
-                    # This is a sharded root container, so we need figure out
-                    # where the obj should live and return a 301.
-                    # We will send back the details of the primary node at the
-                    # same index of this one.
-                    part, nodes = self.ring.get_nodes(account, container)
-                    l_ip, l_port = req.host.split(':')
-                    idx = [node['index'] for node in nodes
-                           if node['ip'] == l_ip and node['port'] == int(l_port)
-                           and node['device'] == drive]
-                    if not idx:
-                        raise HTTPInternalServerError()
-                    idx = idx[0]
-                    ranges = broker.build_pivot_ranges()
-                    piv_range = find_pivot_range(obj, ranges)
-                    piv_acc, piv_cont = pivot_to_pivot_container(
-                        account, container, pivot_range=piv_range)
 
-                    part, nodes = self.ring.get_nodes(piv_acc, piv_cont)
-                    location = "http://%(ip)s:%(port)d/%(device)s" % nodes[idx]
-                    location += "/%s/%s/%s/%s" % (part, piv_acc, piv_cont, obj)
-                    headers = {
-                        'Location': location,
-                        'X-Backend-Pivot-Account': piv_acc,
-                        'X-Backend-Pivot-Container': piv_cont,
-                        'X-Container-Host': "%(ip)s:%(port)d" % nodes[idx],
-                        'X-Container-Device': nodes[idx]['device'],
-                        'X-Container-Partition': part}
-                    return HTTPMovedPermanently(headers=headers)
-                except Exception:
-                    return HTTPInternalServerError()
+        if obj:     # put container object
             # obj put expects the policy_index header, default is for
             # legacy support during upgrade.
             obj_policy_index = requested_policy_index or 0
@@ -436,7 +420,7 @@ class ContainerController(BaseStorageServer):
             if not os.path.exists(broker.db_file):
                 return HTTPNotFound()
             record_type = req.headers.get('x-backend-record-type')
-            if record_type == RECORD_TYPE_PIVOT_NODE:
+            if record_type == str(RECORD_TYPE_PIVOT_NODE):
                 # Pivot point items has different information that needs to
                 # be passed. This should only come from the backend.
                 obj_count = req.headers.get('x-backend-pivot-objects')
@@ -449,10 +433,15 @@ class ContainerController(BaseStorageServer):
                 if not upper:
                     raise HTTPBadRequest()
                 broker.put_object(
-                    obj, req_timestamp.internal,
+                    obj, req_timestamp,
                     int(req.headers['x-size']), '', '', 0,
                     upper=upper, object_count=obj_count,
-                    bytes_used=bytes_used, record_type=record_type)
+                    bytes_used=bytes_used, record_type=int(record_type))
+
+            elif len(broker.get_pivot_ranges()) > 0:
+                # cannot put to a root shard container, find actual container
+                return self._find_shard_location(req, broker, drive, account,
+                                                 container, obj, redirect=True)
             else:
                 broker.put_object(obj, req_timestamp.internal,
                                   int(req.headers['x-size']),
