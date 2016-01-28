@@ -400,6 +400,8 @@ class ContainerBroker(DatabaseBroker):
         if record_type == RECORD_TYPE_PIVOT_NODE:
             if name == 'None':
                 name = None
+            if upper == 'None':
+                upper = None
             record = {'lower': name, 'created_at': timestamp, 'upper': upper,
                       'object_count': object_count, 'bytes_used': bytes_used,
                       'deleted': deleted, 'storage_policy_index': 0,
@@ -822,101 +824,116 @@ class ContainerBroker(DatabaseBroker):
                     item2['prefixed'] = True
             return item2
 
-        def _merge_items_by_type(curs, rec_type='object'):
-            obj = rec_type == 'object'
-            if obj:
-                rec_list = item_list
-            else:
-                rec_list = pivot_range_list
+        def get_records_object(curs, offset, rec_list, query_mod):
+            chunk = [record['name'] for record
+                     in rec_list[offset:offset + SQLITE_ARG_LIMIT]]
+            sql = (('SELECT name, storage_policy_index, created_at '
+                    'FROM object '
+                    'WHERE %s name IN (%s)')
+                   % (query_mod, ','.join('?' * len(chunk))))
+            return (((record[0], record[1]), record[2])
+                    for record in curs.execute(sql, chunk))
 
+        def get_records_pivot(curs, offset, rec_list, query_mod):
+                lower = []
+                upper = []
+                for record in rec_list[offset:offset + SQLITE_ARG_LIMIT]:
+                    lower.append(record['lower'])
+                    upper.append(record['upper'])
+                # None/NULL must be checked with the IS operator
+                sql = (('SELECT lower, upper, 0, created_at '
+                        'FROM pivot_ranges '
+                        'WHERE %s(lower IN (%s) OR lower IS NULL)'
+                        ' AND (upper IN (%s) OR upper IS NULL)')
+                       % (query_mod,
+                          ','.join('?' * len(lower)),
+                          ','.join('?' * len(upper))))
+                return (((rec[0], rec[1], rec[2]), rec[3])
+                        for rec in curs.execute(sql, lower + upper))
+
+        def _merge_items(curs, rec_list, is_object=True):
+            query_mod = ''
             if self.get_db_version(conn) >= 1:
                 query_mod = ' deleted IN (0, 1) AND '
+
+            if is_object:
+                get_records = get_records_object
+                keys = ('name', 'storage_policy_index')
+                del_keys = ('name', 'storage_policy_index')
+                add_keys = ('name', 'created_at', 'size', 'content_type',
+                            'etag', 'deleted', 'storage_policy_index')
+                def transform(item, other):
+                    return max(item, other, key=lambda i: i['created_at'])
+                table = 'object'
             else:
-                query_mod = ''
+                get_records = get_records_pivot
+                keys = ('lower', 'upper', 'storage_policy_index')
+                del_keys = ('lower', 'upper')
+                add_keys = ('lower', 'created_at', 'upper', 'object_count',
+                            'bytes_used', 'deleted')
+                def transform(item, other):
+                    return merge_pivots(other, item)
+                table = 'pivot_ranges'
+
+            to_add_transform = transform
+
             # Get created_at times for objects in rec_list that already exist.
             # We must chunk it up to avoid sqlite's limit of 999 args.
             created_at = {}
-            column = 'name' if obj else 'lower'
             for offset in range(0, len(rec_list), SQLITE_ARG_LIMIT):
-                chunk = [rec[column] for rec in
-                         rec_list[offset:offset + SQLITE_ARG_LIMIT]]
-                sql = 'SELECT %s, ' % column
-                sql += 'storage_policy_index' if obj else '0'
-                sql += ', created_at '
-                sql += 'FROM %s WHERE ' % rec_type
-                sql += query_mod + ' %s IN (%s)' % (column,
-                                                    ','.join('?' * len(chunk)))
                 created_at.update(
-                    ((rec[0], rec[1]), rec[2]) for rec in curs.execute(
-                        sql, chunk))
+                    get_records(curs, offset, rec_list, query_mod))
+
             # Sort item_list into things that need adding and deleting, based
             # on results of created_at query.
             to_delete = {}
             to_add = {}
             for item in rec_list:
                 item.setdefault('storage_policy_index', 0)  # legacy
-                item_ident = (item[column], item['storage_policy_index'])
+                item_ident = tuple(item[key] for key in keys)
                 if created_at.get(item_ident) < item['created_at']:
-                    if item_ident in created_at:  # exists with older timestamp
+                    # exists with older timestamp
+                    if item_ident in created_at:
                         to_delete[item_ident] = item
-                    if item_ident in to_add:  # duplicate entries in item_list
-                        if obj:
-                            to_add[item_ident] = max(
-                                    item, to_add[item_ident],
-                                    key=lambda i: i['created_at'])
-                        else:
-                            to_add[item_ident] = merge_pivots(
-                                    to_add[item_ident], item)
-                    else:
+                    # duplicate entries in item_list
+                    if item_ident in to_add:
+                        other_item = to_add[item_ident]
+                        to_add[item_ident] = to_add_transform(item, other_item)
+                    # a normal entry, the default, add it
+                    # on the chance it is a pivot node, make sure it has items
+                    elif item.get('object_count') != 0:
                         to_add[item_ident] = item
-            if not obj:
+
+            if not is_object:
                 # Now that all the to_add items are merged, they are either in
                 # the form of incremented '+|-<count>' or absolute
                 # '<count>'. If the former we need to increment before
                 # we delete the current values.
-                for item in [i for i in to_add.itervalues()
-                             if i.get('prefixed')]:
+                items = [i for i in to_add.itervalues() if i.get('prefixed')]
+                for item in items:
                     self.update_pivot_usage(item)
+
             if to_delete:
-                sql = 'DELETE FROM %s WHERE ' % rec_type
-                sql += query_mod + '%s=? ' % column
-                sql += 'AND storage_policy_index=?' if obj else ''
-                if obj:
-                    del_generator = ((rec[column], rec['storage_policy_index'])
-                                     for rec in to_delete.itervalues())
-                else:
-                    del_generator = ([rec[column]]
-                                     for rec in to_delete.itervalues())
+                filters = ' AND '.join(['%s IS ?' % key for key in del_keys])
+                sql = 'DELETE FROM %s WHERE %s%s' % (table, query_mod, filters)
+                del_generator = (tuple([record[key] for key in del_keys])
+                                 for record in to_delete.itervalues())
                 curs.executemany(sql, del_generator)
+
             if to_add:
-                if obj:
-                    curs.executemany(
-                        'INSERT INTO object (name, created_at, size, '
-                        'content_type, etag, deleted, storage_policy_index)'
-                        'VALUES (?, ?, ?, ?, ?, ?, ?)',
-                        ((rec[column], rec['created_at'], rec['size'],
-                         rec['content_type'], rec['etag'], rec['deleted'],
-                         rec['storage_policy_index'])
-                         for rec in to_add.itervalues()))
-                else:
-                    curs.executemany(
-                        'INSERT INTO pivot_ranges (lower, created_at, upper, '
-                        'object_count, bytes_used, deleted)'
-                        'VALUES (?, ?, ?, ?, ?, ?)',
-                        ((rec[column], rec['created_at'],
-                          rec.get('upper'),
-                          rec.get('object_count', 0),
-                          rec.get('bytes_used', 0),
-                          rec['deleted'])
-                         for rec in to_add.itervalues()))
+                vals = ','.join('?' * len(add_keys))
+                sql = 'INSERT INTO %s %s VALUES (%s)' % (table, add_keys, vals)
+                add_generator = (tuple([record[key] for key in add_keys])
+                                 for record in to_add.itervalues())
+                curs.executemany(sql, add_generator)
 
         def _really_merge_items(conn):
             curs = conn.cursor()
             curs.execute('BEGIN IMMEDIATE')
             if item_list:
-                _merge_items_by_type(curs, 'object')
+                _merge_items(curs, item_list)
             if pivot_range_list:
-                _merge_items_by_type(curs, 'pivot_ranges')
+                _merge_items(curs, pivot_range_list, False)
             if source and item_list:
                 # for replication we rely on the remote end sending merges in
                 # order with no gaps to increment sync_points
@@ -1196,7 +1213,7 @@ class ContainerBroker(DatabaseBroker):
     def build_pivot_ranges(self):
         ranges = list()
 
-        for node in self.get_pivot_ranges():
+        for node in sorted(self.get_pivot_ranges()):
             ranges.append(PivotRange(node[0], node[2]))
         return ranges
 

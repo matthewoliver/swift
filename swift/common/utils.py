@@ -3718,6 +3718,9 @@ class PivotRange(object):
     def __eq__(self, other):
         return self._lower == other.lower and self._upper == other.upper
 
+    def __repr__(self):
+        return '(%s to %s as of %s)' % (self.lower, self.upper, self.timestamp)
+
     def entire_namespace(self):
         return self._lower is None and self._upper is None
 
@@ -3753,13 +3756,16 @@ def find_pivot_range(item, ranges):
     :param ranges: Byte order sorted list of ranges.
     :return:
     """
-    index = len(ranges) / 2
+    lower_bound = 0
+    upper_bound = len(ranges)
+    index = upper_bounds / 2
     try:
         while item not in ranges[index]:
             if ranges[index] < item:
-                index += (len(ranges) - index) / 2
+                lower_bound = index + 1
             else:
-                index = index / 2
+                upper_bound = index - 1
+            index = lower_bound + ((upper_bound - lower_bound) / 2)
 
         return ranges[index]
     except Exception:

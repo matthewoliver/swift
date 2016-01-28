@@ -1003,6 +1003,21 @@ class ContainerSharder(ContainerReplicator):
             self._replicate_object, part, broker.db_file, node_id)
         any(self.cpool)
 
+        # delete this container as we do not need it anymore
+        if not is_root:
+            self.logger.info(_('Removing unused shard container %s'),
+                             broker.container)
+            try:
+                self.swift.delete_container(broker.account, broker.container)
+            except Exception as exception:
+                # TODO (blmartin):
+                # We need to be sure to remove the container later.
+                # it will not hurt anything by staying around (as it is empty).
+                # Should delete in shard audit
+                self.logger.warning(_('Could not delete container %s/%s'
+                                   ' due to %s. Ignoring for now'),
+                                 exception, broker.account, broker.container)
+
         self.logger.info(_('Finished sharding %s/%s, new shard '
                            'containers %s/%s and %s/%s. Sharded at pivot %s.'),
                          broker.account, broker.container,
