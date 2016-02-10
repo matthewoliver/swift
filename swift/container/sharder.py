@@ -93,7 +93,7 @@ use = egg:swift#catch_errors
 class ContainerSharder(ContainerReplicator):
     """Shards containers."""
 
-    def __init__(self, conf, logger=None):
+    def __init__(self, conf, logger=None, **kargs):
         self.conf = conf
         self.logger = logger or get_logger(conf, log_route='container-sharder')
         self.devices = conf.get('devices', '/srv/node')
@@ -340,11 +340,13 @@ class ContainerSharder(ContainerReplicator):
         policy_index = broker.storage_policy_index
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
-        if len(broker.get_pivot_ranges()) > 0:
-            # It's a sharded node, so anything in the object table
+        if len(broker.get_pivot_ranges()) > 0 or broker.is_deleted():
+            # It's a sharded node or deleted, so anything in the object table
             # is misplaced.
             if broker.get_info()['object_count'] > 0:
                 queries.append(query.copy())
+            else:
+                return
         elif pivot is None:
             # This is an unsharded root container, so we don't need to
             # query anything.
@@ -425,10 +427,10 @@ class ContainerSharder(ContainerReplicator):
 
         lower = broker.metadata.get('X-Container-Sysmeta-Shard-Lower')
         if lower:
-            lower = lower[0]
+            lower, _timestamp = lower
         upper = broker.metadata.get('X-Container-Sysmeta-Shard-Upper')
         if upper:
-            upper = upper[0]
+            upper, _timestamp = upper
 
         if not lower and not upper:
             return None
@@ -438,6 +440,8 @@ class ContainerSharder(ContainerReplicator):
         if not upper:
             upper = None
 
+        if not timestamp:
+            timestamp = _timestamp
         return PivotRange(lower, upper, timestamp)
 
     @staticmethod
@@ -502,8 +506,10 @@ class ContainerSharder(ContainerReplicator):
             # all we can do is check there is nothing screwy with the range
             ranges = broker.get_pivot_ranges()
             ranges = [PivotRange(r[0], r[2], r[1]) for r in ranges]
-            overlaps = self._find_overlapping_ranges(ranges)
+            overlaps = ContainerSharder.find_overlapping_ranges(ranges)
             for overlap in overlaps:
+                self.logger.error(_('Range overlaps found, attempting to '
+                                    'correct'))
                 newest = max(overlap, key=lambda x: x.timestamp)
                 older = set(overlap).difference(set([newest]))
 
@@ -514,6 +520,11 @@ class ContainerSharder(ContainerReplicator):
                           for r in older]
                 self._update_pivot_ranges(root_account, root_container,
                                           'DELETE', pivots)
+                continue_with_container = False
+            missing_ranges = ContainerSharder.check_complete_ranges(ranges)
+            if missing_ranges:
+                self.logger.error(_('Missing range(s) dectected: %s'),
+                                  '-'.join(missing_ranges))
                 continue_with_container = False
 
             return continue_with_container
@@ -535,20 +546,26 @@ class ContainerSharder(ContainerReplicator):
             # it through, in case it has misplaced objects to deal with.
             return continue_with_container
 
-        # pivot isn't in ranges, if it overlaps with an item, were in trouble
-        # if it doesn't then it might not be updated yet, so just let it
+        # pivot isn't in ranges, if it overlaps with an item, were in trouble.
+        # If there is overlap lets see if it's newer then this containers,
+        # if so, it's safe to delte (quarantine this container).
+        # if it's newer, then it might not be updated yet, so just let it
         # continue (or maybe we shouldn't?).
-        if any([r for r in ranges if r.overlaps(pivot)]) and False:
-            # the pivot overlaps something in the root. Not good
-            self.logger.error(_('The range of objects stored in this container'
-                                ' (%s/%s) overlaps with another pivot'),
-                              broker.account, broker.container)
-            # TODO do something here (qurantine?) Also this might be bad cause
-            # this might always hit when the root hasn't been updated so Falsed
-            # it.
-            continue_with_container = False
-            return continue_with_container
-
+        overlaps = [r for r in ranges if r.overlaps(pivot)]
+        if overlaps:
+            if max(overlaps + [pivot], key=lambda x: x.timestamp) == pivot:
+                # pivot is newest so leave it alone for now  as the root might
+                # not be updated  yet.
+                continue_with_container = False
+                return continue_with_container
+            else:
+                # There is a newer range that overlaps/covers this range.
+                # so we are safe to quarantine it.
+                #TODO Quratnine
+                self.logger.error(_('The range of objects stored in this '
+                                    'container (%s/%s) overlaps with another '
+                                    'newer pivot'),
+                                  broker.account, broker.container)
         # pivot doesn't exist in the root containers ranges, but doesn't
         # overlap with anything
         return continue_with_container
@@ -741,7 +758,19 @@ class ContainerSharder(ContainerReplicator):
                     self._send_request, node['ip'], node['port'],
                     node['device'], part, op, obj_path, headers)
 
-    def _find_overlapping_ranges(self, ranges):
+    @staticmethod
+    def check_complete_ranges(ranges):
+        counts = {}
+        for r in ranges:
+            counts.setdefault(r.lower, 0)
+            counts[r.lower] += 1
+            counts.setdefault(r.upper, 0)
+            counts[r.upper] += 1
+
+        return [r for r in counts.keys() if counts[r] < 2]
+
+    @staticmethod
+    def find_overlapping_ranges(ranges):
         result = set()
         for range in ranges:
             res = [r for r in ranges if range != r and range.overlaps(r)]
