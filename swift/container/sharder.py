@@ -558,6 +558,8 @@ class ContainerSharder(ContainerReplicator):
             return
         timestamp = Timestamp(time.time())
         pivot = self.get_pivot_range(broker, timestamp)
+        if not pivot:
+            return
         tmp_info = broker.get_info()
         pivot = (pivot.lower, pivot.timestamp, pivot.upper,
                  tmp_info['object_count'], tmp_info['bytes_used'])
