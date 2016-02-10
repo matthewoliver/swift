@@ -1208,8 +1208,8 @@ class ContainerBroker(DatabaseBroker):
     def build_pivot_ranges(self):
         ranges = list()
 
-        for node in sorted(self.get_pivot_ranges()):
-            ranges.append(PivotRange(node[0], node[2]))
+        for node in self.get_pivot_ranges():
+            ranges.append(PivotRange(node[0], node[2], node[1]))
         return ranges
 
     def get_possible_pivot_point(self, connection=None):
