@@ -3716,6 +3716,8 @@ class PivotRange(object):
             return self._lower >= other
 
     def __eq__(self, other):
+        if not isinstance(other, PivotRange):
+            return False
         return self._lower == other.lower and self._upper == other.upper
 
     def __repr__(self):
@@ -3725,6 +3727,8 @@ class PivotRange(object):
         return self._lower is None and self._upper is None
 
     def overlaps(self, other):
+        if not isinstance(other, PivotRange):
+            return False
         if self.lower is None and other.lower is None:
             return True
         elif self.upper is None and other.upper is None:
@@ -3758,7 +3762,7 @@ def find_pivot_range(item, ranges):
     """
     lower_bound = 0
     upper_bound = len(ranges)
-    index = upper_bounds / 2
+    index = upper_bound / 2
     try:
         while item not in ranges[index]:
             if ranges[index] < item:

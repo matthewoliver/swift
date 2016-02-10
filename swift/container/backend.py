@@ -844,7 +844,8 @@ class ContainerBroker(DatabaseBroker):
                 sql = (('SELECT lower, upper, 0, created_at '
                         'FROM pivot_ranges '
                         'WHERE %s(lower IN (%s) OR lower IS NULL)'
-                        ' AND (upper IN (%s) OR upper IS NULL)')
+                        ' AND (upper IN (%s) OR upper IS NULL) '
+                        'ORDER BY lower, upper')
                        % (query_mod,
                           ','.join('?' * len(lower)),
                           ','.join('?' * len(upper))))
@@ -862,7 +863,7 @@ class ContainerBroker(DatabaseBroker):
                 del_keys = ('name', 'storage_policy_index')
                 add_keys = ('name', 'created_at', 'size', 'content_type',
                             'etag', 'deleted', 'storage_policy_index')
-                def transform(item, other):
+                def to_add_transform(item, other):
                     return max(item, other, key=lambda i: i['created_at'])
                 table = 'object'
             else:
@@ -871,11 +872,8 @@ class ContainerBroker(DatabaseBroker):
                 del_keys = ('lower', 'upper')
                 add_keys = ('lower', 'created_at', 'upper', 'object_count',
                             'bytes_used', 'deleted')
-                def transform(item, other):
-                    return merge_pivots(other, item)
+                to_add_transform = merge_pivots
                 table = 'pivot_ranges'
-
-            to_add_transform = transform
 
             # Get created_at times for objects in rec_list that already exist.
             # We must chunk it up to avoid sqlite's limit of 999 args.
@@ -1107,10 +1105,6 @@ class ContainerBroker(DatabaseBroker):
 
     def get_pivot_ranges(self, connection=None):
         """
-
-        :param padded: Add extra empty string results to it matches a standard
-                       object. This is used when listing pivot nodes in
-                       container listings.
         :return:
         """
 
@@ -1119,7 +1113,8 @@ class ContainerBroker(DatabaseBroker):
                 sql = '''
                 SELECT lower, created_at, upper, object_count, bytes_used
                 FROM pivot_ranges
-                WHERE deleted=0;
+                WHERE deleted=0
+                ORDER BY lower, upper;
                 '''
                 data = conn.execute(sql)
                 data.row_factory = None
