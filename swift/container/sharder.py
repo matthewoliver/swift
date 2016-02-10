@@ -760,14 +760,16 @@ class ContainerSharder(ContainerReplicator):
 
     @staticmethod
     def check_complete_ranges(ranges):
-        counts = {}
+        lower = set()
+        upper = set()
         for r in ranges:
-            counts.setdefault(r.lower, 0)
-            counts[r.lower] += 1
-            counts.setdefault(r.upper, 0)
-            counts[r.upper] += 1
+            lower.add(r.lower)
+            upper.add(r.upper)
+        l = lower.copy()
+        lower.difference_update(upper)
+        upper.difference_update(l)
 
-        return [r for r in counts.keys() if counts[r] < 2]
+        return zip(upper, lower)
 
     @staticmethod
     def find_overlapping_ranges(ranges):
