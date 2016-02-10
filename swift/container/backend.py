@@ -995,7 +995,8 @@ class ContainerBroker(DatabaseBroker):
                         'bytes_used, deleted'
                         'FROM pivot_ranges '
                         'WHERE %s(lower IN (%s) OR lower IS NULL)'
-                        ' AND (upper IN (%s) OR upper IS NULL)')
+                        ' AND (upper IN (%s) OR upper IS NULL) '
+                        'ORDER BY lower, upper')
                        % (query_mod,
                           ','.join('?' * len(lower)),
                           ','.join('?' * len(upper))))
@@ -1250,10 +1251,6 @@ class ContainerBroker(DatabaseBroker):
 
     def get_pivot_ranges(self, connection=None):
         """
-
-        :param padded: Add extra empty string results to it matches a standard
-                       object. This is used when listing pivot nodes in
-                       container listings.
         :return:
         """
 
@@ -1262,7 +1259,8 @@ class ContainerBroker(DatabaseBroker):
                 sql = '''
                 SELECT lower, created_at, upper, object_count, bytes_used
                 FROM pivot_ranges
-                WHERE deleted=0;
+                WHERE deleted=0
+                ORDER BY lower, upper;
                 '''
                 data = conn.execute(sql)
                 data.row_factory = None
