@@ -680,9 +680,10 @@ class ContainerSharder(ContainerReplicator):
                 elif to_shard:
                     # No pivot, so check to see if a pivot needs to be found.
                     self._find_pivot_point(broker)
-                elif obj_count <= (self.shard_container_size / 2):
+                elif obj_count <= (self.shard_container_size *
+                                   self.shard_shrink_point):
                     # Shrink
-                    self._shrink(broker)
+                    self._shrink(broker, root_account, root_container)
                 self._update_pivot_counts(root_account, root_container,
                                           broker)
 
@@ -791,67 +792,82 @@ class ContainerSharder(ContainerReplicator):
 
         return result
 
-    def _find_pivot_point(self, broker):
-        self.logger.info(_('Started searching for best pivot point for %s/%s'),
-                         broker.account, broker.container)
+    def _get_quorum(self, broker, success=None, quorum=None, op='HEAD',
+                    headers={}, post_success=None, post_fail=None,
+                    account=None, container=None):
+        quorum = quorum else self.ring.replica_count / 2 + 1
 
-        path = "/%s/%s" % (broker.account, broker.container)
-        part, nodes = self.ring.get_nodes(broker.account, broker.container)
-        nodes = [d for d in nodes
-                 if d['ip'] not in self.ips or
-                 d['port'] != self.port]
-        obj_count = broker.get_info()['object_count']
-        found_pivot = broker.get_info()['pivot_point']
+        if broker:
+           local = True
+           account = broker.account
+           container = broker.container
+        if not broker and account and container:
+           local = False
+
+        def default_success(resp):
+            return resp and is_success(resp.status)
+        if not success:
+            success = default_success
+
+        path = "/%s/%s" % (account, container)
+        part, nodes = self.ring.get_nodes(account, container)
+        if local:
+            nodes = [d for d in nodes
+                     if d['ip'] not in self.ips or
+                     d['port'] != self.port]
 
         # Send out requests to get suggested pivots and object counts.
         for node in nodes:
             self.cpool.spawn(
                 self._send_request, node['ip'], node['port'], node['device'],
-                part, 'HEAD', path)
+                part, op, path, headers)
 
-        successes = 1
+        successes = 1 if local else 0
         for resp in self.cpool:
-            if not resp or not is_success(resp.status):
-                continue
-            else:
+            if success(resp):
                 successes += 1
-                if resp.getheader('X-Container-Sysmeta-Shard-Pivot'):
-                    # The other node already has a shard point defined, but
-                    # the local one does't. Stop the search because I haven't
-                    # been updated yet (or wait for a replication.
-                    self.logger.warning(_("A container replica has a pivot "
-                                          "point defined but local container "
-                                          "doesn't. This means container "
-                                          "hasn't been updated yet aborting "
-                                          "search for pivot point"))
-                    return
-                if int(resp.getheader('X-Container-Object-Count')) > obj_count:
-                    obj_count = int(resp.getheader('X-Container-Object-Count'))
-                    found_pivot = resp.getheader('X-Backend-Pivot-Point')
+                if post_success:
+                    post_success(resp)
+            else:
+                if post_fail:
+                    post_fail(resp)
+                continue
+        return successes >= quorum
 
-        quorum = self.ring.replica_count / 2 + 1
-        if successes < quorum:
+    def _find_pivot_point(self, broker):
+        self.logger.info(_('Started searching for best pivot point for %s/%s'),
+                         broker.account, broker.container)
+        obj_count = broker.get_info()['object_count']
+        found_pivot = broker.get_info()['pivot_point']
+
+        def on_success(resp):
+            if resp.getheader('X-Container-Sysmeta-Shard-Pivot'):
+                # The other node already has a shard point defined, but
+                # the local one does't. Stop the search because I haven't
+                # been updated yet (or wait for a replication.
+                self.logger.warning(_("A container replica has a pivot "
+                                      "point defined but local container "
+                                      "doesn't. This means container "
+                                      "hasn't been updated yet aborting "
+                                      "search for pivot point"))
+                return
+            if int(resp.getheader('X-Container-Object-Count')) > obj_count:
+                obj_count = int(resp.getheader('X-Container-Object-Count'))
+                found_pivot = resp.getheader('X-Backend-Pivot-Point')
+
+        if not self._get_quorum(broker, post_success=on_success):
             self.logger.info(_('Failed to reach quorum on a pivot point for '
                                '%s/%s'), broker.account, broker.container)
             return
         else:
             # Found a pivot point, so lets update all the other containers
-            self.logger.info('path: %s', path)
             headers = {'X-Container-Sysmeta-Shard-Pivot': found_pivot}
-            for node in nodes:
-                self.cpool.spawn(
-                    self._send_request, node['ip'], node['port'],
-                    node['device'], part, 'POST', path, headers)
 
             broker.update_metadata({
                 'X-Container-Sysmeta-Shard-Pivot':
                     (found_pivot, Timestamp(time.time()).internal)})
 
-            successes = 1
-            for resp in self.cpool:
-                if is_success(resp.status):
-                    successes += 1
-            if successes < quorum:
+            if not self._get_quorum(broker, op='POST', headers=headers):
                 self.logger.info(_('Failed to set %s as the pivot point for '
                                    '%s/%s on remote servers'),
                                  found_pivot, broker.account, broker.container)
@@ -860,8 +876,95 @@ class ContainerSharder(ContainerReplicator):
         self.logger.info(_('Best pivot point for %s/%s is %s'),
                          broker.account, broker.container, found_pivot)
 
-    def _shrink(broker):
-        pass
+    def _shrink(self, broker, root_account, root_container):
+        """Attempt to shrink the current sharded container.
+
+        To shrink a container we need to:
+            1. Find out if the container really has few enough objects, that is
+               a quruom of counts below the threshold.
+            2. Check the neighbours to see if it's possible to shrink/merge
+               together, again this requires getting a quorom.
+            3. Merge, if possible, with the smallest neighbour.
+                a. create a new range container, locally.
+                b. merge objects into it, update local containers.
+                c. replicate, and update ranges table.
+                d. let misplaced objects and replication do the rest.
+        """
+        if root_container == broker.container:
+            # This is the root conatiner, can't shrink it.
+            return
+
+        self.logger.info(_('Sharded container %s/%s is a candidate for '
+                           'shrinking'), broker.account, broker.container)
+        pivot = ContainerSharder.get_pivot_range(broker)
+        self.logger.info(_('Asking for quorum on a pivot point %s for '
+                           '%s/%s'), pivot, broker.account, broker.container)
+
+        obj_count = broker.get_info()['object_count']
+        def on_success(resp):
+            obj_count = max(obj_count,
+                            int(resp.getheader('X-Container-Object-Count')))
+
+        if not self._get_quorum(broker, post_success=on_success):
+            self.logger.info(_('Failed to get quorum on object count in '
+                               '%s/%s'), broker.account, broker.container)
+            return
+
+        # We have a quorum on the number of object can we still shrink?
+        if obj_count > self.shard_container_size * self.shard_shrink_point:
+            self.logger.info(_('After quorum check there were too many ojects '
+                               ' (%d) to continue shrinking %s/%s'), obj_count,
+                             broker.account, broker.container)
+            return
+
+        # Now we need to find a neighbour, if possible, to merge with.
+        # since we know the current range, we can make some simple assumptions.
+        #   1. We know if we are on either end (lower or upper is None).
+        #   2. Anything to the left we can use the lower to find the one
+        #      directly before, becuase the the upper is always included in
+        #      the rage. (use find_pivot_range(lower, ranges).
+        #   3. Upper + something is in the next range.
+        ranges = self.range_cache.get('')
+        if not ranges:
+            ranges = self._get_pivot_ranges(root_account, root_container,
+                                            newest=True)
+            if ranges is None:
+                self.logger.error(
+                    _("Since the audit run of this container and "
+                      "now we can't access the root container "
+                      "%s/%s aborting."),
+                    root_account, root_container)
+                return
+        self.range_cache[''] = ranges
+        lower_n = upper_n = None
+        lower_c = upper_c = self.shard_container_size
+        if pivot.lower:
+            lower_n = find_pivot_range(pivot.lower, ranges)
+        if pivot.upper:
+            upper = str(pivot.upper)[:-1] + chr(ord(str(pivot.upper)[-1]) + 1)
+            upper_n = find_pivot_range(pivot.upper, ranges)
+
+        if lower_n:
+            obj_count = 0
+            acct, cont = pivot_to_pivot_container(root_account, root_container,
+                                                  pivot_range=lower_n)
+
+            if self._get_quorum(None, post_success=on_success,
+                                account=broker.account, container=cont):
+                lower_c = obj_count
+        if upper_n:
+            obj_count = 0
+            acct, cont = pivot_to_pivot_container(root_account, root_container,
+                                                  pivot_range=upper_n)
+
+            if self._get_quorum(None, post_success=on_success,
+                                account=broker.account, container=cont):
+                upper_c = obj_count
+
+        # got counts. now need to compate.
+        # TODO make sure we check to see if a container has already been
+        #      shrunk, maybe check to see if it's been deleted.
+
 
     def _shard_on_pivot(self, pivot, broker, root_account, root_container,
                         node_id):
@@ -870,27 +973,10 @@ class ContainerSharder(ContainerReplicator):
                            '%s/%s'), pivot, broker.account, broker.container)
         # Before we go and split the tree, lets confirm the rest of the
         # containers have a quorum
-        quorum = self.ring.replica_count / 2 + 1
-        path = "/%s/%s" % (broker.account, broker.container)
-        part, nodes = self.ring.get_nodes(broker.account, broker.container)
-        nodes = [d for d in nodes
-                 if d['ip'] not in self.ips or
-                 d['port'] != self.port]
+        def on_success(resp):
+            return resp.getheader('X-Container-Sysmeta-Shard-Pivot') == pivot
 
-        # Send out requests to get suggested pivots and object counts.
-        for node in nodes:
-            self.cpool.spawn(
-                self._send_request, node['ip'], node['port'], node['device'],
-                part, 'HEAD', path)
-
-        successes = 1
-        for resp in self.cpool:
-            if not resp or not is_success(resp.status):
-                continue
-            if resp.getheader('X-Container-Sysmeta-Shard-Pivot') == pivot:
-                successes += 1
-
-        if successes < quorum:
+        if not self._get_quorum(broker, success=on_success):
             self.logger.info(_('Failed to reach quorum on a pivot point for '
                                '%s/%s'), broker.account, broker.container)
             return
