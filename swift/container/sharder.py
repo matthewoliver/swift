@@ -122,6 +122,10 @@ class ContainerSharder(ContainerReplicator):
             self.root, os.path.sep, os.path.sep))
         self.shard_container_size = int(conf.get('shard_container_size',
                                                  SHARD_CONTAINER_SIZE))
+        self.shard_shrink_point = float(conf.get('shard_shrink_point', 50)
+                                        / 100.0)
+        self.shard_shrink_merge_point = \
+            float(conf.get('shard_shrink_merge_point', 75) / 100.0)
         self.rsync_compress = config_true_value(
             conf.get('rsync_compress', 'no'))
 
@@ -590,10 +594,11 @@ class ContainerSharder(ContainerReplicator):
         container it:
             - audits the container
             - checks and deals with misplaced items
-            - 2 phase sharding
+            - 2 phase sharding (if no. objects > shard_container_size)
                 - Phase 1, if there is no pivot defined, find it, then move
                   to next container.
                 - Phase 2, if there is a pivot defined, shard it.
+            - Shrinking (check to see if we need to shrink this container).
         :param reported:
         """
         self._zero_stats()
@@ -665,18 +670,21 @@ class ContainerSharder(ContainerReplicator):
                 new_pivot = \
                     broker.metadata.get('X-Container-Sysmeta-Shard-Pivot')
                 new_pivot = '' if new_pivot is None else new_pivot[0]
+                obj_count = broker.get_info()['object_count']
+                to_shard = obj_count > self.shard_container_size
 
                 if new_pivot:
                     # We need to shard on the pivot point
                     self._shard_on_pivot(new_pivot, broker, root_account,
                                          root_container, node_id)
-                else:
+                elif to_shard:
                     # No pivot, so check to see if a pivot needs to be found.
-                    obj_count = broker.get_info()['object_count']
-                    if obj_count > self.shard_container_size:
-                        self._find_pivot_point(broker)
-                    self._update_pivot_counts(root_account, root_container,
-                                              broker)
+                    self._find_pivot_point(broker)
+                elif obj_count <= (self.shard_container_size / 2):
+                    # Shrink
+                    self._shrink(broker)
+                self._update_pivot_counts(root_account, root_container,
+                                          broker)
 
         # wipe out the cache do disable bypass in delete_db
         cleanups = self.shard_cleanups
@@ -851,6 +859,9 @@ class ContainerSharder(ContainerReplicator):
 
         self.logger.info(_('Best pivot point for %s/%s is %s'),
                          broker.account, broker.container, found_pivot)
+
+    def _shrink(broker):
+        pass
 
     def _shard_on_pivot(self, pivot, broker, root_account, root_container,
                         node_id):
