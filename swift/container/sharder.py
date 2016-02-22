@@ -565,7 +565,7 @@ class ContainerSharder(ContainerReplicator):
             else:
                 # There is a newer range that overlaps/covers this range.
                 # so we are safe to quarantine it.
-                #TODO Quratnine
+                # TODO Quratnine
                 self.logger.error(_('The range of objects stored in this '
                                     'container (%s/%s) overlaps with another '
                                     'newer pivot'),
@@ -661,8 +661,14 @@ class ContainerSharder(ContainerReplicator):
             # if it's already sharded then we want to finish with the audit and
             # check for misplaced objects.
             already_sharded = len(broker.get_pivot_ranges()) > 0
+            is_shrinking = \
+                broker.metadata.get('X-Container-Sysmeta-Shard-Full') or \
+                broker.metadata.get('X-Container-Sysmeta-Shard-Empty')
 
-            if not already_sharded:
+            try:
+                if already_sharded or is_shrinking:
+                    continue
+
                 # Sharding is 2 phase
                 # If a pivot point is defined, we shard on it.. if it isn't
                 # then we see if we need to find a pivot point and set it for
@@ -686,20 +692,20 @@ class ContainerSharder(ContainerReplicator):
                     self._shrink(broker, root_account, root_container)
                 self._update_pivot_counts(root_account, root_container,
                                           broker)
+            finally:
+                # wipe out the cache do disable bypass in delete_db
+                cleanups = self.shard_cleanups
+                self.shard_cleanups = None
+                self.logger.info('Cleaning up %d replicated shard containers',
+                                 len(cleanups))
 
-        # wipe out the cache do disable bypass in delete_db
-        cleanups = self.shard_cleanups
-        self.shard_cleanups = None
-        self.logger.info('Cleaning up %d replicated shard containers',
-                         len(cleanups))
+                for container in cleanups.values():
+                    self.cpool.spawn(self.delete_db, container)
 
-        for container in cleanups.values():
-            self.cpool.spawn(self.delete_db, container)
+                # Now we wait for all threads to finish.
+                any(self.cpool)
 
-        # Now we wait for all threads to finish.
-        any(self.cpool)
-
-        self.logger.info(_('Finished container sharding pass'))
+                self.logger.info(_('Finished container sharding pass'))
 
         # all_locs = audit_location_generator(self.devices, DATADIR, '.db',
         #                                    mount_check=self.mount_check,
@@ -795,14 +801,14 @@ class ContainerSharder(ContainerReplicator):
     def _get_quorum(self, broker, success=None, quorum=None, op='HEAD',
                     headers={}, post_success=None, post_fail=None,
                     account=None, container=None):
-        quorum = quorum else self.ring.replica_count / 2 + 1
+        quorum = quorum if quorum else (self.ring.replica_count / 2 + 1)
 
         if broker:
-           local = True
-           account = broker.account
-           container = broker.container
+            local = True
+            account = broker.account
+            container = broker.container
         if not broker and account and container:
-           local = False
+            local = False
 
         def default_success(resp):
             return resp and is_success(resp.status)
@@ -837,8 +843,8 @@ class ContainerSharder(ContainerReplicator):
     def _find_pivot_point(self, broker):
         self.logger.info(_('Started searching for best pivot point for %s/%s'),
                          broker.account, broker.container)
-        obj_count = broker.get_info()['object_count']
-        found_pivot = broker.get_info()['pivot_point']
+        obj_count = [broker.get_info()['object_count']]
+        found_pivot = [broker.get_info()['pivot_point']]
 
         def on_success(resp):
             if resp.getheader('X-Container-Sysmeta-Shard-Pivot'):
@@ -851,9 +857,9 @@ class ContainerSharder(ContainerReplicator):
                                       "hasn't been updated yet aborting "
                                       "search for pivot point"))
                 return
-            if int(resp.getheader('X-Container-Object-Count')) > obj_count:
-                obj_count = int(resp.getheader('X-Container-Object-Count'))
-                found_pivot = resp.getheader('X-Backend-Pivot-Point')
+            if int(resp.getheader('X-Container-Object-Count')) > obj_count[0]:
+                obj_count[0] = int(resp.getheader('X-Container-Object-Count'))
+                found_pivot[0] = resp.getheader('X-Backend-Pivot-Point')
 
         if not self._get_quorum(broker, post_success=on_success):
             self.logger.info(_('Failed to reach quorum on a pivot point for '
@@ -861,22 +867,43 @@ class ContainerSharder(ContainerReplicator):
             return
         else:
             # Found a pivot point, so lets update all the other containers
-            headers = {'X-Container-Sysmeta-Shard-Pivot': found_pivot}
+            headers = {'X-Container-Sysmeta-Shard-Pivot': found_pivot[0]}
 
             broker.update_metadata({
                 'X-Container-Sysmeta-Shard-Pivot':
-                    (found_pivot, Timestamp(time.time()).internal)})
+                    (found_pivot[0], Timestamp(time.time()).internal)})
 
             if not self._get_quorum(broker, op='POST', headers=headers):
                 self.logger.info(_('Failed to set %s as the pivot point for '
                                    '%s/%s on remote servers'),
-                                 found_pivot, broker.account, broker.container)
+                                 found_pivot[0], broker.account,
+                                 broker.container)
                 return
 
         self.logger.info(_('Best pivot point for %s/%s is %s'),
-                         broker.account, broker.container, found_pivot)
+                         broker.account, broker.container, found_pivot[0])
 
     def _shrink(self, broker, root_account, root_container):
+        """shrinking is a 2 phase process
+
+        Phase 1: If the container is small enough see if there is a neighbour
+        to merge with. If so then move all objects into neighbour and set
+        special metadata:
+            X-Container-Sysmeta-Shard-Full: <neighbour>
+            X-Container-Sysmeta-Shard-Empty: <this container>
+
+        Phase 2: On a storage node running a sharder what contains a neighbour
+        replica, create a new container for the new range. Move all objects in
+        to it, delete self and shard-empty, update root and replicate.
+        """
+
+        if broker.metadata.get('X-Container-Sysmeta-Shard-Full') or \
+                broker.metadata.get('X-Container-Sysmeta-Shard-Emtpy'):
+            self._shrink_phase_2(broker, root_account, root_container)
+        else:
+            self._shrink_phase_1(broker, root_account, root_container)
+
+    def _shrink_phase_1(self, broker, root_account, root_container):
         """Attempt to shrink the current sharded container.
 
         To shrink a container we need to:
@@ -900,10 +927,11 @@ class ContainerSharder(ContainerReplicator):
         self.logger.info(_('Asking for quorum on a pivot point %s for '
                            '%s/%s'), pivot, broker.account, broker.container)
 
-        obj_count = broker.get_info()['object_count']
+        obj_count = [broker.get_info()['object_count']]
+
         def on_success(resp):
-            obj_count = max(obj_count,
-                            int(resp.getheader('X-Container-Object-Count')))
+            obj_count[0] = max(obj_count[0],
+                               int(resp.getheader('X-Container-Object-Count')))
 
         if not self._get_quorum(broker, post_success=on_success):
             self.logger.info(_('Failed to get quorum on object count in '
@@ -911,11 +939,12 @@ class ContainerSharder(ContainerReplicator):
             return
 
         # We have a quorum on the number of object can we still shrink?
-        if obj_count > self.shard_container_size * self.shard_shrink_point:
+        if obj_count[0] > self.shard_container_size * self.shard_shrink_point:
             self.logger.info(_('After quorum check there were too many ojects '
-                               ' (%d) to continue shrinking %s/%s'), obj_count,
-                             broker.account, broker.container)
+                               ' (%d) to continue shrinking %s/%s'),
+                             obj_count[0], broker.account, broker.container)
             return
+        curr_obj_count = obj_count[0]
 
         # Now we need to find a neighbour, if possible, to merge with.
         # since we know the current range, we can make some simple assumptions.
@@ -940,31 +969,271 @@ class ContainerSharder(ContainerReplicator):
         lower_c = upper_c = self.shard_container_size
         if pivot.lower:
             lower_n = find_pivot_range(pivot.lower, ranges)
-        if pivot.upper:
-            upper = str(pivot.upper)[:-1] + chr(ord(str(pivot.upper)[-1]) + 1)
-            upper_n = find_pivot_range(pivot.upper, ranges)
 
-        if lower_n:
-            obj_count = 0
+            obj_count = [0]
             acct, cont = pivot_to_pivot_container(root_account, root_container,
                                                   pivot_range=lower_n)
 
             if self._get_quorum(None, post_success=on_success,
                                 account=broker.account, container=cont):
-                lower_c = obj_count
-        if upper_n:
-            obj_count = 0
+                lower_c = obj_count[0]
+
+        if pivot.upper:
+            upper = str(pivot.upper)[:-1] + chr(ord(str(pivot.upper)[-1]) + 1)
+            upper_n = find_pivot_range(upper, ranges)
+
+            obj_count = [0]
             acct, cont = pivot_to_pivot_container(root_account, root_container,
                                                   pivot_range=upper_n)
 
             if self._get_quorum(None, post_success=on_success,
                                 account=broker.account, container=cont):
-                upper_c = obj_count
+                upper_c = obj_count[0]
 
-        # got counts. now need to compate.
-        # TODO make sure we check to see if a container has already been
-        #      shrunk, maybe check to see if it's been deleted.
+        # got counts. now need to compare.
+        neighbours = {lower_c: lower_n, upper_c: upper_n}
+        smallest = min(neighbours.keys())
+        if smallest + curr_obj_count > self.shard_container_size * \
+                self.shard_shrink_merge_point:
+            _acct, cont = pivot_to_pivot_container(
+                root_account, root_container, pivot_range=neighbours[smallest])
+            self.logger.info(
+                _('If this container merges with it\'s smallest neighbour (%s) '
+                  'there will be too many objects. %d (merged) > %d '
+                  '(shard_merge_point)'), cont, smallest + curr_obj_count,
+                self.shard_container_size * self.shard_shrink_merge_point)
+            return
 
+        # So we now have  valid neighbour, so we want to move our objects in to
+        # it.
+        n_pivot = neighbours[smallest]
+
+        policy_index = broker.storage_policy_index
+        query = dict(marker='', end_marker='', prefix='', delimiter='',
+                     storage_policy_index=policy_index)
+
+        items = broker.list_objects_iter(CONTAINER_LISTING_LIMIT, **query)
+        if len(items) == CONTAINER_LISTING_LIMIT:
+            marker = items[-1][0]
+        else:
+            marker = ''
+
+        try:
+            new_part, new_broker, node_id = \
+                self._get_and_fill_shard_broker(
+                    n_pivot, items, root_account, root_container, policy_index)
+
+            # Delete the same items from current broker (while we have the
+            # same state)
+            delete_objs = self._generate_object_list(items, policy_index,
+                                                     delete=True)
+            broker.merge_items(delete_objs)
+        except DeviceUnavailable as duex:
+            self.logger.warning(_(str(duex)))
+            return
+
+        self._add_other_items(marker, broker, new_broker, query)
+
+        timestamp = Timestamp(time.time()).internal
+        shrink_meta = {
+            'X-Container-Sysmeta-Shard-Full': (new_broker.container, timestamp),
+            'X-Container-Sysmeta-Shard-Empty': (broker.container, timestamp)}
+        broker.update_metadata(shrink_meta)
+        new_broker.update_metadata(shrink_meta)
+
+        part = self.ring.get_part(broker.account, broker.container)
+        self.logger.info(_('Replicating phase 1 shrunk containers %s/%s and '
+                           '%s/%s'), new_broker.account, new_broker.container,
+                         broker.account, broker.container)
+        self.cpool.spawn(
+            self._replicate_object, new_part, new_broker.db_file, node_id)
+        self.cpool.spawn(
+            self._replicate_object, part, broker.db_file, node_id)
+        any(self.cpool)
+
+    def _shrink_phase_2(self, broker, root_account, root_container):
+        # firstly the phase 2 happens inside the full container. So if
+        # this isn't the full container, continue.
+        full_shard = broker.metadata.get('X-Container-Sysmeta-Shard-Full')
+        full_shard = '' if full_shard is None else full_shard[0]
+
+        if broker.container != full_shard:
+            return
+        self.logger.info(_('Starting Shrinking phase 2 on %s/%s.'),
+                         broker.account, broker.container)
+
+        # OK we have a full container, now lets make sure we have a quorum on
+        # what the empty container is, just in case.
+
+        empty_shard = broker.metadata.get('X-Container-Sysmeta-Shard-Empty')
+        empty_shard = '' if empty_shard is None else empty_shard[0]
+
+        def is_success(resp):
+            return resp.getheader('X-Container-Sysmeta-Shard-Empty') == \
+                empty_shard \
+                and resp.getheader('X-Container-Sysmeta-Shard-Full') == \
+                full_shard
+
+        if not self._get_quorum(broker, success=is_success):
+            self.logger.info(_('Failed to reach quorum on a empty/full pivot '
+                               'for shrinking %s/%s'), broker.account,
+                             broker.container)
+            return
+
+        def get_empty_range(account, container):
+            path = self.swift.make_path(account, container)
+            headers = dict()
+            try:
+                resp = self.swift.make_request('HEAD', path, headers,
+                                               acceptable_statuses=(2,))
+            except internal_client.UnexpectedResponse:
+                self.logger.error(_("Failed to get range from %s/%s"),
+                                  account, container)
+                return None
+
+            lower = resp.get_header('X-Container-Sysmeta-Shard-Lower') or None
+            upper = resp.get_header('X-Container-Sysmeta-Shard-Upper') or None
+
+            if not lower and not upper:
+                return None
+
+            if not lower:
+                lower = None
+            if not upper:
+                upper = None
+
+            return PivotRange(lower, upper)
+
+        # Now it's time to make the new container
+        full_range = self.get_pivot_range(broker)
+        empty_range = get_empty_range(broker.account, empty_shard)
+
+        if not empty_range:
+            self.logger.info(_('Failed to find the range for the empty '
+                               'container %s/%s canceling shrinking of %s/%s'),
+                             broker.account, empty_shard, broker.account,
+                             broker.container)
+            return
+
+        timestamp = Timestamp(time.time()).internal
+        if empty_range < full_range:
+            lower = empty_range.lower
+            upper = full_range.upper
+        else:
+            lower = full_range.lower
+            upper = empty_range.upper
+        new_range = PivotRange(lower, upper, timestamp)
+        new_acct, new_cont = pivot_to_pivot_container(root_account,
+                                                      root_container,
+                                                      pivot_range=new_range)
+
+        ranges = self.range_cache.get('')
+        if not ranges:
+            ranges = self._get_pivot_ranges(root_account, root_container,
+                                            newest=True)
+            if ranges is None:
+                self.logger.error(
+                    _("Since the audit run of this container and "
+                      "now we can't access the root container "
+                      "%s/%s aborting."),
+                    root_account, root_container)
+                return
+            self.range_cache[''] = ranges
+
+        policy_index = broker.storage_policy_index
+        query = dict(marker='', end_marker='', prefix='', delimiter='',
+                     storage_policy_index=policy_index)
+
+        items = broker.list_objects_iter(CONTAINER_LISTING_LIMIT, **query)
+        if len(items) == CONTAINER_LISTING_LIMIT:
+            marker = items[-1][0]
+        else:
+            marker = ''
+
+        try:
+            new_part, new_broker, node_id = \
+                self._get_and_fill_shard_broker(
+                    new_range, items, root_account, root_container,
+                    policy_index)
+
+            # Delete the same items from current broker (while we have the
+            # same state)
+            delete_objs = self._generate_object_list(items, policy_index,
+                                                     delete=True)
+            broker.merge_items(delete_objs)
+        except DeviceUnavailable as duex:
+            self.logger.warning(_(str(duex)))
+            return
+
+        self._add_other_items(marker, broker, new_broker, query)
+
+        self.cpool.spawn(
+            self._replicate_object, new_part, new_broker.db_file, node_id)
+        any(self.cpool)
+
+        tmp_info = new_broker.get_info()
+        new_obj_count, new_bytes_used = (tmp_info['object_count'],
+                                         tmp_info['bytes_used'])
+        pivot_ranges = [(new_range.lower, timestamp, new_range.upper,
+                         new_obj_count, new_bytes_used)]
+        items = self._generate_object_list(pivot_ranges, 0)
+        broker.merge_items(items)
+
+        # Push the new pivot range to the root container,
+        # we do this so we can short circuit PUTs.
+        self._update_pivot_ranges(root_account, root_container, 'PUT',
+                                  pivot_ranges)
+
+        # blank out the current stats in root of this contianer now
+        # that it has been blanked.
+        pivot_ranges = list()
+        for r in (empty_range, full_range):
+            pivot_ranges.append((r.lower, timestamp, r.upper, 0, 0))
+
+        self._update_pivot_ranges(root_account, root_container, 'DELETE',
+                                  pivot_ranges)
+
+        self.logger.info(_('Deleting empty (%s) and full (%s) containers '
+                         'that have now merged into %s/%s'), empty_shard,
+                         broker.container, new_acct, new_cont)
+        self.swift.delete_container(broker.account, empty_shard)
+        broker.delete_db(timestamp)
+
+        # Now replicate the container we are working on
+        self.logger.info(_('Replicating container %s/%s'),
+                         broker.account, broker.container)
+        part = self.ring.get_part(broker.account, broker.container)
+        self.cpool.spawn(
+            self._replicate_object, part, broker.db_file, node_id)
+        any(self.cpool)
+
+    def _add_other_items(self, marker, broker, broker_to_update, qry):
+        """
+        Add other items from one broker to another.
+
+        The qry is a query dict in the form of:
+            dict(marker='', end_marker='', prefix='', delimiter='',
+                 storage_policy_index=policy_index)
+        """
+        while marker:
+            qry['marker'] = marker
+            new_items = broker.list_objects_iter(
+                CONTAINER_LISTING_LIMIT, **qry)
+
+            # Add new items
+            objects = self._generate_object_list(
+                new_items, broker.storage_policy_index)
+            broker_to_update.merge_items(objects)
+
+            # Delete existing (while we have the same view of the items)
+            delete_objs = self._generate_object_list(
+                new_items, broker.storage_policy_index, delete=True)
+            broker.merge_items(delete_objs)
+
+            if len(new_items) == CONTAINER_LISTING_LIMIT:
+                marker = new_items[-1][0]
+            else:
+                marker = ''
 
     def _shard_on_pivot(self, pivot, broker, root_account, root_container,
                         node_id):
@@ -973,6 +1242,7 @@ class ContainerSharder(ContainerReplicator):
                            '%s/%s'), pivot, broker.account, broker.container)
         # Before we go and split the tree, lets confirm the rest of the
         # containers have a quorum
+
         def on_success(resp):
             return resp.getheader('X-Container-Sysmeta-Shard-Pivot') == pivot
 
@@ -1036,29 +1306,6 @@ class ContainerSharder(ContainerReplicator):
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
 
-        # there might be more then CONTAINER_LISTING_LIMIT items in the
-        # new shard, if so add all the objects to the shard database.
-        def add_other_items(marker, broker_to_update, qry):
-            while marker:
-                qry['marker'] = marker
-                new_items = broker.list_objects_iter(
-                    CONTAINER_LISTING_LIMIT, **qry)
-
-                # Add new items
-                objects = self._generate_object_list(
-                    new_items, broker.storage_policy_index)
-                broker_to_update.merge_items(objects)
-
-                # Delete existing (while we have the same view of the items)
-                delete_objs = self._generate_object_list(
-                    new_items, broker.storage_policy_index, delete=True)
-                broker.merge_items(delete_objs)
-
-                if len(new_items) == CONTAINER_LISTING_LIMIT:
-                    marker = new_items[-1][0]
-                else:
-                    marker = ''
-
         new_pivot_data = {}
         for new_cont, weight in ((new_left_cont, -1), (new_right_cont, 1)):
             piv = left_range if weight < 0 else right_range
@@ -1088,7 +1335,7 @@ class ContainerSharder(ContainerReplicator):
                 self.logger.warning(_(str(duex)))
                 return
 
-            add_other_items(marker, new_broker, q)
+            self._add_other_items(marker, broker, new_broker, q)
             tmp_info = new_broker.get_info()
             new_pivot_data[piv] = (tmp_info['object_count'],
                                    tmp_info['bytes_used'])
@@ -1129,6 +1376,7 @@ class ContainerSharder(ContainerReplicator):
         # Now replicate the container we are working on
         self.logger.info(_('Replicating container %s/%s'),
                          broker.account, broker.container)
+        part = self.ring.get_part(broker.account, broker.container)
         self.cpool.spawn(
             self._replicate_object, part, broker.db_file, node_id)
         any(self.cpool)
@@ -1145,8 +1393,8 @@ class ContainerSharder(ContainerReplicator):
                 # it will not hurt anything by staying around (as it is empty).
                 # Should delete in shard audit
                 self.logger.warning(_('Could not delete container %s/%s'
-                                   ' due to %s. Ignoring for now'),
-                                 exception, broker.account, broker.container)
+                                    ' due to %s. Ignoring for now'),
+                                    exception, broker.account, broker.container)
 
         self.logger.info(_('Finished sharding %s/%s, new shard '
                            'containers %s/%s and %s/%s. Sharded at pivot %s.'),
