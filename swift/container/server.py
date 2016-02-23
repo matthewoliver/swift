@@ -248,14 +248,21 @@ class ContainerController(BaseStorageServer):
             return None
 
     def _find_shard_location(self, req, broker, drive, root_account,
-                             root_container, obj, redirect=False):
+                             root_container, obj, redirect=False,
+                             redirect_cont=None):
         try:
             # This is a sharded root container, so we need figure out
-            # where the obj should live and return a 301.
-            ranges = broker.build_pivot_ranges()
-            containing_range = find_pivot_range(obj, ranges)
-            acct, cont = pivot_to_pivot_container(root_account, root_container,
-                                                  pivot_range=containing_range)
+            # where the obj should live and return a 301. If redirect_cont
+            # is given, then we know where to redurect to without having to
+            # look it up.
+            if not redirect_cont:
+                ranges = broker.build_pivot_ranges()
+                containing_range = find_pivot_range(obj, ranges)
+                acct, cont = pivot_to_pivot_container(
+                        root_account, root_container,
+                        pivot_range=containing_range)
+            else:
+                acct, cont = (root_account, redirect_cont)
 
             _, nodes = self.ring.get_nodes(root_account, root_container)
             ip, port = req.host.split(':')
@@ -419,6 +426,20 @@ class ContainerController(BaseStorageServer):
                     pass
             if not os.path.exists(broker.db_file):
                 return HTTPNotFound()
+            # There is a chance this is a sharded leaf container, that is in
+            # the middle of shrinking. If that's the case we need to know if
+            # it's a shard empty container, and if it is redirect to the full
+            # shard container. So objects get to where they need to live even
+            # if the sharder is slow or stopped.
+            is_shard_empty = False
+            shard_full = None
+
+            if broker.is_shrinking():
+                shrink_conts = broker.get_shrinking_containers()
+                if shrink_conts.get('empty') == broker.container:
+                    is_shard_empty = True
+                    shard_full = shrink_conts.get('full')
+
             record_type = req.headers.get('x-backend-record-type')
             if record_type == str(RECORD_TYPE_PIVOT_NODE):
                 # Pivot point items has different information that needs to
@@ -438,10 +459,16 @@ class ContainerController(BaseStorageServer):
                     upper=upper, object_count=obj_count,
                     bytes_used=bytes_used, record_type=int(record_type))
 
-            elif len(broker.get_pivot_ranges()) > 0:
+            elif len(broker.get_pivot_ranges()) > 0 or is_shard_empty:
                 # cannot put to a root shard container, find actual container
+                # or redirect to the full container if in the middle of a
+                # shrinking phase.
+                redirect_cont = None
+                if is_shard_empty:
+                   redirect_cont = shard_full
                 return self._find_shard_location(req, broker, drive, account,
-                                                 container, obj, redirect=True)
+                                                 container, obj, redirect=True,
+                                                 redirect_cont=redirect_cont)
             else:
                 broker.put_object(obj, req_timestamp.internal,
                                   int(req.headers['x-size']),
@@ -461,7 +488,8 @@ class ContainerController(BaseStorageServer):
                                              new_container_policy,
                                              requested_policy_index)
             if req.headers.get('X-Container-Sharding'):
-                sharding_sysmeta = get_sys_meta_prefix('container') + 'sharding'
+                sharding_sysmeta = \
+                    get_sys_meta_prefix('container') + 'sharding'
                 req.headers[sharding_sysmeta] = \
                     config_true_value(req.headers['X-Container-Sharding'])
             metadata = {}
@@ -562,6 +590,15 @@ class ContainerController(BaseStorageServer):
     def GET_sharded(self, req, broker, headers, marker='', end_marker='',
                     prefix='', limit=constraints.CONTAINER_LISTING_LIMIT):
 
+        object_count = [0]
+        object_bytes = [0]
+        limit = [limit]
+        end = [False]
+        objects = list()
+        used_ranges = list()
+        params = req.params.copy()
+        params.update({'format': 'json', 'limit': str(limit[0])})
+
         def _send_request(node, part, op, path, params):
             try:
                 qs = '&'.join(['='.join(v) for v in params.iteritems()])
@@ -574,6 +611,47 @@ class ContainerController(BaseStorageServer):
                     return resp
             except (Exception, Timeout) as ex:
                 return None
+
+        def _talk_to_nodes(root_account, root_container, pivot, account=None,
+                           container=None):
+            if not account or not container and pivot:
+                piv_acct, piv_cont = pivot_to_pivot_container(
+                    root_account, root_container, pivot_range=pivot)
+            elif account and container:
+                piv_acct, piv_cont = account, container
+            else:
+                return
+            path = '/%s/%s' % (piv_acct, piv_cont)
+            part, nodes = self.ring.get_nodes(piv_acct, piv_cont)
+            shuffle(nodes)
+            for node in nodes:
+                resp = _send_request(node, part, req.method, path, params)
+                if resp and is_success(resp.status):
+                    empty = resp.getheader('X-Container-Sysmeta-Shard-Empty')
+                    full = resp.getheader('X-Container-Sysmeta-Shard-Full')
+                    if full and empty == piv_cont:
+                        # We have an empty container, so we need to look in
+                        # the full one for this containers objects.
+                        if full not in used_ranges:
+                            used_ranges.append(full)
+                            _talk_to_nodes(root_account, root_container, None,
+                                           piv_acct, full)
+                            return
+                    object_count[0] += \
+                        int(resp.getheader('X-Container-Object-Count')) or 0
+                    object_bytes[0] += \
+                        int(resp.getheader('X-Container-Bytes-Used')) or 0
+                    try:
+                        objs = json.load(resp)
+                    except ValueError as ex:
+                        objs = []
+                    if objs:
+                        objects.extend(objs)
+                        limit[0] -= len(objs)
+                        params['limit'] = limit[0]
+                    else:
+                        end[0] = True
+                    return
 
         # Firstly we need the requested container's, the root container, pivot
         # tree.
@@ -588,13 +666,7 @@ class ContainerController(BaseStorageServer):
 
         if end_marker:
             epiv = find_pivot_range(end_marker, ranges)
-        end = False
 
-        object_count = 0
-        object_bytes = 0
-        objects = list()
-        params = req.params.copy()
-        params.update({'format': 'json', 'limit': str(limit)})
         for piv_range in ranges:
             if not start and spiv:
                 if piv_range == spiv:
@@ -603,34 +675,16 @@ class ContainerController(BaseStorageServer):
                     continue
 
             if epiv and piv_range == epiv:
-                end = True
+                end[0] = True
 
-            piv_acct, piv_cont = pivot_to_pivot_container(
-                broker.account, broker.container, pivot_range=piv_range)
-            path = '/%s/%s' % (piv_acct, piv_cont)
-            part, nodes = self.ring.get_nodes(piv_acct, piv_cont)
-            shuffle(nodes)
-            for node in nodes:
-                resp = _send_request(node, part, req.method, path, params)
-                if resp and is_success(resp.status):
-                    object_count += \
-                        int(resp.getheader('X-Container-Object-Count')) or 0
-                    object_bytes += \
-                        int(resp.getheader('X-Container-Bytes-Used')) or 0
-                    try:
-                        objs = json.load(resp)
-                    except ValueError as ex:
-                        objs = []
-                    if objs:
-                        objects.extend(objs)
-                        limit -= len(objs)
-                    else:
-                        end = True
-                    break
-            if end:
+            if piv_range in used_ranges:
+                continue
+
+            _talk_to_nodes(broker.account, broker.container, piv_range)
+            if end[0]:
                 break
-        headers['X-Container-Object-Count'] = object_count
-        headers['X-Container-Bytes-Used'] = object_bytes
+        headers['X-Container-Object-Count'] = object_count[0]
+        headers['X-Container-Bytes-Used'] = object_bytes[0]
 
         out_content_type = get_listing_content_type(req)
         return self.create_listing(req, out_content_type, {}, headers,
