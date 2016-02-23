@@ -1391,3 +1391,20 @@ class ContainerBroker(DatabaseBroker):
         else:
             with self.get() as conn:
                 return _get_possible_pivot_points(conn)
+
+    def is_shrinking(self):
+        return self.metadata.get('X-Container-Sysmeta-Shard-Full') or \
+            self.metadata.get('X-Container-Sysmeta-Shard-Empty')
+
+    def get_shrinking_containers(self):
+        res = dict()
+        if self.is_shrinking():
+            shard_empty = \
+                self.metadata.get('X-Container-Sysmeta-Shard-Empty')
+            if shard_empty:
+                res['empty'] = shard_empty[0]
+            shard_full = \
+                self.metadata.get('X-Container-Sysmeta-Shard-Full')
+            if shard_full:
+                res['full'] = shard_full[0]
+        return res

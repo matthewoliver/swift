@@ -344,7 +344,17 @@ class ContainerSharder(ContainerReplicator):
         policy_index = broker.storage_policy_index
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
-        if len(broker.get_pivot_ranges()) > 0 or broker.is_deleted():
+
+        is_full = is_empty = False
+        shrink_conts = broker.get_shrinking_containers()
+        if broker.is_shrinking():
+            if shrink_conts.get('empty') == broker.container:
+                is_empty = True
+            elif shrink_conts.get('full') == broker.container:
+                is_full = True
+
+        if len(broker.get_pivot_ranges()) > 0 or broker.is_deleted() \
+                or is_empty:
             # It's a sharded node or deleted, so anything in the object table
             # is misplaced.
             if broker.get_info()['object_count'] > 0:
@@ -358,6 +368,19 @@ class ContainerSharder(ContainerReplicator):
         else:
             # it hasn't been sharded and isn't the root container, so we need
             # to look for objects that shouldn't be in the object table
+            # there is a chance however, that this container is in the process
+            # of shrinking down. That is to say between phase 1 and 2. Where
+            # there is a shard full container and shard empty container. If
+            # it's the former, then we are temp holding more then its range.
+            if is_full:
+                # it is full, so it is holding it's current range and that of
+                # the empty container. So we need to find its range.
+                empty_range = self._get_empty_range(broker.account,
+                                                    shrink_conts['empty'])
+                if pivot < empty_range:
+                    pivot.upper = empty_range.upper
+                else:
+                    pivot.lower = empty_range.lower
             if pivot.upper:
                 tmp_q = query.copy()
                 tmp_q['marker'] = pivot.upper
@@ -661,12 +684,9 @@ class ContainerSharder(ContainerReplicator):
             # if it's already sharded then we want to finish with the audit and
             # check for misplaced objects.
             already_sharded = len(broker.get_pivot_ranges()) > 0
-            is_shrinking = \
-                broker.metadata.get('X-Container-Sysmeta-Shard-Full') or \
-                broker.metadata.get('X-Container-Sysmeta-Shard-Empty')
 
             try:
-                if already_sharded or is_shrinking:
+                if already_sharded or broker.is_shrinking():
                     continue
 
                 # Sharding is 2 phase
@@ -1041,6 +1061,19 @@ class ContainerSharder(ContainerReplicator):
         broker.update_metadata(shrink_meta)
         new_broker.update_metadata(shrink_meta)
 
+        # We need to update the root container so the empty count is zeroed.
+        empty_piv = (pivot.lower, timestamp, pivot.upper, 0, 0)
+
+        # And to keep it as up to date as possible, send an update for the full
+        # container
+        tmp_info = new_broker.get_info()
+        new_obj_cont, new_bytes_used = (tmp_info['object_count'],
+                                        tmp_info['bytes_used'])
+        full_piv = (n_pivot.lower, timestamp, n_pivot.upper,
+                    "+%d" % new_obj_cont, "+%d" % new_bytes_used)
+        self._update_pivot_ranges(root_account, root_container, 'PUT',
+                                  [empty_piv, full_piv])
+
         part = self.ring.get_part(broker.account, broker.container)
         self.logger.info(_('Replicating phase 1 shrunk containers %s/%s and '
                            '%s/%s'), new_broker.account, new_broker.container,
@@ -1051,22 +1084,45 @@ class ContainerSharder(ContainerReplicator):
             self._replicate_object, part, broker.db_file, node_id)
         any(self.cpool)
 
+    def _get_empty_range(self, account, container):
+        path = self.swift.make_path(account, container)
+        headers = dict()
+        try:
+            resp = self.swift.make_request('HEAD', path, headers,
+                                           acceptable_statuses=(2,))
+        except internal_client.UnexpectedResponse:
+            self.logger.error(_("Failed to get range from %s/%s"),
+                              account, container)
+            return None
+
+        lower = resp.get_header('X-Container-Sysmeta-Shard-Lower') or None
+        upper = resp.get_header('X-Container-Sysmeta-Shard-Upper') or None
+
+        if not lower and not upper:
+            return None
+
+        if not lower:
+            lower = None
+        if not upper:
+            upper = None
+
+        return PivotRange(lower, upper)
+
     def _shrink_phase_2(self, broker, root_account, root_container):
         # firstly the phase 2 happens inside the full container. So if
         # this isn't the full container, continue.
-        full_shard = broker.metadata.get('X-Container-Sysmeta-Shard-Full')
-        full_shard = '' if full_shard is None else full_shard[0]
+        shrink_containers = broker.get_shrinking_containers()
+        empty_shard = shrink_containers.get('empty')
+        full_shard = shrink_containers.get('full')
 
-        if broker.container != full_shard:
+        if not shrink_containers or broker.container != \
+                shrink_containers['full']:
             return
         self.logger.info(_('Starting Shrinking phase 2 on %s/%s.'),
                          broker.account, broker.container)
 
         # OK we have a full container, now lets make sure we have a quorum on
         # what the empty container is, just in case.
-
-        empty_shard = broker.metadata.get('X-Container-Sysmeta-Shard-Empty')
-        empty_shard = '' if empty_shard is None else empty_shard[0]
 
         def is_success(resp):
             return resp.getheader('X-Container-Sysmeta-Shard-Empty') == \
@@ -1080,33 +1136,9 @@ class ContainerSharder(ContainerReplicator):
                              broker.container)
             return
 
-        def get_empty_range(account, container):
-            path = self.swift.make_path(account, container)
-            headers = dict()
-            try:
-                resp = self.swift.make_request('HEAD', path, headers,
-                                               acceptable_statuses=(2,))
-            except internal_client.UnexpectedResponse:
-                self.logger.error(_("Failed to get range from %s/%s"),
-                                  account, container)
-                return None
-
-            lower = resp.get_header('X-Container-Sysmeta-Shard-Lower') or None
-            upper = resp.get_header('X-Container-Sysmeta-Shard-Upper') or None
-
-            if not lower and not upper:
-                return None
-
-            if not lower:
-                lower = None
-            if not upper:
-                upper = None
-
-            return PivotRange(lower, upper)
-
         # Now it's time to make the new container
         full_range = self.get_pivot_range(broker)
-        empty_range = get_empty_range(broker.account, empty_shard)
+        empty_range = self._get_empty_range(broker.account, empty_shard)
 
         if not empty_range:
             self.logger.info(_('Failed to find the range for the empty '
