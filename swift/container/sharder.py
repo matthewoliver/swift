@@ -436,10 +436,10 @@ class ContainerSharder(ContainerReplicator):
             run_query(query)
 
         # wipe out the cache do disable bypass in delete_db
-        cleanups = self.shard_cleanups
+        cleanups = self.shard_cleanups or {}
         self.shard_cleanups = self.shard_brokers = None
         self.logger.info('Cleaning up %d replicated shard containers',
-                         len(cleanups))
+                         len(cleanups) if cleanups else 0)
         for container in cleanups.values():
             self.cpool.spawn(self.delete_db, container)
         any(self.cpool)
@@ -524,6 +524,13 @@ class ContainerSharder(ContainerReplicator):
 
         self.logger.info(_('Auditing %s/%s'), broker.account, broker.container)
         continue_with_container = True
+
+        # if the container has been marked as deleted, we all metadata will
+        # have been erased so no point auditing. But we want it to pass, in
+        # case any objects exist inside it.
+        if broker.is_deleted():
+            return continue_with_container
+
         if not root_account or not root_container:
             root_account, root_container = \
                 ContainerSharder.get_shard_root_path(broker)
@@ -1414,19 +1421,19 @@ class ContainerSharder(ContainerReplicator):
         any(self.cpool)
 
         # delete this container as we do not need it anymore
-        if not is_root:
-            self.logger.info(_('Removing unused shard container %s'),
-                             broker.container)
-            try:
-                self.swift.delete_container(broker.account, broker.container)
-            except Exception as exception:
+        # if not is_root:
+        #    self.logger.info(_('Removing unused shard container %s'),
+        #                     broker.container)
+        #    try:
+        #        self.swift.delete_container(broker.account, broker.container)
+        #    except Exception as exception:
                 # TODO (blmartin):
                 # We need to be sure to remove the container later.
                 # it will not hurt anything by staying around (as it is empty).
                 # Should delete in shard audit
-                self.logger.warning(_('Could not delete container %s/%s'
-                                    ' due to %s. Ignoring for now'),
-                                    exception, broker.account, broker.container)
+        #        self.logger.warning(_('Could not delete container %s/%s'
+        #                            ' due to %s. Ignoring for now'),
+        #                            exception, broker.account, broker.container)
 
         self.logger.info(_('Finished sharding %s/%s, new shard '
                            'containers %s/%s and %s/%s. Sharded at pivot %s.'),
