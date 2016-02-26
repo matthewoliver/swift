@@ -561,7 +561,7 @@ class ContainerController(BaseStorageServer):
         headers = gen_resp_headers(info, is_deleted=is_deleted)
         if is_deleted:
             return HTTPNotFound(request=req, headers=headers)
-        if len(broker.get_pivot_ranges()) > 0:
+        if broker.is_root_container() and len(broker.get_pivot_ranges()) > 0:
             # Sharded, so lets ask the ranges table how many objects and bytes
             # are used.
             usage = broker.get_pivot_usage()
@@ -666,10 +666,10 @@ class ContainerController(BaseStorageServer):
                     if objs:
                         objects.extend(objs)
                         limit[0] -= len(objs)
-                        params['limit'] = limit[0]
+                        params['limit'] = str(limit[0])
                     else:
                         end[0] = True
-                    return
+                    break
 
         # Firstly we need the requested container's, the root container, pivot
         # tree.

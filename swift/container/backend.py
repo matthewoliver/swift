@@ -1408,3 +1408,12 @@ class ContainerBroker(DatabaseBroker):
             if shard_full:
                 res['full'] = shard_full[0]
         return res
+
+    def is_root_container(self):
+        """ Is this container a root container
+
+        Any container that doesn't have a root container associated with
+        it is a root container. So strictly speaking an unsharded container is
+        also a type of root container.
+        """
+        return not self.metadata.get('X-Container-Sysmeta-Shard-Container')
