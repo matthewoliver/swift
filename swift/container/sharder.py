@@ -378,9 +378,11 @@ class ContainerSharder(ContainerReplicator):
                 empty_range = self._get_empty_range(broker.account,
                                                     shrink_conts['empty'])
                 if pivot < empty_range:
-                    pivot.upper = empty_range.upper
+                    pivot = PivotRange(pivot.lower, empty_range.upper,
+                                       pivot.timestamp)
                 else:
-                    pivot.lower = empty_range.lower
+                    pivot = PivotRange(empty_range.lower, pivot.upper,
+                                       pivot.timestamp)
             if pivot.upper:
                 tmp_q = query.copy()
                 tmp_q['marker'] = pivot.upper
@@ -693,7 +695,13 @@ class ContainerSharder(ContainerReplicator):
             already_sharded = len(broker.get_pivot_ranges()) > 0
 
             try:
-                if already_sharded or broker.is_shrinking():
+                if already_sharded:
+                    continue
+
+                if broker.is_shrinking():
+                    # No matter what, we want to finish this shrink stage
+                    # before anything else.
+                    self._shrink(broker, root_account, root_container)
                     continue
 
                 # Sharding is 2 phase
@@ -826,19 +834,22 @@ class ContainerSharder(ContainerReplicator):
         return result
 
     def _get_quorum(self, broker, success=None, quorum=None, op='HEAD',
-                    headers={}, post_success=None, post_fail=None,
+                    headers=None, post_success=None, post_fail=None,
                     account=None, container=None):
         quorum = quorum if quorum else (self.ring.replica_count / 2 + 1)
+        local = False
 
         if broker:
             local = True
             account = broker.account
             container = broker.container
-        if not broker and account and container:
-            local = False
+
+        if not headers:
+            headers = {}
 
         def default_success(resp):
             return resp and is_success(resp.status)
+
         if not success:
             success = default_success
 
@@ -857,6 +868,8 @@ class ContainerSharder(ContainerReplicator):
 
         successes = 1 if local else 0
         for resp in self.cpool:
+            if not resp:
+                continue
             if success(resp):
                 successes += 1
                 if post_success:
@@ -957,8 +970,20 @@ class ContainerSharder(ContainerReplicator):
         obj_count = [broker.get_info()['object_count']]
 
         def on_success(resp):
-            obj_count[0] = max(obj_count[0],
-                               int(resp.getheader('X-Container-Object-Count')))
+            # We need to make sure that if this neighbour is in the middle
+            # of shrinking, it isn't chosen as neighbour to merge into.
+            empty = resp.getheader('X-Container-Sysmeta-Shard-Empty')
+            full = resp.getheader('X-Container-Sysmeta-Shard-Full')
+            if not empty and not full:
+                oc = resp.getheader('X-Container-Object-Count')
+                try:
+                    oc = int(oc)
+                except ValueError:
+                    oc = self.shard_container_size
+                obj_count[0] = \
+                    max(obj_count[0], oc)
+            else:
+                obj_count[0] = self.shard_container_size
 
         if not self._get_quorum(broker, post_success=on_success):
             self.logger.info(_('Failed to get quorum on object count in '
@@ -1102,8 +1127,8 @@ class ContainerSharder(ContainerReplicator):
                               account, container)
             return None
 
-        lower = resp.get_header('X-Container-Sysmeta-Shard-Lower') or None
-        upper = resp.get_header('X-Container-Sysmeta-Shard-Upper') or None
+        lower = resp.headers.get('X-Container-Sysmeta-Shard-Lower')
+        upper = resp.headers.get('X-Container-Sysmeta-Shard-Upper')
 
         if not lower and not upper:
             return None
@@ -1183,6 +1208,19 @@ class ContainerSharder(ContainerReplicator):
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
 
+        try:
+            policy = POLICIES.get_by_index(policy_index)
+            headers = {'X-Storage-Policy': policy.name}
+            self.swift.create_container(new_acct, new_cont, headers=headers)
+        except internal_client.UnexpectedResponse as ex:
+            self.logger.warning(_('Failed to put container: %s'),
+                                str(ex))
+            self.logger.error(_('PUT of new shard containers failed, cancelling'
+                                ' shrinking of %s/%s. Will try again next '
+                                'pass'),
+                              broker.account, broker.container)
+            return
+
         items = broker.list_objects_iter(CONTAINER_LISTING_LIMIT, **query)
         if len(items) == CONTAINER_LISTING_LIMIT:
             marker = items[-1][0]
@@ -1235,7 +1273,11 @@ class ContainerSharder(ContainerReplicator):
         self.logger.info(_('Deleting empty (%s) and full (%s) containers '
                          'that have now merged into %s/%s'), empty_shard,
                          broker.container, new_acct, new_cont)
-        self.swift.delete_container(broker.account, empty_shard)
+        try:
+            self.swift.delete_container(broker.account, empty_shard)
+        except internal_client.UnexpectedResponse as ex:
+            self.logger.info(_('Failed to delete %s/%s during shrinking: %s'),
+                             broker.account, empty_shard, ex)
         broker.delete_db(timestamp)
 
         # Now replicate the container we are working on
