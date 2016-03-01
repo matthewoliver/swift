@@ -738,7 +738,7 @@ class ContainerSharder(ContainerReplicator):
                     self.cpool.spawn(self.delete_db, container)
 
                 # Now we wait for all threads to finish.
-                any(self.cpool)
+                all(self.cpool)
 
                 self.logger.info(_('Finished container sharding pass'))
 
@@ -807,6 +807,7 @@ class ContainerSharder(ContainerReplicator):
                 self.cpool.spawn(
                     self._send_request, node['ip'], node['port'],
                     node['device'], part, op, obj_path, headers)
+            all(self.cpool)
 
     @staticmethod
     def check_complete_ranges(ranges):
@@ -964,8 +965,6 @@ class ContainerSharder(ContainerReplicator):
         self.logger.info(_('Sharded container %s/%s is a candidate for '
                            'shrinking'), broker.account, broker.container)
         pivot = ContainerSharder.get_pivot_range(broker)
-        self.logger.info(_('Asking for quorum on a pivot point %s for '
-                           '%s/%s'), pivot, broker.account, broker.container)
 
         obj_count = [broker.get_info()['object_count']]
 

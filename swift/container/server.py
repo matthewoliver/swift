@@ -357,6 +357,11 @@ class ContainerController(BaseStorageServer):
             # delete container
             if not broker.empty():
                 return HTTPConflict(request=req)
+            if broker.is_root_container() and \
+                    len(broker.get_pivot_ranges()) > 0:
+                resp = self.DELETE_sharded(req, broker)
+                if resp:
+                    return resp
             existed = Timestamp(broker.get_info()['put_timestamp']) and \
                 not broker.is_deleted()
             broker.delete_db(req_timestamp.internal)
@@ -369,6 +374,49 @@ class ContainerController(BaseStorageServer):
             if existed:
                 return HTTPNoContent(request=req)
             return HTTPNotFound()
+
+    def DELETE_sharded(self, req, broker):
+        """
+        Check to see if there are anything in the sharded containers, then
+        delete them first.
+
+        :param req: The request object
+        :param broker: The broker for this container
+        :return: Returns None on success or a response to send back to the
+                 client on an error, eg. 409.
+        """
+        # First lets get some usages.
+        usages = broker.get_pivot_usage()
+        obj_count = None
+        if usages:
+            obj_count = usages.get('object_count')
+
+        if not usages or not obj_count:
+            # this is suppose to be a sharded root container, yet we can't
+            # get information about counts from it. There must be an issue.
+            self.logger.error(_('Failed to get required counts from sharded '
+                                'container %s/%s'), broker.account,
+                              broker.container)
+            return HTTPInternalServerError(request=req)
+
+        if obj_count > 0:
+            return HTTPConflict(request=req)
+
+        successful_ranges = list()
+        ranges = broker.build_pivot_ranges()
+        for pivot_range in ranges:
+            acct, cont = pivot_to_pivot_container(
+                broker.account, broker.container, pivot_range=pivot_range)
+            # TODO Still need to finish this, deciding on how much I should
+            # reimplement that happens in the proxy. Ways forward:
+            #  1. Reimplement a basic make requests/getting quorum.
+            #  2. Refactor out some of the quroum/best_response methods from
+            #     proxy.controller.base and use them.
+            #  3. Use an internal client, in side the container server
+            #  4. Do sharded deletes from inside the proxy.
+
+
+        return None
 
     def _update_or_create(self, req, broker, timestamp, new_container_policy,
                           requested_policy_index):
