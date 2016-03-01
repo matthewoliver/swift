@@ -3700,19 +3700,19 @@ class PivotRange(object):
             return self.lower < item <= self._upper
 
     def __lt__(self, other):
+        if self._upper is None:
+            return False
         if isinstance(other, PivotRange):
             return self._upper < other.lower or self._lower < other.lower
         else:
-            if self._upper is None:
-                return False
             return self._upper < other
 
     def __gt__(self, other):
+        if self._lower is None:
+            return False
         if isinstance(other, PivotRange):
             return self._lower >= other.upper or self._upper > other.upper
         else:
-            if self._lower is None:
-                return False
             return self._lower >= other
 
     def __eq__(self, other):
