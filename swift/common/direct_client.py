@@ -80,7 +80,7 @@ def _make_req(node, part, method, path, _headers, stype,
 def _get_direct_account_container(path, stype, node, part,
                                   marker=None, limit=None,
                                   prefix=None, delimiter=None, conn_timeout=5,
-                                  response_timeout=15):
+                                  response_timeout=15, **kargs):
     """Base class for get direct account and container.
 
     Do not use directly use the get_direct_account or
@@ -95,6 +95,10 @@ def _get_direct_account_container(path, stype, node, part,
         qs += '&prefix=%s' % quote(prefix)
     if delimiter:
         qs += '&delimiter=%s' % quote(delimiter)
+    if 'reverse' in kargs:
+        qs += '&reverse=%s' % quote(kargs.get('reverse', 'no'))
+    if 'nodes' in kargs:
+        qs += '&nodes=%s' % quote(kargs.get('nodes', ''))
     with Timeout(conn_timeout):
         conn = http_connect(node['ip'], node['port'], node['device'], part,
                             'GET', path, query_string=qs,
@@ -185,7 +189,7 @@ def direct_head_container(node, part, account, container, conn_timeout=5,
 
 def direct_get_container(node, part, account, container, marker=None,
                          limit=None, prefix=None, delimiter=None,
-                         conn_timeout=5, response_timeout=15):
+                         conn_timeout=5, response_timeout=15, **kargs):
     """
     Get container listings directly from the container server.
 
@@ -208,7 +212,8 @@ def direct_get_container(node, part, account, container, marker=None,
                                          limit=limit, prefix=prefix,
                                          delimiter=delimiter,
                                          conn_timeout=conn_timeout,
-                                         response_timeout=response_timeout)
+                                         response_timeout=response_timeout,
+                                         **kargs)
 
 
 def direct_delete_container(node, part, account, container, conn_timeout=5,
