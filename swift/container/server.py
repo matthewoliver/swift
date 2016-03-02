@@ -31,6 +31,8 @@ from swift.container.backend import ContainerBroker, DATADIR, \
 from swift.container.replicator import ContainerReplicatorRpc
 from swift.common import ring
 from swift.common.db import DatabaseAlreadyExists
+from swift.common.direct_client import direct_get_container, \
+    DirectClientException
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.request_helpers import get_param, get_listing_content_type, \
     split_and_validate_path, is_sys_or_user_meta, get_sys_meta_prefix
@@ -415,7 +417,6 @@ class ContainerController(BaseStorageServer):
             #  3. Use an internal client, in side the container server
             #  4. Do sharded deletes from inside the proxy.
 
-
         return None
 
     def _update_or_create(self, req, broker, timestamp, new_container_policy,
@@ -665,19 +666,6 @@ class ContainerController(BaseStorageServer):
         params = req.params.copy()
         params.update({'format': 'json', 'limit': str(limit[0])})
 
-        def _send_request(node, part, op, path, params):
-            try:
-                qs = '&'.join(['='.join(v) for v in params.iteritems()])
-                with ConnectionTimeout(self.conn_timeout):
-                    conn = http_connect(
-                        node['ip'], node['port'], node['device'], part, op,
-                        path, query_string=qs)
-                with Timeout(self.node_timeout):
-                    resp = conn.getresponse()
-                    return resp
-            except (Exception, Timeout) as ex:
-                return None
-
         def _talk_to_nodes(root_account, root_container, pivot, account=None,
                            container=None):
             if not account or not container and pivot:
@@ -687,37 +675,38 @@ class ContainerController(BaseStorageServer):
                 piv_acct, piv_cont = account, container
             else:
                 return
-            path = '/%s/%s' % (piv_acct, piv_cont)
             part, nodes = self.ring.get_nodes(piv_acct, piv_cont)
             shuffle(nodes)
             for node in nodes:
-                resp = _send_request(node, part, req.method, path, params)
-                if resp and is_success(resp.status):
-                    empty = resp.getheader('X-Container-Sysmeta-Shard-Empty')
-                    full = resp.getheader('X-Container-Sysmeta-Shard-Full')
-                    if full and empty == piv_cont:
-                        # We have an empty container, so we need to look in
-                        # the full one for this containers objects.
-                        if full not in used_ranges:
-                            used_ranges.append(full)
-                            _talk_to_nodes(root_account, root_container, None,
-                                           piv_acct, full)
-                            return
-                    object_count[0] += \
-                        int(resp.getheader('X-Container-Object-Count')) or 0
-                    object_bytes[0] += \
-                        int(resp.getheader('X-Container-Bytes-Used')) or 0
-                    try:
-                        objs = json.load(resp)
-                    except ValueError as ex:
-                        objs = []
-                    if objs:
-                        objects.extend(objs)
-                        limit[0] -= len(objs)
-                        params['limit'] = str(limit[0])
-                    else:
-                        end[0] = True
-                    break
+                try:
+                    hdrs, objs = direct_get_container(
+                        node, part, piv_acct, piv_cont, **params)
+                except DirectClientException:
+                    # The exception will be thrown if not is_success so just
+                    # move onto the next node.
+                    continue
+
+                empty = hdrs.get('X-Container-Sysmeta-Shard-Empty')
+                full = hdrs.get('X-Container-Sysmeta-Shard-Full')
+                if full and empty == piv_cont:
+                    # We have an empty container, so we need to look in
+                    # the full one for this containers objects.
+                    if full not in used_ranges:
+                        used_ranges.append(full)
+                        _talk_to_nodes(root_account, root_container, None,
+                                       piv_acct, full)
+                        return
+                object_count[0] += \
+                    int(hdrs.get('X-Container-Object-Count', 0))
+                object_bytes[0] += \
+                    int(hdrs.get('X-Container-Bytes-Used', 0))
+                if objs:
+                    objects.extend(objs)
+                    limit[0] -= len(objs)
+                    params['limit'] = str(limit[0])
+                else:
+                    end[0] = True
+                break
 
         # Firstly we need the requested container's, the root container, pivot
         # tree.
