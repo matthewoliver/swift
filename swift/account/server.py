@@ -192,6 +192,7 @@ class AccountController(BaseStorageServer):
         limit = constraints.ACCOUNT_LISTING_LIMIT
         given_limit = get_param(req, 'limit')
         reverse = config_true_value(get_param(req, 'reverse'))
+        contains = get_param(req, 'contains')
         if given_limit and given_limit.isdigit():
             limit = int(given_limit)
             if limit > constraints.ACCOUNT_LISTING_LIMIT:
@@ -212,7 +213,7 @@ class AccountController(BaseStorageServer):
             return self._deleted_response(broker, req, HTTPNotFound)
         return account_listing_response(account, req, out_content_type, broker,
                                         limit, marker, end_marker, prefix,
-                                        delimiter, reverse)
+                                        delimiter, reverse, contains)
 
     @public
     @replication

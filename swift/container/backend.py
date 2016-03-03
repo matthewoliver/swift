@@ -558,7 +558,7 @@ class ContainerBroker(DatabaseBroker):
 
     def list_objects_iter(self, limit, marker, end_marker, prefix, delimiter,
                           path=None, storage_policy_index=0, reverse=False,
-                          substr=None):
+                          contains=None):
         """
         Get a list of objects sorted by name starting at marker onward, up
         to limit entries.  Entries will begin with the prefix and will not
@@ -572,14 +572,14 @@ class ContainerBroker(DatabaseBroker):
         :param path: if defined, will set the prefix and delimiter based on
                      the path
         :param reverse: reverse the result order.
-        :param substr: do a substr search e.g %substr%
+        :param contains: match objects whose name contains the value
 
         :returns: list of tuples of (name, created_at, size, content_type,
                   etag)
         """
         delim_force_gte = False
-        (marker, end_marker, prefix, delimiter, path, substr) = utf8encode(
-            marker, end_marker, prefix, delimiter, path, substr)
+        (marker, end_marker, prefix, delimiter, path, contains) = utf8encode(
+            marker, end_marker, prefix, delimiter, path, contains)
         self._commit_puts_stale_ok()
         if reverse:
             # Reverse the markers if we are reversing the listing.
@@ -618,10 +618,10 @@ class ContainerBroker(DatabaseBroker):
                 elif prefix:
                     query += ' name >= ? AND'
                     query_args.append(prefix)
-                if substr:
-                    substr = '%' + substr + '%'
+                if contains:
+                    contains = '%' + contains + '%'
                     query += ' name LIKE ? AND'
-                    query_args.append(substr)
+                    query_args.append(contains)
                 if self.get_db_version(conn) < 1:
                     query += ' +deleted = 0'
                 else:

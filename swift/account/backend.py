@@ -366,7 +366,7 @@ class AccountBroker(DatabaseBroker):
             ''').fetchone())
 
     def list_containers_iter(self, limit, marker, end_marker, prefix,
-                             delimiter, reverse=False):
+                             delimiter, reverse=False, contains=None):
         """
         Get a list of containers sorted by name starting at marker onward, up
         to limit entries. Entries will begin with the prefix and will not have
@@ -377,7 +377,8 @@ class AccountBroker(DatabaseBroker):
         :param end_marker: end marker query
         :param prefix: prefix query
         :param delimiter: delimiter for query
-        :param reverse: reverse the result order.
+        :param reverse: reverse the result order
+        :param contains: match containers whose name contains the value
 
         :returns: list of tuples of (name, object_count, bytes_used, 0)
         """
@@ -419,6 +420,10 @@ class AccountBroker(DatabaseBroker):
                 elif prefix:
                     query += ' name >= ? AND'
                     query_args.append(prefix)
+                if contains:
+                    contains = '%' + contains + '%'
+                    query += ' name LIKE ? AND'
+                    query_args.append(contains)
                 if self.get_db_version(conn) < 1:
                     query += ' +deleted = 0'
                 else:
