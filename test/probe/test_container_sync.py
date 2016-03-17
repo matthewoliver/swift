@@ -12,16 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
+import time
 import uuid
 import random
+from ConfigParser import ConfigParser
+from contextlib import contextmanager
+from shutil import rmtree
+from tempfile import mkdtemp
+
+import errno
 from nose import SkipTest
 import unittest
 
 from six.moves.urllib.parse import urlparse
 from swiftclient import client, ClientException
 
+from swift.common.manager import Manager, Server, SWIFT_DIR
 from swift.common.http import HTTP_NOT_FOUND
-from swift.common.manager import Manager
+from swift.common.utils import readconf
 from test.probe.brain import BrainSplitter
 from test.probe.common import ReplProbeTest, ENABLED_POLICIES
 
@@ -45,56 +54,161 @@ def get_current_realm_cluster(url):
     raise SkipTest('Unable find current realm cluster')
 
 
+class FakeServer(Server):
+    def __init__(self, server_name, tempdir, custom_conf):
+        self.custom_conf = custom_conf
+        self.tempdir = tempdir
+        super(FakeServer, self).__init__(server_name, run_dir=tempdir)
+
+    def conf_files(self):
+        # overrides superclass to return custom conf files in a temp dir.
+        # each custom conf files will have custom_conf applied.
+        new_conf_files = []
+        conf_files = super(FakeServer, self).conf_files()
+        for conf_file in conf_files:
+            conf = readconf(conf_file)  # read from a file or a dir of files
+            cp = ConfigParser()
+            for conf_source in (conf, self.custom_conf):
+                for section_name, options in conf_source.items():
+                    if not isinstance(options, dict):
+                        continue
+                    if not cp.has_section(section_name):
+                        cp.add_section(section_name)
+                    for name, value in options.items():
+                        cp.set(section_name, name, value)
+
+            # the path to the conf file is significant because it determines
+            # where the Server writes and then looks for its pid files
+            tmp_conf_file_dir = os.path.dirname(conf_file).replace(
+                SWIFT_DIR, self.tempdir)
+            try:
+                os.mkdir(tmp_conf_file_dir)
+            except OSError as err:
+                if err.errno != errno.EEXIST:
+                    raise
+            tmp_conf_file = os.path.join(tmp_conf_file_dir,
+                                         os.path.basename(conf_file))
+            with open(tmp_conf_file, 'w') as fp:
+                cp.write(fp)
+
+            new_conf_files.append(tmp_conf_file)
+
+        return new_conf_files
+
+
 class TestContainerSync(ReplProbeTest):
 
     def setUp(self):
         super(TestContainerSync, self).setUp()
         self.realm, self.cluster = get_current_realm_cluster(self.url)
+        self.source_containers = []
+        self.dest_containers = []
+        self.tempdir = mkdtemp()
 
-    def _setup_synced_containers(
-            self, source_overrides=None, dest_overrides=None):
-        # these defaults are used to create both source and dest containers
+    def tearDown(self):
+        rmtree(self.tempdir)
+        super(TestContainerSync, self).tearDown()
+
+    @contextmanager
+    def run_server(self, server_name, custom_conf, **kwargs):
+        # kick off server daemons, yield, then kill the daemons on exit
+        server = FakeServer(server_name, self.tempdir, custom_conf)
+        try:
+            server.launch(**kwargs)
+            yield
+        finally:
+            server.stop(verbose=True)
+
+    def create_source_and_dest_containers(self, num,
+                                          skey='secret', dkey='secret',
+                                          source_overrides=None,
+                                          dest_overrides=None):
         # unless overridden by source_overrides and/or dest_overrides
         default_params = {'url': self.url,
                           'token': self.token,
-                          'account': self.account,
-                          'sync_key': 'secret'}
+                          'account': self.account}
+        container_suffixes = (uuid.uuid4() for i in range(num))
+        for container_suffix in container_suffixes:
+            # setup dest container
+            dest = dict(default_params)
+            dest['name'] = 'dest-container-%s' % container_suffix
+            dest.update(dest_overrides or {})
+            dest_headers = {}
+            dest_policy = None
+            if len(ENABLED_POLICIES) > 1:
+                dest_policy = random.choice(ENABLED_POLICIES)
+                dest_headers['X-Storage-Policy'] = dest_policy.name
+            if dkey is not None:
+                dest_headers['X-Container-Sync-Key'] = dkey
+            client.put_container(dest['url'], dest['token'], dest['name'],
+                                 headers=dest_headers)
+            self.dest_containers.append(dest['name'])
 
-        # setup dest container
-        dest = dict(default_params)
-        dest['name'] = 'dest-container-%s' % uuid.uuid4()
-        dest.update(dest_overrides or {})
-        dest_headers = {}
-        dest_policy = None
-        if len(ENABLED_POLICIES) > 1:
-            dest_policy = random.choice(ENABLED_POLICIES)
-            dest_headers['X-Storage-Policy'] = dest_policy.name
-        if dest['sync_key'] is not None:
-            dest_headers['X-Container-Sync-Key'] = dest['sync_key']
-        client.put_container(dest['url'], dest['token'], dest['name'],
-                             headers=dest_headers)
+            # setup source container
+            source = dict(default_params)
+            source['name'] = 'source-container-%s' % container_suffix
+            source.update(source_overrides or {})
+            source_headers = {}
+            sync_to = '//%s/%s/%s/%s' % (self.realm,
+                                         self.cluster,
+                                         dest['account'],
+                                         dest['name'])
+            source_headers['X-Container-Sync-To'] = sync_to
+            if skey is not None:
+                source_headers['X-Container-Sync-Key'] = skey
+            if dest_policy:
+                source_policy = random.choice([p for p in ENABLED_POLICIES
+                                               if p is not dest_policy])
+                source_headers['X-Storage-Policy'] = source_policy.name
+            client.put_container(source['url'], source['token'], source['name'],
+                                 headers=source_headers)
+            self.source_containers.append(source['name'])
 
-        # setup source container
-        source = dict(default_params)
-        source['name'] = 'source-container-%s' % uuid.uuid4()
-        source.update(source_overrides or {})
-        source_headers = {}
-        sync_to = '//%s/%s/%s/%s' % (self.realm, self.cluster, dest['account'],
-                                     dest['name'])
-        source_headers['X-Container-Sync-To'] = sync_to
-        if source['sync_key'] is not None:
-            source_headers['X-Container-Sync-Key'] = source['sync_key']
-        if dest_policy:
-            source_policy = random.choice([p for p in ENABLED_POLICIES
-                                           if p is not dest_policy])
-            source_headers['X-Storage-Policy'] = source_policy.name
-        client.put_container(source['url'], source['token'], source['name'],
-                             headers=source_headers)
+    def create_synced_containers_pair(self, skey='secret', dkey='secret',
+                                      source_overrides=None,
+                                      dest_overrides=None):
+        self.create_source_and_dest_containers(1, skey, dkey, source_overrides,
+                                               dest_overrides)
+        return self.source_containers[0], self.dest_containers[0]
 
-        return source['name'], dest['name']
+    def populate_source_containers(self, num):
+        self.obj_names = [str(uuid.uuid4()) for i in range(num)]
+        for source_container in self.source_containers:
+            for obj_name in self.obj_names:
+                client.put_object(self.url,
+                                  self.token,
+                                  source_container,
+                                  obj_name,
+                                  '%s\n%s' % (source_container, obj_name))
+
+    def validate_container_sync(self):
+        errors = []
+        for i, dest_container in enumerate(self.dest_containers):
+            for obj_name in self.obj_names:
+                try:
+                    headers, body = client.get_object(self.url, self.token,
+                                                      dest_container, obj_name)
+                except ClientException as err:
+                    errors.append('Failed to GET %s/%s: %s' %
+                                  (dest_container, obj_name, err))
+                else:
+                    obj_body = '%s\n%s' % (self.source_containers[i], obj_name)
+                    if obj_body != body:
+                        errors.append(
+                            'Expected body %s but got %s for %s/%s' %
+                            (obj_body, body, dest_container, obj_name))
+
+        if errors:
+            msg = 'Unexpected errors: \n' + '\n'.join(errors)
+            self.fail(msg)
+
+    def run_sync_forever(self, conf, wait_time):
+        Manager(['container-replicator']).once()
+        with self.run_server('container-sync', {'container-sync': conf}):
+            time.sleep(wait_time)  # leave time for at least one sync cycle
 
     def _test_sync(self, object_post_as_copy):
-        source_container, dest_container = self._setup_synced_containers()
+        source_container, dest_container = self.create_synced_containers_pair()
 
         # upload to source
         object_name = 'object-%s' % uuid.uuid4()
@@ -165,9 +279,8 @@ class TestContainerSync(ReplProbeTest):
         # be found in the destination account at time of sync'ing.
         # Create source and dest containers for manifest in separate accounts.
         dest_account = self.account_2
-        source_container, dest_container = self._setup_synced_containers(
-            dest_overrides=dest_account
-        )
+        source_container, dest_container = self.create_synced_containers_pairs(
+            dest_overrides=dest_account)
 
         # Create source and dest containers for segments in separate accounts.
         # These containers must have same name for the destination SLO manifest
@@ -175,10 +288,10 @@ class TestContainerSync(ReplProbeTest):
         # key so segments will not sync.
         segs_container = 'segments-%s' % uuid.uuid4()
         dest_segs_info = dict(dest_account)
-        dest_segs_info.update({'name': segs_container, 'sync_key': None})
-        self._setup_synced_containers(
-            source_overrides={'name': segs_container, 'sync_key': 'segs_key'},
-            dest_overrides=dest_segs_info)
+        dest_segs_info.update({'name': segs_container})
+        self.create_source_and_dest_containers(
+            source_overrides={'name': segs_container},
+            dest_overrides=dest_segs_info, dkey=None)
 
         # upload a segment to source
         segment_name = 'segment-%s' % uuid.uuid4()
@@ -228,7 +341,7 @@ class TestContainerSync(ReplProbeTest):
         # now set sync key on destination segments container
         client.put_container(
             dest_account['url'], dest_account['token'], segs_container,
-            headers={'X-Container-Sync-Key': 'segs_key'})
+            headers={'X-Container-Sync-Key': 'secret'})
 
         # cycle container-sync
         Manager(['container-sync']).once()
@@ -248,20 +361,13 @@ class TestContainerSync(ReplProbeTest):
         self.assertEqual(segment_data, body)
 
     def test_sync_lazy_skey(self):
-        # Create synced containers, but with no key at source
-        source_container, dest_container =\
-            self._setup_synced_containers(source_overrides={'sync_key': None})
-
-        # upload to source
-        object_name = 'object-%s' % uuid.uuid4()
-        client.put_object(self.url, self.token, source_container, object_name,
-                          'test-body')
-
-        # cycle container-sync, nothing should happen
+        source_container, dest_container = \
+            self.create_synced_containers_pair(None, 'secret')
+        self.populate_source_containers(1)
         Manager(['container-sync']).once()
         with self.assertRaises(ClientException) as err:
             _junk, body = client.get_object(self.url, self.token,
-                                            dest_container, object_name)
+                                            dest_container, self.obj_names[0])
         self.assertEqual(err.exception.http_status, HTTP_NOT_FOUND)
 
         # amend source key
@@ -270,25 +376,18 @@ class TestContainerSync(ReplProbeTest):
                              headers=source_headers)
         # cycle container-sync, should replicate
         Manager(['container-sync']).once()
-        _junk, body = client.get_object(self.url, self.token,
-                                        dest_container, object_name)
-        self.assertEqual(body, 'test-body')
+        self.validate_container_sync()
 
     def test_sync_lazy_dkey(self):
-        # Create synced containers, but with no key at dest
-        source_container, dest_container =\
-            self._setup_synced_containers(dest_overrides={'sync_key': None})
-
-        # upload to source
-        object_name = 'object-%s' % uuid.uuid4()
-        client.put_object(self.url, self.token, source_container, object_name,
-                          'test-body')
+        source_container, dest_container = \
+            self.create_synced_containers_pair('secret', None)
+        self.populate_source_containers(1)
 
         # cycle container-sync, nothing should happen
         Manager(['container-sync']).once()
         with self.assertRaises(ClientException) as err:
             _junk, body = client.get_object(self.url, self.token,
-                                            dest_container, object_name)
+                                            dest_container, self.obj_names[0])
         self.assertEqual(err.exception.http_status, HTTP_NOT_FOUND)
 
         # amend dest key
@@ -297,12 +396,25 @@ class TestContainerSync(ReplProbeTest):
                              headers=dest_headers)
         # cycle container-sync, should replicate
         Manager(['container-sync']).once()
-        _junk, body = client.get_object(self.url, self.token,
-                                        dest_container, object_name)
-        self.assertEqual(body, 'test-body')
+        self.validate_container_sync()
+
+    def test_sync_forever_multiple_containers(self):
+        self.create_source_and_dest_containers(2)
+        self.populate_source_containers(1)
+        conf = {'processes': 2, 'interval': 1}
+        self.run_sync_forever(conf, 10)
+        self.validate_container_sync()
+
+    def test_sync_forever_multiple_containers_and_objects(self):
+        self.create_source_and_dest_containers(4)
+        self.populate_source_containers(4)
+        conf = {'processes': 2, 'interval': 1}
+        self.run_sync_forever(conf, 10)
+        self.validate_container_sync()
 
     def test_sync_with_stale_container_rows(self):
-        source_container, dest_container = self._setup_synced_containers()
+        source_container, dest_container = self.create_synced_containers_pair()
+
         brain = BrainSplitter(self.url, self.token, source_container,
                               None, 'container')
 
@@ -366,7 +478,7 @@ class TestContainerSync(ReplProbeTest):
             self.fail(msg)
 
     def test_sync_newer_remote(self):
-        source_container, dest_container = self._setup_synced_containers()
+        source_container, dest_container = self.create_synced_containers_pair()
 
         # upload to source
         object_name = 'object-%s' % uuid.uuid4()

@@ -256,6 +256,7 @@ use = egg:swift#recon
 # Internal client config file path
 # internal_client_conf_path = /etc/swift/internal-client.conf
 #
+
 # You can set scheduling priority of processes. Niceness values range from -20
 # (most favorable to the process) to 19 (least favorable to the process).
 # nice_priority =
@@ -267,6 +268,11 @@ use = egg:swift#recon
 # Work only with ionice_class.
 # ionice_class =
 # ionice_priority =
+
+# The maximum number of child sync processes to run in parallel (default=1).
+# Each child process syncs one container, so increasing this number will cause
+# more containers to be simultaneously synced.
+# processes = 1
 
 # Note: Put it at the beginning of the pipeline to profile all middleware. But
 # it is safer to put this after healthcheck.

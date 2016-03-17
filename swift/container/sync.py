@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import collections
 import errno
 import os
+import signal
+import sys
 import uuid
+import json
+import collections
 from swift import gettext_ as _
 from time import ctime, time
 from random import choice, random
@@ -167,6 +170,8 @@ class ContainerSync(Daemon):
         #: to the next one. If a container sync hasn't finished in this time,
         #: it'll just be resumed next scan.
         self.container_time = int(conf.get('container_time', 60))
+        #: dictionary for child processes pipe book keeping
+        self.pid2file = {}
         #: ContainerSyncCluster instance for validating sync-to values.
         self.realms_conf = ContainerSyncRealms(
             os.path.join(
@@ -187,32 +192,30 @@ class ContainerSync(Daemon):
         self.sync_store = ContainerSyncStore(self.devices,
                                              self.logger,
                                              self.mount_check)
-        #: Number of containers with sync turned on that were successfully
-        #: synced.
-        self.container_syncs = 0
-        #: Number of successful DELETEs triggered.
-        self.container_deletes = 0
-        #: Number of successful PUTs triggered.
-        self.container_puts = 0
-        #: Number of containers whose sync has been turned off, but
-        #: are not yet cleared from the sync store.
-        self.container_skips = 0
-        #: Number of containers that had a failure of some type.
-        self.container_failures = 0
 
-        #: Per container stats. These are collected per container.
-        #: puts - the number of puts that were done for the container
-        #: deletes - the number of deletes that were fot the container
-        #: bytes - the total number of bytes transferred per the container
-        self.container_stats = collections.defaultdict(int)
-        self.container_stats.clear()
-
+        #: Container sync stats, consisting of:
+        #: syncs - The number of containers with sync turned on that were
+        #:     successfully synced.
+        #: deletes - The number of successful DELETEs triggered.
+        #: puts - The number of successful PUTs triggered.
+        #: skips - The number of containers whose sync has been turned off,
+        #:     but are not yet cleared from the sync store.
+        #: failures: The number of containers that had a failure of some type.
+        self.stats = collections.defaultdict(int)
         #: Time of last stats report.
         self.reported = time()
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
         #: swift.common.ring.Ring for locating containers.
         self.container_ring = container_ring or Ring(self.swift_dir,
                                                      ring_name='container')
+        #: The maximum number of sync processes running in parallel
+        try:
+            self.processes = int(conf.get('processes', 1))
+            if self.processes < 1:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise ValueError(
+                _("Option 'processes' must be a positive integer"))
         bind_ip = conf.get('bind_ip', '0.0.0.0')
         self._myips = whataremyips(bind_ip)
         self._myport = int(conf.get('bind_port', 6201))
@@ -220,6 +223,7 @@ class ContainerSync(Daemon):
             config_true_value(conf.get('db_preallocation', 'f'))
         self.conn_timeout = float(conf.get('conn_timeout', 5))
         request_tries = int(conf.get('request_tries') or 3)
+        self.write_fd = None
 
         internal_client_conf_path = conf.get('internal_client_conf_path')
         if not internal_client_conf_path:
@@ -241,19 +245,99 @@ class ContainerSync(Daemon):
                   '%(conf)r (%(error)s)')
                 % {'conf': internal_client_conf_path, 'error': err})
 
+    def _update_stats(self, container_stats):
+        for key in ('puts', 'deletes', 'failures', 'skips', 'syncs'):
+            self.stats[key] += container_stats.get(key, 0)
+
+    update_stats = _update_stats
+
+    def _write_stats(self, stats):
+        # Writes per container stats to pipe in child process.
+        # If no stats to send (error occurred), send an empty line so
+        # read_stats doesn't hang.
+        stats_string = ''
+        if stats:
+            try:
+                stats_string = json.dumps(stats)
+            except TypeError as err:
+                self.logger.exception(_('Error serializing stats: %s'), err)
+
+        try:
+            with os.fdopen(self.write_fd, 'w') as f:
+                f.write(stats_string + "\n")
+        except (IOError, OSError) as err:
+            self.logger.exception(_('Error writing stats to pipe: %s'), err)
+
+    def _read_stats(self, fd):
+        # Reads per container stats from pipe in parent process and updates
+        # daemon stats.
+        try:
+            with os.fdopen(fd, 'r') as f:
+                stats_string = f.readline()
+        except (IOError, OSError) as err:
+            self.logger.exception(_('Error reading stats from pipe: %s'), err)
+            return
+
+        try:
+            stats = json.loads(stats_string)
+        except (ValueError, TypeError):
+            self.logger.exception(
+                _('Error de-serializing stats %s'), stats_string)
+            return
+
+        self._update_stats(stats)
+
+    def _wait_for_child(self):
+        pid = os.wait()[0]
+        try:
+            self._read_stats(self.pid2file[pid])
+        finally:
+            del self.pid2file[pid]
+            self.periodic_report()
+
+    def _do_fork(self):
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid:
+            self.pid2file[pid] = read_fd
+            os.close(write_fd)
+        else:
+            os.close(read_fd)
+            self.write_fd = write_fd
+
     def run_forever(self, *args, **kwargs):
         """
         Runs container sync scans until stopped.
         """
         sleep(random() * self.interval)
         while True:
+            self.logger.info(_('Begin container sync sweep'))
             begin = time()
             for path in self.sync_store.synced_containers_generator():
-                self.container_stats.clear()
-                self.container_sync(path)
-                if time() - self.reported >= 3600:  # once an hour
-                    self.report()
-            elapsed = time() - begin
+                # Block until a worker process is available - can not
+                # fork more than number of processes allocation defined
+                while len(self.pid2file) >= self.processes:
+                    self._wait_for_child()
+                self._do_fork()
+                if self.write_fd:  # forked child process
+                    try:
+                        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                        # in child process, write stats to the pipe instead of
+                        # updating directly
+                        self.update_stats = self._write_stats
+                        self.container_sync(path)
+                    finally:
+                        sys.exit()
+
+            # Done looping over synced containers.
+            # Make sure all workers are done so that we don't start a new
+            # worker on a container that may still be in progress.
+            while self.pid2file:
+                self._wait_for_child()
+
+            end = time()
+            self.periodic_report(end)
+            elapsed = end - begin
             if elapsed < self.interval:
                 sleep(self.interval - elapsed)
 
@@ -265,36 +349,34 @@ class ContainerSync(Daemon):
         begin = time()
         for path in self.sync_store.synced_containers_generator():
             self.container_sync(path)
-            if time() - self.reported >= 3600:  # once an hour
-                self.report()
+            self.periodic_report()
         self.report()
         elapsed = time() - begin
         self.logger.info(
             _('Container sync "once" mode completed: %.02fs'), elapsed)
+
+    def periodic_report(self, t=None):
+        if t is None:
+            t = time()
+        if t - self.reported >= 3600:  # once an hour
+            self.report()
 
     def report(self):
         """
         Writes a report of the stats to the logger and resets the stats for the
         next report.
         """
+        self.stats['time'] = ctime(self.reported)
         self.logger.info(
-            _('Since %(time)s: %(sync)s synced [%(delete)s deletes, %(put)s '
-              'puts], %(skip)s skipped, %(fail)s failed'),
-            {'time': ctime(self.reported),
-             'sync': self.container_syncs,
-             'delete': self.container_deletes,
-             'put': self.container_puts,
-             'skip': self.container_skips,
-             'fail': self.container_failures})
+            _('Since time: %(time)s, synced: %(syncs)s, deletes: %(deletes)s, '
+              'puts: %(puts)s, skipped: %(skips)s, failed: %(failures)s'),
+            self.stats)
+
+        self.stats.clear()
         self.reported = time()
-        self.container_syncs = 0
-        self.container_deletes = 0
-        self.container_puts = 0
-        self.container_skips = 0
-        self.container_failures = 0
 
     def container_report(self, start, end, sync_point1, sync_point2, info,
-                         max_row):
+                         max_row, container_stats):
         self.logger.info(_('Container sync report: %(container)s, '
                            'time window start: %(start)s, '
                            'time window end: %(end)s, '
@@ -309,10 +391,10 @@ class ContainerSync(Daemon):
                                                   info['container']),
                           'start': start,
                           'end': end,
-                          'puts': self.container_stats['puts'],
+                          'puts': container_stats['puts'],
                           'posts': 0,
-                          'deletes': self.container_stats['deletes'],
-                          'bytes': self.container_stats['bytes'],
+                          'deletes': container_stats['deletes'],
+                          'bytes': container_stats['bytes'],
                           'point1': sync_point1,
                           'point2': sync_point2,
                           'total': max_row})
@@ -325,6 +407,14 @@ class ContainerSync(Daemon):
 
         :param path: the path to a container db
         """
+        #: Per container stats. These are collected per container.
+        #: puts - the number of puts that were done for the container
+        #: deletes - the number of deletes that were done for the container
+        #: bytes - the total number of bytes transferred for the container
+        #: skips - 1 if the container was skipped, 0 otherwise
+        #: syncs - 1 if syncing was successful, 0 otherwise
+        #: failures - 1 if syncing failed, 0 otherwise
+        container_stats = collections.defaultdict(int)
         broker = None
         try:
             broker = ContainerBroker(path)
@@ -361,7 +451,7 @@ class ContainerSync(Daemon):
                     elif key.lower() == 'x-container-sync-key':
                         user_key = value
                 if not sync_to or not user_key:
-                    self.container_skips += 1
+                    container_stats['skips'] += 1
                     self.logger.increment('skips')
                     return
                 err, sync_to, realm, realm_key = validate_sync_to(
@@ -371,7 +461,7 @@ class ContainerSync(Daemon):
                         _('ERROR %(db_file)s: %(validate_sync_to_err)s'),
                         {'db_file': str(broker),
                          'validate_sync_to_err': err})
-                    self.container_failures += 1
+                    container_stats['failures'] += 1
                     self.logger.increment('failures')
                     return
                 start_at = time()
@@ -395,7 +485,7 @@ class ContainerSync(Daemon):
                         # nodes didn't succeed.
                         if not self.container_sync_row(
                                 row, sync_to, user_key, broker, info, realm,
-                                realm_key):
+                                realm_key, container_stats):
                             if not next_sync_point:
                                 next_sync_point = sync_point2
                         sync_point2 = row['ROWID']
@@ -423,22 +513,25 @@ class ContainerSync(Daemon):
                                 len(nodes) == ordinal:
                             self.container_sync_row(
                                 row, sync_to, user_key, broker, info, realm,
-                                realm_key)
+                                realm_key, container_stats)
                         sync_point1 = row['ROWID']
                         broker.set_x_container_sync_points(sync_point1, None)
                         sync_stage_time = time()
-                    self.container_syncs += 1
+                    container_stats['syncs'] += 1
                     self.logger.increment('syncs')
                 finally:
                     self.container_report(start_at, sync_stage_time,
                                           sync_point1,
                                           next_sync_point,
-                                          info, broker.get_max_row())
+                                          info, broker.get_max_row(),
+                                          container_stats)
         except (Exception, Timeout):
-            self.container_failures += 1
+            container_stats['failures'] += 1
             self.logger.increment('failures')
             self.logger.exception(_('ERROR Syncing %s'),
                                   broker if broker else path)
+        finally:
+            self.update_stats(container_stats)
 
     def _update_sync_to_headers(self, name, sync_to, user_key,
                                 realm, realm_key, method, headers):
@@ -514,7 +607,7 @@ class ContainerSync(Daemon):
             raise http_err
 
     def container_sync_row(self, row, sync_to, user_key, broker, info,
-                           realm, realm_key):
+                           realm, realm_key, container_stats):
         """
         Sends the update the row indicates to the sync_to container.
         Update can be either delete or put.
@@ -555,8 +648,7 @@ class ContainerSync(Daemon):
                 except ClientException as err:
                     if err.http_status != HTTP_NOT_FOUND:
                         raise
-                self.container_deletes += 1
-                self.container_stats['deletes'] += 1
+                container_stats['deletes'] += 1
                 self.logger.increment('deletes')
                 self.logger.timing_since('deletes.timing', start_time)
             else:
@@ -606,9 +698,8 @@ class ContainerSync(Daemon):
                            contents=FileLikeIter(body),
                            proxy=self.select_http_proxy(), logger=self.logger,
                            timeout=self.conn_timeout)
-                self.container_puts += 1
-                self.container_stats['puts'] += 1
-                self.container_stats['bytes'] += row['size']
+                container_stats['puts'] += 1
+                container_stats['bytes'] += row['size']
                 self.logger.increment('puts')
                 self.logger.timing_since('puts.timing', start_time)
         except ClientException as err:
@@ -629,14 +720,14 @@ class ContainerSync(Daemon):
                 self.logger.exception(
                     _('ERROR Syncing %(db_file)s %(row)s'),
                     {'db_file': str(broker), 'row': row})
-            self.container_failures += 1
+            container_stats['failures'] += 1
             self.logger.increment('failures')
             return False
         except (Exception, Timeout) as err:
             self.logger.exception(
                 _('ERROR Syncing %(db_file)s %(row)s'),
                 {'db_file': str(broker), 'row': row})
-            self.container_failures += 1
+            container_stats['failures'] += 1
             self.logger.increment('failures')
             return False
         return True

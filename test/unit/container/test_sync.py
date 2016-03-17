@@ -20,8 +20,12 @@ from textwrap import dedent
 
 import mock
 import errno
+import collections
+import time
+
 from swift.common.utils import Timestamp
 from test.unit import debug_logger
+from test.unit import FakeLogger
 from swift.container import sync
 from swift.common.db import DatabaseConnectionError
 from swift.common import utils
@@ -158,108 +162,298 @@ class TestContainerSync(unittest.TestCase):
             sample_conf = sample_conf_file.read()
         self.assertEqual(contents, sample_conf)
 
-    def test_run_forever(self):
-        # This runs runs_forever with fakes to succeed for two loops, the first
-        # causing a report but no interval sleep, the second no report but an
-        # interval sleep.
-        time_calls = [0]
-        sleep_calls = []
+    def _do_run_forever(self, conf, listings, timings, expected_sleeps=0):
+        # helper method to set up mocks and call run_forever.
+        # expected_sleeps is number in addition to random startup delay
+        do_fork_calls = [0]
+        forked_pids = []
+        pid_peak_count = [0]
 
-        def fake_time():
-            time_calls[0] += 1
-            returns = [1,     # Initialized reported time
-                       1,     # Start time
-                       3602,  # Is it report time (yes)
-                       3602,  # Report time
-                       3602,  # Elapsed time for "under interval" (no)
-                       3602,  # Start time
-                       3603,  # Is it report time (no)
-                       3603]  # Elapsed time for "under interval" (yes)
-            if time_calls[0] == len(returns) + 1:
-                raise Exception('we are now done')
-            return returns[time_calls[0] - 1]
+        def fake_do_fork(cs_self):
+            # Instead of forking, cause the child process code to always
+            # execute. The real _do_fork closes the pipe's read_fd and write_fd
+            # on the child and parent paths respectively, but here we use them
+            # both in same process so don't close them.
+            do_fork_calls[0] += 1
+            read_fd, write_fd = os.pipe()
+            # Increment pid on each call and add to a list of issued pids
+            pid = do_fork_calls[0]
+            forked_pids.insert(0, pid)
+            # fake the parent path behaviour
+            cs_self.pid2file[pid] = read_fd
+            # fake the child path behaviour
+            cs_self.write_fd = write_fd
+            # track the max number of simultaneous forked child processes
+            pid_peak_count[0] = max(pid_peak_count[0], len(cs_self.pid2file))
 
-        def fake_sleep(amount):
-            sleep_calls.append(amount)
+        with mock.patch('swift.container.sync.InternalClient'),\
+                mock.patch('swift.container.sync.time') as fake_time, \
+                mock.patch('swift.container.sync.sleep') as fake_sleep, \
+                mock.patch('swift.container.sync.os.wait') as fake_wait, \
+                mock.patch('swift.container.sync.sys.exit'), \
+                mock.patch('swift.container.sync.ContainerSync._do_fork',
+                           fake_do_fork), \
+                mock.patch('swift.container.sync_store.'
+                           'ContainerSyncStore.synced_containers_generator',)\
+                as fake_generator:
+            fake_time.side_effect = timings
+            fake_wait.side_effect = lambda: (forked_pids.pop(), 0)
+            fake_generator.side_effect = [iter(l) for l in listings]
 
-        gen_func = ('swift.container.sync_store.'
-                    'ContainerSyncStore.synced_containers_generator')
-        with mock.patch('swift.container.sync.InternalClient'), \
-                mock.patch('swift.container.sync.time', fake_time), \
-                mock.patch('swift.container.sync.sleep', fake_sleep), \
-                mock.patch(gen_func) as fake_generator, \
-                mock.patch('swift.container.sync.ContainerBroker',
-                           lambda p: FakeContainerBroker(p, info={
-                               'account': 'a', 'container': 'c',
-                               'storage_policy_index': 0})):
-            fake_generator.side_effect = [iter(['container.db']),
-                                          iter(['container.db'])]
-            cs = sync.ContainerSync({}, container_ring=FakeRing())
+            cs = sync.ContainerSync(conf, container_ring=FakeRing(),
+                                    logger=FakeLogger())
             try:
                 cs.run_forever()
             except Exception as err:
+                # check for the fake_time sentinel value
                 if str(err) != 'we are now done':
                     raise
 
-            self.assertEqual(time_calls, [9])
-            self.assertEqual(len(sleep_calls), 2)
-            self.assertLessEqual(sleep_calls[0], cs.interval)
-            self.assertEqual(cs.interval - 1, sleep_calls[1])
-            self.assertEqual(2, fake_generator.call_count)
-            self.assertEqual(cs.reported, 3602)
+        # verify sleeps
+        self.assertEqual(1 + expected_sleeps, fake_sleep.call_count)
+        # random sleep time at start of run_forever
+        self.assertLessEqual(fake_sleep.call_args_list[0][0][0],
+                             cs.interval)
+        for i in range(1, expected_sleeps):
+            self.assertLessEqual(fake_sleep.call_args_list[i][0][0],
+                                 cs.interval)
+
+        # sanity checks
+        self.assertEqual(len(timings), fake_time.call_count)
+        self.assertEqual(len(listings), fake_generator.call_count)
+        self.assertFalse(forked_pids)  # waited for all child processes
+        self.assertLessEqual(pid_peak_count[0], cs.processes)
+        return cs
+
+    def _do_run_forever_mocked_container_sync(
+            self, conf, listings, container_stats, timings, expected_sleeps=0):
+        # helper to mock container_sync method before testing run_forever
+        sync_calls = [0]
+
+        def fake_container_sync(cs_self, path):
+            # fake updating the stats for a container sync
+            stats = container_stats[sync_calls[0]]
+            if isinstance(stats, Exception):
+                raise stats
+            cs_self.update_stats(stats)
+            sync_calls[0] += 1
+
+        with mock.patch('swift.container.sync.ContainerSync.container_sync',
+                        fake_container_sync):
+            cs = self._do_run_forever(conf, listings, timings, expected_sleeps)
+
+        self.assertEqual(len(container_stats), sync_calls[0])
+        return cs
+
+    def _do_test_run_forever(self, conf):
+        # run three cycles then verify expected logs
+        container_stats = [
+            dict(puts=1, deletes=0, skips=0, syncs=1, failures=0),
+            dict(puts=0, deletes=2, skips=0, syncs=1, failures=0),
+            dict(puts=0, deletes=0, skips=0, syncs=0, failures=1),
+            dict(puts=0, deletes=0, skips=1, syncs=0, failures=0),
+            dict(puts=3, deletes=4, skips=0, syncs=1, failures=0)]
+        timings = [
+            0,     # initialisation of reported time in __init__
+            1,     # First sweep - Start time
+            3559,  # Is it report time, 3559 (no)
+            3559,  # Elapsed time = 3558 for "under interval" (no)
+            3602,  # Second sweep - Start time
+            3603,  # Is it report time, 3603 (yes)
+            3603,  # report
+            3901,  # Elapsed time = 299 for "under interval" (yes)
+            6908,  # Third sweep - Start, 3 containers to sync
+            7201,  # is it report time, 3598 (no)
+            7202,  # is it report time, 3599 (no)
+            7203,  # is it report time, 3600 (yes)
+            7207,  # report time
+            7208,  # Elapsed time = 300 for "under interval" (no)
+            Exception('we are now done')]  # Start time -> end test
+
+        listings = [
+            ['container1.db'],
+            ['container1.db'],
+            ['container1.db', 'container2.db', 'container3.db']]
+
+        cs = self._do_run_forever_mocked_container_sync(
+            conf, listings, container_stats, timings, expected_sleeps=1)
+
+        # verify logs
+        self.assertFalse(cs.logger.get_lines_for_level('error'))
+        info_lines = cs.logger.get_lines_for_level('info')
+        self.assertEqual('Begin container sync sweep', info_lines[0])
+        self.assertEqual('Begin container sync sweep', info_lines[1])
+        # reported stats accumulated over first two sweeps
+        self.assertIn(
+            "synced: 2, deletes: 2, puts: 1, skipped: 0, failed: 0",
+            info_lines[2])
+        self.assertEqual('Begin container sync sweep', info_lines[3])
+        # reported stats accumulated in third sweep
+        self.assertIn(
+            "synced: 1, deletes: 4, puts: 3, skipped: 1, failed: 1",
+            info_lines[4])
+        self.assertEqual('Begin container sync sweep', info_lines[5])
+        self.assertFalse(info_lines[6:])
+
+        self.assertEqual(cs.reported, 7207)
+
+    def test_run_forever(self):
+        self._do_test_run_forever({})
+
+    def test_run_forever_two_processes(self):
+        self._do_test_run_forever({'processes': 2})
+
+    def test_run_forever_three_processes(self):
+        self._do_test_run_forever({'processes': 3})
+
+    def test_run_forever_pipe_errors(self):
+        # verify that errors with pipe IO get logged and do not cause
+        # run_forever to hang
+        listings = [['container1.db']]
+        container_stats = [
+            dict(puts=1, deletes=0, skips=0, syncs=1, failures=0)]
+        timings = [0,     # initialisation of reported time in __init__
+                   1,     # First sweep - Start time
+                   3601,  # Is it report time (yes)
+                   3601,  # report time (yes)
+                   Exception('we are now done')]  # -> end test
+
+        def do_test(errors):
+            with mock.patch('swift.container.sync.os.fdopen') as fake_fdopen:
+                fake_fdopen.return_value.__enter__.side_effect = errors
+                cs = self._do_run_forever_mocked_container_sync(
+                    {}, listings, container_stats, timings)
+
+            # verify logs
+            self.assertEqual(2, fake_fdopen.call_count)
+            error_lines = cs.logger.get_lines_for_level('error')
+            self.assertIn('Error writing stats to pipe: write error',
+                          error_lines[0])
+            self.assertIn('Error reading stats from pipe: read error',
+                          error_lines[1])
+            self.assertFalse(error_lines[2:])
+            info_lines = cs.logger.get_lines_for_level('info')
+            self.assertEqual('Begin container sync sweep', info_lines[0])
+            self.assertIn(
+                "synced: 0, deletes: 0, puts: 0, skipped: 0, failed: 0",
+                info_lines[1])
+            self.assertFalse(info_lines[2:])
+
+        do_test([OSError('write error'), OSError('read error')])
+        do_test([IOError('write error'), IOError('read error')])
+
+    def test_run_forever_serialize_stats_error(self):
+        # verify that any bug with stats gets logged and does not cause
+        # run_forever to hang
+        listings = [['container1.db']]
+        container_stats = [object()]  # cause json.dumps to raise TypeError
+        timings = [0,     # initialisation of reported time in __init__
+                   1,     # First sweep - Start time
+                   3601,  # Is it report time (yes)
+                   3601,  # report time (yes)
+                   Exception('we are now done')]  # -> end test
+
+        cs = self._do_run_forever_mocked_container_sync(
+            {}, listings, container_stats, timings)
+
+        # verify logs
+        error_lines = cs.logger.get_lines_for_level('error')
+        self.assertIn('Error serializing stats',
+                      error_lines[0])
+        self.assertIn('Error de-serializing stats',
+                      error_lines[1])
+        self.assertFalse(error_lines[2:])
+        info_lines = cs.logger.get_lines_for_level('info')
+        self.assertEqual('Begin container sync sweep', info_lines[0])
+        self.assertIn(
+            "synced: 0, deletes: 0, puts: 0, skipped: 0, failed: 0",
+            info_lines[1])
+        self.assertFalse(info_lines[2:])
+
+    def test_run_forever_broker_error(self):
+        # verify that an error in container_sync method gets logged does not
+        # cause run_forever to hang
+        with mock.patch('swift.container.sync.ContainerBroker',
+                        side_effect=Exception('test exc')):
+            listings = [['container1.db']]
+            timings = [0,     # initialisation of reported time in __init__
+                       1,     # First sweep - Start time
+                       3601,  # Is it report time (yes)
+                       3601,  # report time (yes)
+                       Exception('we are now done')]  # -> end test
+            cs = self._do_run_forever({}, listings, timings)
+
+        # verify logs
+        error_lines = cs.logger.get_lines_for_level('error')
+        self.assertIn('ERROR Syncing ', error_lines[0])
+        self.assertFalse(error_lines[1:])
+        info_lines = cs.logger.get_lines_for_level('info')
+        self.assertEqual('Begin container sync sweep', info_lines[0])
+        self.assertIn(
+            "synced: 0, deletes: 0, puts: 0, skipped: 0, failed: 1",
+            info_lines[1])
+        self.assertFalse(info_lines[2:])
 
     def test_run_once(self):
         # This runs runs_once with fakes twice, the first causing an interim
         # report, the second with no interim report.
-        time_calls = [0]
-
-        def fake_time():
-            time_calls[0] += 1
-            returns = [1,     # Initialized reported time
-                       1,     # Start time
-                       3602,  # Is it report time (yes)
-                       3602,  # Report time
-                       3602,  # End report time
-                       3602,  # For elapsed
-                       3602,  # Start time
-                       3603,  # Is it report time (no)
-                       3604,  # End report time
-                       3605]  # For elapsed
-            if time_calls[0] == len(returns) + 1:
-                raise Exception('we are now done')
-            return returns[time_calls[0] - 1]
-
-        gen_func = ('swift.container.sync_store.'
-                    'ContainerSyncStore.synced_containers_generator')
-        with mock.patch('swift.container.sync.InternalClient'), \
-                mock.patch('swift.container.sync.time', fake_time), \
-                mock.patch(gen_func) as fake_generator, \
-                mock.patch('swift.container.sync.ContainerBroker',
-                           lambda p: FakeContainerBroker(p, info={
-                               'account': 'a', 'container': 'c',
-                               'storage_policy_index': 0})):
-            fake_generator.side_effect = [iter(['container.db']),
-                                          iter(['container.db'])]
-            cs = sync.ContainerSync({}, container_ring=FakeRing())
-            try:
+        with mock.patch('swift.container.sync.InternalClient'),\
+            mock.patch('swift.container.sync.time') as fake_time, \
+            mock.patch('swift.container.sync_store.'
+                       'ContainerSyncStore.synced_containers_generator')\
+            as fake_generator, \
+            mock.patch('swift.container.sync.ContainerBroker',
+                       lambda p: FakeContainerBroker(p, info={
+                           'account': 'a', 'container': 'c',
+                           'storage_policy_index': 0})):
+                fake_time.side_effect = \
+                    [0,     # initialisation of reported time in __init__
+                     1,     # begin Start time
+                     3602,  # Is it report time (yes)
+                     3602,  # Report time
+                     3602,  # End report time
+                     3602,  # For elapsed
+                     3603,  # Start time,
+                     3604,  # Is it report time (no)
+                     3605,  # End report time
+                     3606,  # For elapsed
+                     ]
+                fake_generator.side_effect = [iter(['container.db']),
+                                              iter(['container.db'])]
+                cs = sync.ContainerSync({}, container_ring=FakeRing(),
+                                        logger=FakeLogger())
                 cs.run_once()
-                self.assertEqual(time_calls, [6])
+                self.assertEqual(6, fake_time.call_count)
                 self.assertEqual(1, fake_generator.call_count)
                 self.assertEqual(cs.reported, 3602)
                 cs.run_once()
-            except Exception as err:
-                if str(err) != 'we are now done':
-                    raise
+                self.assertEqual(10, fake_time.call_count)
+                self.assertEqual(2, fake_generator.call_count)
+                self.assertEqual(cs.reported, 3605)
 
-            self.assertEqual(time_calls, [10])
-            self.assertEqual(2, fake_generator.call_count)
-            self.assertEqual(cs.reported, 3604)
+        # verify logs
+        self.assertFalse(cs.logger.get_lines_for_level('error'))
+        info_lines = cs.logger.get_lines_for_level('info')
+        self.assertEqual('Begin container sync "once" mode', info_lines[0])
+        self.assertIn(
+            "synced: 0, deletes: 0, puts: 0, skipped: 0, failed: 0",
+            info_lines[1])
+        self.assertIn(
+            "synced: 0, deletes: 0, puts: 0, skipped: 0, failed: 0",
+            info_lines[2])
+        self.assertIn('Container sync "once" mode completed', info_lines[3])
+        self.assertEqual('Begin container sync "once" mode', info_lines[4])
+        self.assertIn(
+            "synced: 0, deletes: 0, puts: 0, skipped: 0, failed: 0",
+            info_lines[5])
+        self.assertIn('Container sync "once" mode completed', info_lines[6])
+        self.assertFalse(info_lines[7:])
 
     def test_container_sync_not_db(self):
         cring = FakeRing()
         with mock.patch('swift.container.sync.InternalClient'):
             cs = sync.ContainerSync({}, container_ring=cring)
-        self.assertEqual(cs.container_failures, 0)
+        self.assertEqual(cs.stats['failures'], 0)
 
     def test_container_sync_missing_db(self):
         cring = FakeRing()
@@ -282,8 +476,8 @@ class TestContainerSync(unittest.TestCase):
                     'a',
                     "DB doesn't exist")
                 cs.container_sync('isa.db')
-                self.assertEqual(cs.container_failures, 1)
-                self.assertEqual(cs.container_skips, 0)
+                self.assertEqual(cs.stats['failures'], 1)
+                self.assertEqual(cs.stats['skips'], 0)
                 self.assertEqual(1, fake_remove.call_count)
                 self.assertEqual('isa.db', fake_remove.call_args[0][0].db_file)
 
@@ -296,8 +490,8 @@ class TestContainerSync(unittest.TestCase):
                     "DB doesn't exist")
                 fake_remove.side_effect = OSError('1')
                 cs.container_sync('isa.db')
-                self.assertEqual(cs.container_failures, 2)
-                self.assertEqual(cs.container_skips, 0)
+                self.assertEqual(cs.stats['failures'], 2)
+                self.assertEqual(cs.stats['skips'], 0)
                 self.assertEqual(1, fake_remove.call_count)
                 self.assertEqual('isa.db', fake_remove.call_args[0][0].db_file)
 
@@ -310,8 +504,8 @@ class TestContainerSync(unittest.TestCase):
                     "DB doesn't exist")
                 fake_remove.side_effect = OSError(errno.EPERM, 'a')
                 cs.container_sync('isa.db')
-                self.assertEqual(cs.container_failures, 3)
-                self.assertEqual(cs.container_skips, 0)
+                self.assertEqual(cs.stats['failures'], 3)
+                self.assertEqual(cs.stats['skips'], 0)
                 self.assertEqual(1, fake_remove.call_count)
                 self.assertEqual('isa.db', fake_remove.call_args[0][0].db_file)
 
@@ -321,8 +515,8 @@ class TestContainerSync(unittest.TestCase):
             with mock.patch(store + '.remove_synced_container') as fake_remove:
                 fake_get_info.side_effect = DatabaseConnectionError('a', 'a')
                 cs.container_sync('isa.db')
-                self.assertEqual(cs.container_failures, 4)
-                self.assertEqual(cs.container_skips, 0)
+                self.assertEqual(cs.stats['failures'], 4)
+                self.assertEqual(cs.stats['skips'], 0)
                 self.assertEqual(0, fake_remove.call_count)
 
     def test_container_sync_not_my_db(self):
@@ -343,24 +537,24 @@ class TestContainerSync(unittest.TestCase):
             cs._myips = ['127.0.0.1']   # No match
             cs._myport = 1              # No match
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 0)
+            self.assertEqual(cs.stats['failures'], 0)
 
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1              # No match
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 0)
+            self.assertEqual(cs.stats['failures'], 0)
 
             cs._myips = ['127.0.0.1']   # No match
             cs._myport = 1000           # Match
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 0)
+            self.assertEqual(cs.stats['failures'], 0)
 
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
             # This complete match will cause the 1 container failure since the
             # broker's info doesn't contain sync point keys
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 1)
+            self.assertEqual(cs.stats['failures'], 1)
         finally:
             sync.ContainerBroker = orig_ContainerBroker
 
@@ -378,7 +572,7 @@ class TestContainerSync(unittest.TestCase):
             # This complete match will cause the 1 container failure since the
             # broker's info doesn't contain sync point keys
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 1)
+            self.assertEqual(cs.stats['failures'], 1)
 
             sync.ContainerBroker = lambda p: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
@@ -386,7 +580,7 @@ class TestContainerSync(unittest.TestCase):
             # This complete match will not cause any more container failures
             # since the broker indicates deletion
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 1)
+            self.assertEqual(cs.stats['failures'], 1)
         finally:
             sync.ContainerBroker = orig_ContainerBroker
 
@@ -406,8 +600,8 @@ class TestContainerSync(unittest.TestCase):
             # This complete match will be skipped since the broker's metadata
             # has no x-container-sync-to or x-container-sync-key
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 0)
-            self.assertEqual(cs.container_skips, 1)
+            self.assertEqual(cs.stats['failures'], 0)
+            self.assertEqual(cs.stats['skips'], 1)
 
             sync.ContainerBroker = lambda p: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
@@ -420,8 +614,8 @@ class TestContainerSync(unittest.TestCase):
             # This complete match will be skipped since the broker's metadata
             # has no x-container-sync-key
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 0)
-            self.assertEqual(cs.container_skips, 2)
+            self.assertEqual(cs.stats['failures'], 0)
+            self.assertEqual(cs.stats['skips'], 2)
 
             sync.ContainerBroker = lambda p: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
@@ -434,8 +628,8 @@ class TestContainerSync(unittest.TestCase):
             # This complete match will be skipped since the broker's metadata
             # has no x-container-sync-to
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 0)
-            self.assertEqual(cs.container_skips, 3)
+            self.assertEqual(cs.stats['failures'], 0)
+            self.assertEqual(cs.stats['skips'], 3)
 
             sync.ContainerBroker = lambda p: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
@@ -450,8 +644,8 @@ class TestContainerSync(unittest.TestCase):
             # This complete match will cause a container failure since the
             # sync-to won't validate as allowed.
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 1)
-            self.assertEqual(cs.container_skips, 3)
+            self.assertEqual(cs.stats['failures'], 1)
+            self.assertEqual(cs.stats['skips'], 3)
 
             sync.ContainerBroker = lambda p: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
@@ -466,8 +660,8 @@ class TestContainerSync(unittest.TestCase):
             # This complete match will succeed completely since the broker
             # get_items_since will return no new rows.
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 1)
-            self.assertEqual(cs.container_skips, 3)
+            self.assertEqual(cs.stats['failures'], 1)
+            self.assertEqual(cs.stats['skips'], 3)
         finally:
             sync.ContainerBroker = orig_ContainerBroker
 
@@ -491,8 +685,8 @@ class TestContainerSync(unittest.TestCase):
             cs.allowed_sync_hosts = ['127.0.0.1']
             # This sync will fail since the items_since data is bad.
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 1)
-            self.assertEqual(cs.container_skips, 0)
+            self.assertEqual(cs.stats['failures'], 1)
+            self.assertEqual(cs.stats['skips'], 0)
 
             # Set up fake times to make the sync short-circuit as having taken
             # too long
@@ -509,8 +703,8 @@ class TestContainerSync(unittest.TestCase):
             # as to be time to move on (before it ever actually tries to do
             # anything).
             cs.container_sync('isa.db')
-            self.assertEqual(cs.container_failures, 1)
-            self.assertEqual(cs.container_skips, 0)
+            self.assertEqual(cs.stats['failures'], 1)
+            self.assertEqual(cs.stats['skips'], 0)
         finally:
             sync.ContainerBroker = orig_ContainerBroker
             sync.time = orig_time
@@ -541,8 +735,8 @@ class TestContainerSync(unittest.TestCase):
             cs.allowed_sync_hosts = ['127.0.0.1']
             cs.container_sync('isa.db')
             # Succeeds because no rows match
-            self.assertEqual(cs.container_failures, 1)
-            self.assertEqual(cs.container_skips, 0)
+            self.assertEqual(cs.stats['failures'], 1)
+            self.assertEqual(cs.stats['skips'], 0)
             self.assertEqual(fcb.sync_point1, None)
             self.assertEqual(fcb.sync_point2, -1)
 
@@ -568,8 +762,8 @@ class TestContainerSync(unittest.TestCase):
             cs.allowed_sync_hosts = ['127.0.0.1']
             cs.container_sync('isa.db')
             # Succeeds because the two sync points haven't deviated yet
-            self.assertEqual(cs.container_failures, 1)
-            self.assertEqual(cs.container_skips, 0)
+            self.assertEqual(cs.stats['failures'], 1)
+            self.assertEqual(cs.stats['skips'], 0)
             self.assertEqual(fcb.sync_point1, -1)
             self.assertEqual(fcb.sync_point2, -1)
 
@@ -589,8 +783,8 @@ class TestContainerSync(unittest.TestCase):
             cs.container_sync('isa.db')
             # Fails because container_sync_row will fail since the row has no
             # 'deleted' key
-            self.assertEqual(cs.container_failures, 2)
-            self.assertEqual(cs.container_skips, 0)
+            self.assertEqual(cs.stats['failures'], 2)
+            self.assertEqual(cs.stats['skips'], 0)
             self.assertEqual(fcb.sync_point1, None)
             self.assertEqual(fcb.sync_point2, -1)
 
@@ -615,8 +809,8 @@ class TestContainerSync(unittest.TestCase):
             cs.allowed_sync_hosts = ['127.0.0.1']
             cs.container_sync('isa.db')
             # Fails because delete_object fails
-            self.assertEqual(cs.container_failures, 3)
-            self.assertEqual(cs.container_skips, 0)
+            self.assertEqual(cs.stats['failures'], 3)
+            self.assertEqual(cs.stats['skips'], 0)
             self.assertEqual(fcb.sync_point1, None)
             self.assertEqual(fcb.sync_point2, -1)
 
@@ -639,8 +833,8 @@ class TestContainerSync(unittest.TestCase):
             cs.allowed_sync_hosts = ['127.0.0.1']
             cs.container_sync('isa.db')
             # Succeeds because delete_object succeeds
-            self.assertEqual(cs.container_failures, 3)
-            self.assertEqual(cs.container_skips, 0)
+            self.assertEqual(cs.stats['failures'], 3)
+            self.assertEqual(cs.stats['skips'], 0)
             self.assertEqual(fcb.sync_point1, None)
             self.assertEqual(fcb.sync_point2, 1)
 
@@ -677,8 +871,8 @@ class TestContainerSync(unittest.TestCase):
             cs.allowed_sync_hosts = ['127.0.0.1']
             cs.container_sync('isa.db')
             # Succeeds because no rows match
-            self.assertEqual(cs.container_failures, 0)
-            self.assertEqual(cs.container_skips, 0)
+            self.assertEqual(cs.stats['failures'], 0)
+            self.assertEqual(cs.stats['skips'], 0)
             self.assertEqual(fcb.sync_point1, 1)
             self.assertEqual(fcb.sync_point2, None)
 
@@ -708,8 +902,8 @@ class TestContainerSync(unittest.TestCase):
             cs.container_sync('isa.db')
             # Fails because row is missing 'deleted' key
             # Nevertheless the fault is skipped
-            self.assertEqual(cs.container_failures, 1)
-            self.assertEqual(cs.container_skips, 0)
+            self.assertEqual(cs.stats['failures'], 1)
+            self.assertEqual(cs.stats['skips'], 0)
             self.assertEqual(fcb.sync_point1, 1)
             self.assertEqual(fcb.sync_point2, None)
 
@@ -730,8 +924,8 @@ class TestContainerSync(unittest.TestCase):
             cs.container_sync('isa.db')
             # Succeeds because row now has 'deleted' key and delete_object
             # succeeds
-            self.assertEqual(cs.container_failures, 1)
-            self.assertEqual(cs.container_skips, 0)
+            self.assertEqual(cs.stats['failures'], 1)
+            self.assertEqual(cs.stats['skips'], 0)
             self.assertEqual(fcb.sync_point1, 1)
             self.assertEqual(fcb.sync_point2, None)
         finally:
@@ -844,6 +1038,7 @@ class TestContainerSync(unittest.TestCase):
             # Success.
             # simulate a row with tombstone at 1.1 and later ctype, meta times
             created_at = ts_data.internal + '+1388+1388'  # last modified = 1.2
+            stats = collections.defaultdict(int)
             self.assertTrue(cs.container_sync_row(
                 {'deleted': True,
                  'name': 'object',
@@ -851,8 +1046,8 @@ class TestContainerSync(unittest.TestCase):
                  'size': '1000'}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(cs.container_deletes, 1)
+                realm, realm_key, stats))
+            self.assertEqual(stats['deletes'], 1)
 
             exc = []
 
@@ -862,14 +1057,15 @@ class TestContainerSync(unittest.TestCase):
 
             sync.delete_object = fake_delete_object
             # Failure because of delete_object exception
+            stats = collections.defaultdict(int)
             self.assertFalse(cs.container_sync_row(
                 {'deleted': True,
                  'name': 'object',
                  'created_at': '1.2'}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(cs.container_deletes, 1)
+                realm, realm_key, stats))
+            self.assertEqual(stats['failures'], 1)
             self.assertEqual(len(exc), 1)
             self.assertEqual(str(exc[-1]), 'test exception')
 
@@ -879,14 +1075,15 @@ class TestContainerSync(unittest.TestCase):
 
             sync.delete_object = fake_delete_object
             # Failure because of delete_object exception
+            stats = collections.defaultdict(int)
             self.assertFalse(cs.container_sync_row(
                 {'deleted': True,
                  'name': 'object',
                  'created_at': '1.2'}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(cs.container_deletes, 1)
+                realm, realm_key, stats))
+            self.assertEqual(stats['failures'], 1)
             self.assertEqual(len(exc), 2)
             self.assertEqual(str(exc[-1]), 'test client exception')
 
@@ -897,14 +1094,15 @@ class TestContainerSync(unittest.TestCase):
 
             sync.delete_object = fake_delete_object
             # Success because the object wasn't even found
+            stats = collections.defaultdict(int)
             self.assertTrue(cs.container_sync_row(
                 {'deleted': True,
                  'name': 'object',
                  'created_at': '1.2'}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(cs.container_deletes, 2)
+                realm, realm_key, stats))
+            self.assertEqual(stats['deletes'], 1)
             self.assertEqual(len(exc), 3)
             self.assertEqual(str(exc[-1]), 'test client exception: 404')
         finally:
@@ -930,38 +1128,33 @@ class TestContainerSync(unittest.TestCase):
             sync.uuid = FakeUUID
             ts_data = Timestamp(1.1)
             timestamp = Timestamp(1.2)
-            put_object_calls = []
 
-            def fake_put_object(*args, **kwargs):
-                put_object_calls.append((args, kwargs))
-
-            def check_put_object(extra_headers, sync_to, name=None,
-                                 headers=None, contents=None, proxy=None,
-                                 logger=None, timeout=None):
+            def fake_put_object(sync_to, name=None, headers=None,
+                                contents=None, proxy=None, logger=None,
+                                timeout=None):
                 self.assertEqual(sync_to, 'http://sync/to/path')
                 self.assertEqual(name, 'object')
-                expected_headers = {
-                    'x-timestamp': timestamp.internal,
-                    'etag': 'etagvalue',
-                    'other-header': 'other header value',
-                    'content-type': 'text/plain'}
                 if realm:
-                    expected_headers.update({
+                    self.assertEqual(headers, {
                         'x-container-sync-auth':
-                        'US abcdef a5fb3cf950738e6e3b364190e246bd7dd21dad3c'})
+                        'US abcdef a5fb3cf950738e6e3b364190e246bd7dd21dad3c',
+                        'x-timestamp': timestamp.internal,
+                        'etag': 'etagvalue',
+                        'other-header': 'other header value',
+                        'content-type': 'text/plain'})
                 else:
-                    expected_headers.update({
-                        'x-container-sync-key': 'key'})
-                expected_headers.update(extra_headers)
-                self.assertDictEqual(expected_headers, headers)
+                    self.assertEqual(headers, {
+                        'x-container-sync-key': 'key',
+                        'x-timestamp': timestamp.internal,
+                        'other-header': 'other header value',
+                        'etag': 'etagvalue',
+                        'content-type': 'text/plain'})
                 self.assertEqual(contents.read(), 'contents')
                 self.assertEqual(proxy, 'http://proxy')
                 self.assertEqual(timeout, 5.0)
                 self.assertEqual(logger, self.logger)
 
             sync.put_object = fake_put_object
-            expected_put_count = 0
-            excepted_failure_count = 0
 
             with mock.patch('swift.container.sync.InternalClient'):
                 cs = sync.ContainerSync({}, container_ring=FakeRing(),
@@ -990,6 +1183,7 @@ class TestContainerSync(unittest.TestCase):
             orig_object_in_rcontainer = cs._object_in_remote_container
             cs._object_in_remote_container = fake_object_in_rcontainer
 
+            stats = collections.defaultdict(int)
             self.assertTrue(cs.container_sync_row(
                 {'deleted': False,
                  'name': 'object',
@@ -997,12 +1191,8 @@ class TestContainerSync(unittest.TestCase):
                  'size': 50}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(1, len(put_object_calls))
-            check_put_object({'etag': 'etagvalue'},
-                             *put_object_calls[0][0], **put_object_calls[0][1])
-            expected_put_count += 1
-            self.assertEqual(cs.container_puts, expected_put_count)
+                realm, realm_key, stats))
+            self.assertEqual(stats['puts'], 1)
 
             def fake_get_object(acct, con, obj, headers, acceptable_statuses):
                 self.assertEqual(headers['X-Newest'], True)
@@ -1022,7 +1212,7 @@ class TestContainerSync(unittest.TestCase):
             # Success as everything says it worked, also checks 'date' and
             # 'last-modified' headers are removed and that 'etag' header is
             # stripped of double quotes.
-            put_object_calls = []
+            stats = collections.defaultdict(int)
             self.assertTrue(cs.container_sync_row(
                 {'deleted': False,
                  'name': 'object',
@@ -1030,17 +1220,13 @@ class TestContainerSync(unittest.TestCase):
                  'size': 60}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(1, len(put_object_calls))
-            check_put_object({'etag': 'etagvalue'},
-                             *put_object_calls[0][0], **put_object_calls[0][1])
-            expected_put_count += 1
-            self.assertEqual(cs.container_puts, expected_put_count)
+                realm, realm_key, stats))
+            self.assertEqual(stats['puts'], 1)
 
             # Success as everything says it worked, also check that PUT
             # timestamp equals GET timestamp when it is newer than created_at
             # value.
-            put_object_calls = []
+            stats = collections.defaultdict(int)
             self.assertTrue(cs.container_sync_row(
                 {'deleted': False,
                  'name': 'object',
@@ -1048,45 +1234,8 @@ class TestContainerSync(unittest.TestCase):
                  'size': 60}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(1, len(put_object_calls))
-            check_put_object({'etag': 'etagvalue'},
-                             *put_object_calls[0][0], **put_object_calls[0][1])
-            expected_put_count += 1
-            self.assertEqual(cs.container_puts, expected_put_count)
-
-            def fake_get_object(acct, con, obj, headers, acceptable_statuses):
-                self.assertEqual(headers['X-Newest'], True)
-                self.assertEqual(headers['X-Backend-Storage-Policy-Index'],
-                                 '0')
-                return (200,
-                        {'date': 'date value',
-                         'last-modified': 'last modified value',
-                         'x-timestamp': timestamp.internal,
-                         'other-header': 'other header value',
-                         'etag': '"etagvalue"',
-                         'x-static-large-object': 'true',
-                         'content-type': 'text/plain; swift_bytes=123'},
-                        iter('contents'))
-
-            cs.swift.get_object = fake_get_object
-
-            # Success as everything says it worked, also check that etag
-            # header removed in case of SLO
-            put_object_calls = []
-            self.assertTrue(cs.container_sync_row(
-                {'deleted': False,
-                 'name': 'object',
-                 'created_at': '1.1',
-                 'size': 60}, 'http://sync/to/path',
-                'key', FakeContainerBroker('broker'),
-                {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(1, len(put_object_calls))
-            check_put_object({'x-static-large-object': 'true'},
-                             *put_object_calls[0][0], **put_object_calls[0][1])
-            expected_put_count += 1
-            self.assertEqual(cs.container_puts, expected_put_count)
+                realm, realm_key, stats))
+            self.assertEqual(stats['puts'], 1)
 
             exc = []
 
@@ -1099,6 +1248,7 @@ class TestContainerSync(unittest.TestCase):
 
             cs.swift.get_object = fake_get_object
             # Fail due to completely unexpected exception
+            stats = collections.defaultdict(int)
             self.assertFalse(cs.container_sync_row(
                 {'deleted': False,
                  'name': 'object',
@@ -1106,9 +1256,8 @@ class TestContainerSync(unittest.TestCase):
                  'size': 70}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(cs.container_puts, expected_put_count)
-            excepted_failure_count += 1
+                realm, realm_key, stats))
+            self.assertEqual(stats['failures'], 1)
             self.assertEqual(len(exc), 1)
             self.assertEqual(str(exc[-1]), 'test exception')
 
@@ -1124,6 +1273,7 @@ class TestContainerSync(unittest.TestCase):
 
             cs.swift.get_object = fake_get_object
             # Fail due to all direct_get_object calls failing
+            stats = collections.defaultdict(int)
             self.assertFalse(cs.container_sync_row(
                 {'deleted': False,
                  'name': 'object',
@@ -1131,9 +1281,8 @@ class TestContainerSync(unittest.TestCase):
                  'size': 80}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(cs.container_puts, expected_put_count)
-            excepted_failure_count += 1
+                realm, realm_key, stats))
+            self.assertEqual(stats, {'failures': 1})
             self.assertEqual(len(exc), 1)
             self.assertEqual(str(exc[-1]), 'test client exception')
 
@@ -1152,6 +1301,7 @@ class TestContainerSync(unittest.TestCase):
             cs.swift.get_object = fake_get_object
             sync.put_object = fake_put_object
             # Fail due to 401
+            stats = collections.defaultdict(int)
             self.assertFalse(cs.container_sync_row(
                 {'deleted': False,
                  'name': 'object',
@@ -1159,10 +1309,8 @@ class TestContainerSync(unittest.TestCase):
                  'size': 90}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(cs.container_puts, expected_put_count)
-            excepted_failure_count += 1
-            self.assertEqual(cs.container_failures, excepted_failure_count)
+                realm, realm_key, stats))
+            self.assertEqual(stats, {'failures': 1})
             self.assertLogMessage('info', 'Unauth')
 
             def fake_put_object(*args, **kwargs):
@@ -1170,6 +1318,7 @@ class TestContainerSync(unittest.TestCase):
 
             sync.put_object = fake_put_object
             # Fail due to 404
+            stats = collections.defaultdict(int)
             self.assertFalse(cs.container_sync_row(
                 {'deleted': False,
                  'name': 'object',
@@ -1177,10 +1326,8 @@ class TestContainerSync(unittest.TestCase):
                  'size': 50}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(cs.container_puts, expected_put_count)
-            excepted_failure_count += 1
-            self.assertEqual(cs.container_failures, excepted_failure_count)
+                realm, realm_key, stats))
+            self.assertEqual(stats, {'failures': 1})
             self.assertLogMessage('info', 'Not found', 1)
 
             def fake_put_object(*args, **kwargs):
@@ -1188,6 +1335,7 @@ class TestContainerSync(unittest.TestCase):
 
             sync.put_object = fake_put_object
             # Fail due to 503
+            stats = collections.defaultdict(int)
             self.assertFalse(cs.container_sync_row(
                 {'deleted': False,
                  'name': 'object',
@@ -1195,10 +1343,8 @@ class TestContainerSync(unittest.TestCase):
                  'size': 50}, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
-                realm, realm_key))
-            self.assertEqual(cs.container_puts, expected_put_count)
-            excepted_failure_count += 1
-            self.assertEqual(cs.container_failures, excepted_failure_count)
+                realm, realm_key, stats))
+            self.assertEqual(stats, {'failures': 1})
             self.assertLogMessage('error', 'ERROR Syncing')
 
             # Test the following cases:
@@ -1230,29 +1376,31 @@ class TestContainerSync(unittest.TestCase):
             sync.put_object = fake_put_object
             sync.head_object = fake_head_object
             cs._object_in_remote_container = orig_object_in_rcontainer
+            stats = collections.defaultdict(int)
             self.assertTrue(cs.container_sync_row(
                 test_row, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 test_info,
-                realm, realm_key))
+                realm, realm_key, stats))
             # No additional put has taken place
             self.assertEqual(len(actual_puts), 0)
             # No additional errors
-            self.assertEqual(cs.container_failures, excepted_failure_count)
+            self.assertFalse(stats)
 
             def fake_head_object(*args, **kwargs):
                 return ({'x-timestamp': '1.3'}, '')
 
             sync.head_object = fake_head_object
+            stats = collections.defaultdict(int)
             self.assertTrue(cs.container_sync_row(
                 test_row, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
                 test_info,
-                realm, realm_key))
+                realm, realm_key, stats))
             # No additional put has taken place
             self.assertEqual(len(actual_puts), 0)
             # No additional errors
-            self.assertEqual(cs.container_failures, excepted_failure_count)
+            self.assertFalse(stats)
 
             actual_puts = []
 
@@ -1260,54 +1408,56 @@ class TestContainerSync(unittest.TestCase):
                 raise ClientException('test client exception', http_status=404)
 
             sync.head_object = fake_head_object
+            stats = collections.defaultdict(int)
             self.assertTrue(cs.container_sync_row(
                 test_row, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
-                test_info, realm, realm_key))
+                test_info, realm, realm_key, stats))
             # Additional put has taken place
             self.assertEqual(len(actual_puts), 1)
             # No additional errors
-            self.assertEqual(cs.container_failures, excepted_failure_count)
+            self.assertEqual(stats, {'bytes': 10, 'puts': 1})
 
             def fake_head_object(*args, **kwargs):
                 raise ClientException('test client exception', http_status=401)
 
             sync.head_object = fake_head_object
+            stats = collections.defaultdict(int)
             self.assertFalse(cs.container_sync_row(
                 test_row, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
-                test_info, realm, realm_key))
+                test_info, realm, realm_key, stats))
             # No additional put has taken place, failures increased
             self.assertEqual(len(actual_puts), 1)
-            excepted_failure_count += 1
-            self.assertEqual(cs.container_failures, excepted_failure_count)
+            self.assertEqual(stats, {'failures': 1})
 
             def fake_head_object(*args, **kwargs):
                 raise Exception()
 
             sync.head_object = fake_head_object
+            stats = collections.defaultdict(int)
             self.assertFalse(cs.container_sync_row(
                              test_row,
                              'http://sync/to/path',
                              'key', FakeContainerBroker('broker'),
-                             test_info, realm, realm_key))
+                             test_info, realm, realm_key, stats))
             # No additional put has taken place, failures increased
             self.assertEqual(len(actual_puts), 1)
-            excepted_failure_count += 1
-            self.assertEqual(cs.container_failures, excepted_failure_count)
+            self.assertEqual(stats, {'failures': 1})
 
             def fake_head_object(*args, **kwargs):
                 return ({'x-timestamp': '1.1'}, '')
 
             sync.head_object = fake_head_object
+            stats = collections.defaultdict(int)
             self.assertTrue(cs.container_sync_row(
                 test_row, 'http://sync/to/path',
                 'key', FakeContainerBroker('broker'),
-                test_info, realm, realm_key))
+                test_info, realm, realm_key, stats))
             # Additional put has taken place
             self.assertEqual(len(actual_puts), 2)
             # No additional errors
-            self.assertEqual(cs.container_failures, excepted_failure_count)
+            self.assertEqual(stats, {'bytes': 10, 'puts': 1})
 
         finally:
             sync.uuid = orig_uuid
@@ -1337,6 +1487,126 @@ class TestContainerSync(unittest.TestCase):
         self.assertEqual(
             set(cs.http_proxies),
             set(['http://one', 'http://two', 'http://three']))
+
+    def test_conf_processes(self):
+        with mock.patch('swift.container.sync.InternalClient'):
+            cs = sync.ContainerSync({}, container_ring=FakeRing())
+        self.assertEqual(1, cs.processes)
+
+        for val in ('1', 1, '20', 20):
+            conf = {'processes': val}
+            with mock.patch('swift.container.sync.InternalClient'):
+                cs = sync.ContainerSync(conf, container_ring=FakeRing())
+            self.assertEqual(int(val), cs.processes)
+
+        # bad values
+        for val in (0, '0', -3, '-3', None, 'three'):
+            conf = {'processes': val}
+            with mock.patch('swift.container.sync.InternalClient'):
+                with self.assertRaises(ValueError) as cm:
+                    sync.ContainerSync(conf, container_ring=FakeRing())
+            self.assertIn("'processes' must be a positive integer",
+                          cm.exception.message)
+
+    def test_conf(self):
+        def do_test(conf, expected):
+            fake_ring = FakeRing()
+            fake_logger = FakeLogger()
+            with mock.patch('swift.container.sync.InternalClient'):
+                cs = sync.ContainerSync(
+                    conf, container_ring=fake_ring, logger=fake_logger)
+            self.assertIs(cs.container_ring, fake_ring)
+            self.assertIs(cs.logger, fake_logger)
+            for k, v in expected.items():
+                actual = getattr(cs, k)
+                self.assertEqual(v, actual,
+                                 'Expected %s but got %s for option %s'
+                                 % (v, actual, k))
+
+        # expected default values
+        defaults = {'processes': 1,
+                    'conn_timeout': 5,
+                    'devices': '/srv/node',
+                    'mount_check': True,
+                    'interval': 300,
+                    'container_time': 60,
+                    'swift_dir': '/etc/swift',
+                    'allowed_sync_hosts': ['127.0.0.1']}
+        do_test({}, defaults)
+
+        # non-default settings
+        settings = {'processes': 4,
+                    'conn_timeout': 10,
+                    'devices': '/devices',
+                    'mount_check': False,
+                    'interval': 30,
+                    'container_time': 120,
+                    'swift_dir': '/alt/swift',
+                    'allowed_sync_hosts': '10.0.5.6'}
+        expected = dict(settings)
+        expected.update({'allowed_sync_hosts': ['10.0.5.6']})
+        do_test(settings, expected)
+
+    def test_report(self):
+        fake_times = (0, 99, 1999)
+        with mock.patch('swift.container.sync.InternalClient'), \
+            mock.patch('swift.container.sync.time',
+                       side_effect=fake_times):
+            cs = sync.ContainerSync(
+                {}, container_ring=FakeRing(), logger=FakeLogger())
+            self.assertEqual(fake_times[0], cs.reported)
+            cs.stats = dict(puts=0, deletes=0, skips=0, syncs=0, failures=0)
+            cs.report()
+            self.assertFalse(cs.stats)
+            self.assertEqual(fake_times[1], cs.reported)
+            info_lines = cs.logger.get_lines_for_level('info')
+            self.assertEqual(
+                'Since time: %s, synced: 0, deletes: 0, puts: 0, '
+                'skipped: 0, failed: 0' % time.ctime(fake_times[0]),
+                info_lines[0])
+            self.assertFalse(info_lines[1:])
+            cs.stats = dict(puts=6, deletes=7, skips=3, syncs=4, failures=1)
+            cs.report()
+            self.assertFalse(cs.stats)
+            self.assertEqual(fake_times[2], cs.reported)
+            info_lines = cs.logger.get_lines_for_level('info')
+            self.assertEqual(
+                'Since time: %s, synced: 4, deletes: 7, puts: 6, '
+                'skipped: 3, failed: 1' % time.ctime(fake_times[1]),
+                info_lines[1])
+            self.assertFalse(info_lines[2:])
+
+    def test_periodic_report(self):
+        def do_test(fake_times, expected_report_calls):
+            with mock.patch('swift.container.sync.InternalClient'), \
+                mock.patch('swift.container.sync.time',
+                           side_effect=fake_times), \
+                mock.patch('swift.container.sync.ContainerSync.report') \
+                    as mock_report:
+                cs = sync.ContainerSync(
+                    {}, container_ring=FakeRing(), logger=FakeLogger())
+                cs.periodic_report()
+            self.assertEqual(expected_report_calls, mock_report.call_count)
+            self.assertEqual(fake_times[0], cs.reported)  # sanity check
+
+            with mock.patch('swift.container.sync.InternalClient'), \
+                mock.patch('swift.container.sync.time',
+                           side_effect=fake_times[:1]), \
+                mock.patch('swift.container.sync.ContainerSync.report') \
+                    as mock_report:
+                cs = sync.ContainerSync(
+                    {}, container_ring=FakeRing(), logger=FakeLogger())
+                cs.periodic_report(fake_times[1])
+            self.assertEqual(expected_report_calls, mock_report.call_count)
+            self.assertEqual(fake_times[0], cs.reported)  # sanity check
+
+        do_test((0, 1), 0)
+        do_test((0, 3599), 0)
+        do_test((0, 3600), 1)
+        do_test((0, 3601), 1)
+        do_test((0, 7200), 1)
+        do_test((1471010000.123, 1471013600.122), 0)
+        do_test((1471010000.123, 1471013600.123), 1)
 
 
 if __name__ == '__main__':
