@@ -350,7 +350,7 @@ class ContainerController(BaseStorageServer):
             elif len(broker.get_pivot_ranges()) > 0:
                 # cannot put to a root shard container, find actual container
                 return self._find_shard_location(req, broker, drive, account,
-                                                 container, obj)
+                                                 container, obj, redirect=True)
             else:
                 broker.delete_object(obj, req.headers.get('x-timestamp'),
                                      obj_policy_index)

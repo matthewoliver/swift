@@ -264,6 +264,8 @@ def merge_pivots(item, existing):
         return True
     if existing['created_at'] > item['created_at']:
         item, existing = existing, item
+    if existing['created_at'] == item['created_at']:
+        return False
     for col in ('object_count', 'bytes_used'):
         item[col] = str(item[col])
         existing[col] = str(existing[col])
@@ -517,7 +519,7 @@ class ContainerBroker(DatabaseBroker):
         if record['record_type'] == RECORD_TYPE_PIVOT_NODE:
             return (record['lower'], record['created_at'], record['upper'],
                     record['object_count'], record['bytes_used'],
-                    record['deleted'], 0, record['record_type'])
+                    record['deleted'], 0, 0, 0, record['record_type'])
         return (record['name'], record['created_at'], record['size'],
                 record['content_type'], record['etag'], record['deleted'],
                 record['storage_policy_index'],
@@ -992,9 +994,9 @@ class ContainerBroker(DatabaseBroker):
                     upper.append(record['upper'])
                 # None/NULL must be checked with the IS operator
                 sql = (('SELECT lower, created_at, upper, object_count, '
-                        'bytes_used, deleted'
+                        'bytes_used, deleted '
                         'FROM pivot_ranges '
-                        'WHERE %s(lower IN (%s) OR lower IS NULL)'
+                        'WHERE %s (lower IN (%s) OR lower IS NULL)'
                         ' AND (upper IN (%s) OR upper IS NULL) '
                         'ORDER BY lower, upper')
                        % (query_mod,
@@ -1016,14 +1018,16 @@ class ContainerBroker(DatabaseBroker):
                             'etag', 'deleted', 'storage_policy_index')
                 transform_item = update_new_item_from_existing
                 table = 'object'
+                record_type = RECORD_TYPE_OBJECT
             else:
                 get_records = get_records_pivot
-                keys = ('lower', 'upper', 'storage_policy_index')
+                keys = ('lower', 'upper')
                 del_keys = ('lower', 'upper')
                 add_keys = ('lower', 'created_at', 'upper', 'object_count',
                             'bytes_used', 'deleted')
                 transform_item = merge_pivots
                 table = 'pivot_ranges'
+                record_type = RECORD_TYPE_PIVOT_NODE
 
             # Get created_at times for objects in rec_list that already exist.
             # We must chunk it up to avoid sqlite's limit of 999 args.
@@ -1039,7 +1043,8 @@ class ContainerBroker(DatabaseBroker):
             for item in rec_list:
                 item.setdefault('storage_policy_index', 0)  # legacy
                 item_ident = tuple(item[key] for key in keys)
-                existing = self._record_to_dict(records.get(item_ident))
+                existing = self._record_to_dict(records.get(item_ident),
+                                                record_type=record_type)
                 if transform_item(item, existing):
                     # exists with older timestamp
                     if item_ident in records:
