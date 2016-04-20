@@ -154,11 +154,8 @@ class ContainerSharder(ContainerReplicator):
 
     def _zero_stats(self):
         """Zero out the stats."""
+        super(ContainerSharder, self)._zero_stats()
         # TODO add actual sharding stats to track, and zero them out here.
-        self.stats = {'attempted': 0, 'success': 0, 'failure': 0, 'ts_repl': 0,
-                      'no_change': 0, 'hashmatch': 0, 'rsync': 0, 'diff': 0,
-                      'remove': 0, 'empty': 0, 'remote_merge': 0,
-                      'start': time.time(), 'diff_capped': 0}
 
     def _get_local_devices(self):
         self._local_device_ids = set()
