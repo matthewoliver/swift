@@ -31,7 +31,12 @@ from swift.common.exceptions import DeviceUnavailable
 from swift.common.http import is_success
 from swift.common.db import DatabaseAlreadyExists
 from swift.common.utils import (Timestamp, hash_path,
-                                storage_directory, quorum_size)
+                                storage_directory, majority_size)
+
+
+def other_items_hook(broker):
+    pivot_ranges = broker.get_pivot_ranges()
+    return broker.pivot_nodes_to_items(pivot_ranges)
 
 
 def other_items_hook(broker):
@@ -43,7 +48,7 @@ class ContainerReplicator(db_replicator.Replicator):
     server_type = 'container'
     brokerclass = ContainerBroker
     datadir = DATADIR
-    default_port = 6001
+    default_port = 6201
 
     def report_up_to_date(self, full_info):
         reported_key_map = {
@@ -207,9 +212,9 @@ class ContainerReplicator(db_replicator.Replicator):
             broker.update_reconciler_sync(info['max_row'])
             return
         max_sync = self.dump_to_reconciler(broker, point)
-        success = responses.count(True) >= quorum_size(len(responses))
+        success = responses.count(True) >= majority_size(len(responses))
         if max_sync > point and success:
-            # to be safe, only slide up the sync point with a quorum on
+            # to be safe, only slide up the sync point with a majority on
             # replication
             broker.update_reconciler_sync(max_sync)
 

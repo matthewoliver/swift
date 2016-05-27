@@ -598,8 +598,10 @@ class FallocateWrapper(object):
             st = os.fstatvfs(fd)
             free = st.f_frsize * st.f_bavail - length.value
             if free <= FALLOCATE_RESERVE:
-                raise OSError('FALLOCATE_RESERVE fail %s <= %s' % (
-                    free, FALLOCATE_RESERVE))
+                raise OSError(
+                    errno.ENOSPC,
+                    'FALLOCATE_RESERVE fail %s <= %s' % (free,
+                                                         FALLOCATE_RESERVE))
         args = {
             'fallocate': (fd, mode, offset, length),
             'posix_fallocate': (fd, offset, length)
@@ -2936,6 +2938,10 @@ def public(func):
     return func
 
 
+def majority_size(n):
+    return (n // 2) + 1
+
+
 def quorum_size(n):
     """
     quorum size as it applies to services that use 'replication' for data
@@ -2945,7 +2951,7 @@ def quorum_size(n):
     Number of successful backend requests needed for the proxy to consider
     the client request successful.
     """
-    return (n // 2) + 1
+    return (n + 1) // 2
 
 
 def rsync_ip(ip):

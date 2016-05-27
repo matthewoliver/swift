@@ -37,7 +37,7 @@ from swift.common.ring.utils import is_local_device
 from swift.common.utils import get_logger, config_true_value, \
     dump_recon_cache, whataremyips, hash_path, \
     storage_directory, Timestamp, PivotRange, pivot_to_pivot_container, \
-    find_pivot_range, GreenAsyncPile, ismount
+    find_pivot_range, GreenAsyncPile, ismount, majority_size
 from swift.common.wsgi import ConfigString
 from swift.common.storage_policy import POLICIES
 
@@ -834,7 +834,7 @@ class ContainerSharder(ContainerReplicator):
     def _get_quorum(self, broker, success=None, quorum=None, op='HEAD',
                     headers=None, post_success=None, post_fail=None,
                     account=None, container=None):
-        quorum = quorum if quorum else (self.ring.replica_count / 2 + 1)
+        quorum = quorum if quorum else (majority_size(self.ring.replica_count))
         local = False
 
         if broker:

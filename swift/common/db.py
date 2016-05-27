@@ -32,7 +32,8 @@ from tempfile import mkstemp
 from eventlet import sleep, Timeout
 import sqlite3
 
-from swift.common.constraints import MAX_META_COUNT, MAX_META_OVERALL_SIZE
+from swift.common.constraints import MAX_META_COUNT, MAX_META_OVERALL_SIZE, \
+    check_utf8
 from swift.common.utils import Timestamp, renamer, \
     mkdirs, lock_parent_directory, fallocate
 from swift.common.exceptions import LockTimeout
@@ -633,7 +634,7 @@ class DatabaseBroker(object):
             with lock_parent_directory(self.pending_file,
                                        self.pending_timeout):
                 self._commit_puts()
-        except LockTimeout:
+        except (LockTimeout, sqlite3.OperationalError):
             if not self.stale_reads_ok:
                 raise
 
@@ -734,11 +735,11 @@ class DatabaseBroker(object):
     @staticmethod
     def validate_metadata(metadata):
         """
-        Validates that metadata_falls within acceptable limits.
+        Validates that metadata falls within acceptable limits.
 
         :param metadata: to be validated
         :raises: HTTPBadRequest if MAX_META_COUNT or MAX_META_OVERALL_SIZE
-                 is exceeded
+                 is exceeded, or if metadata contains non-UTF-8 data
         """
         meta_count = 0
         meta_size = 0
@@ -752,6 +753,10 @@ class DatabaseBroker(object):
                 key = key[len(prefix):]
                 meta_count = meta_count + 1
                 meta_size = meta_size + len(key) + len(value)
+            bad_key = key and not check_utf8(key)
+            bad_value = value and not check_utf8(value)
+            if bad_key or bad_value:
+                raise HTTPBadRequest('Metadata must be valid UTF-8')
         if meta_count > MAX_META_COUNT:
             raise HTTPBadRequest('Too many metadata items; max %d'
                                  % MAX_META_COUNT)
