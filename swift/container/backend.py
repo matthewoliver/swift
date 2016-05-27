@@ -19,6 +19,7 @@ Pluggable Back-ends for Container Server
 import os
 from uuid import uuid4
 import time
+from itertools import izip_longest
 
 import six
 import six.moves.cPickle as pickle
@@ -279,6 +280,13 @@ def merge_pivots(item, existing):
         else:
             item.pop('prefixed', None)
     return True
+
+
+def middle_str(str1, str2):
+    result = []
+    for l, u in izip_longest(map(ord, str1), map(ord, str2), fillvalue=0):
+        result.append((l + u) // 2)
+    return u''.join(map(unichr, result))
 
 
 class ContainerBroker(DatabaseBroker):
@@ -1363,6 +1371,47 @@ class ContainerBroker(DatabaseBroker):
             ranges.append(PivotRange(node[0], node[2], node[1]))
         return ranges
 
+    def _get_possible_pivot_point(self, conn):
+        try:
+            data = conn.execute('''
+                SELECT name
+                FROM object
+                WHERE deleted=0 ORDER BY name LIMIT 1 OFFSET (
+                    SELECT object_count / 2
+                    FROM policy_stat);
+                ''')
+            if data:
+                data = data.fetchone()
+                return data['name']
+            else:
+                return ''
+        except Exception:
+            return ''
+
+    def _get_fuzzy_pivot_point(self, conn):
+        try:
+            params = []
+            # SQLite's optimisation means if we do a single min or max
+            # hitting only an index means it'll jump straight to the first
+            # or last element in the index (linked list). If we combine the
+            # two in one we have to hit every record, we don't want that.
+            # So we do one at a time. This gives a HUGE speed improvement
+            # on even really large containers.
+            for fn in ('min', 'max'):
+                data = conn.execute('''
+                    SELECT %s(name) as name
+                    FROM object
+                    WHERE deleted=0;
+                    ''' % fn)
+                if data:
+                    data = data.fetchone()
+                    params.append(data['name'])
+                else:
+                    return ''
+            return middle_str(*params)
+        except Exception:
+            return ''
+
     def get_possible_pivot_point(self, connection=None):
         """
         Finds the middle entry of the table that could be used as a pivot
@@ -1373,29 +1422,13 @@ class ContainerBroker(DatabaseBroker):
 
         :return: The middle object in the container.
         """
-        def _get_possible_pivot_points(conn):
-            try:
-                data = conn.execute('''
-                    SELECT name
-                    FROM object
-                    WHERE deleted=0 LIMIT 1 OFFSET (
-                        SELECT object_count / 2
-                        FROM policy_stat);
-                    ''')
-                if data:
-                    data = data.fetchone()
-                    return data['name']
-                else:
-                    return ''
-            except Exception:
-                return ''
 
         self._commit_puts_stale_ok()
         if connection:
-            return _get_possible_pivot_points(connection)
+            return self._get_fuzzy_pivot_point(connection)
         else:
             with self.get() as conn:
-                return _get_possible_pivot_points(conn)
+                return self._get_fuzzy_pivot_point(conn)
 
     def is_shrinking(self):
         return self.metadata.get('X-Container-Sysmeta-Shard-Full') or \
