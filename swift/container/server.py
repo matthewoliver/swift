@@ -22,7 +22,7 @@ from xml.etree.cElementTree import Element, SubElement, tostring
 
 from eventlet import Timeout
 from operator import itemgetter
-from random import shuffle
+from random import shuffle, randint
 
 import swift.common.db
 from swift.container.sync_store import ContainerSyncStore
@@ -32,7 +32,7 @@ from swift.container.replicator import ContainerReplicatorRpc
 from swift.common import ring
 from swift.common.db import DatabaseAlreadyExists
 from swift.common.direct_client import direct_get_container, \
-    DirectClientException
+    DirectClientException, direct_delete_container
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.request_helpers import get_param, get_listing_content_type, \
     split_and_validate_path, is_sys_or_user_meta, get_sys_meta_prefix
@@ -262,7 +262,23 @@ class ContainerController(BaseStorageServer):
             self.logger.exception('Failed to update sync_store %s during %s' %
                                   (broker.db_file, method))
 
-    def _find_shard_location(self, req, broker, drive, root_account,
+    def _get_node_index(self, req, random=False):
+        drive, part, account, container = split_and_validate_path(
+            req, 4, 4, True)
+        _, nodes = self.ring.get_nodes(account, container)
+        if random:
+            return randint(0, len(nodes) - 1)
+        ip, port = req.host.split(':')
+        indices = [node['index'] for node in nodes
+                    if node['ip'] == ip and
+                       node['port'] == int(port) and
+                       node['device'] == drive]
+
+        if indices:
+            return indices[0]
+        return None
+
+    def _find_shard_location(self, req, broker, root_account,
                              root_container, obj, redirect=False,
                              redirect_cont=None):
         try:
@@ -279,17 +295,15 @@ class ContainerController(BaseStorageServer):
             else:
                 acct, cont = (root_account, redirect_cont)
 
-            _, nodes = self.ring.get_nodes(root_account, root_container)
-            ip, port = req.host.split(':')
-            indicies = [node['index'] for node in nodes
-                        if node['ip'] == ip and
-                           node['port'] == int(port) and
-                           node['device'] == drive]
-            if not indicies:
+            node_index = self._get_node_index(req)
+            if not node_index:
+                # This node doesn't seem to be the primary for this container,
+                # so must be a handoff. Lets use a random index.. maybe
+                # node_index = self._get_node_index(req, random=True)
                 raise HTTPInternalServerError()
 
             part, nodes = self.ring.get_nodes(acct, cont)
-            node = nodes[indicies[0]]
+            node = nodes[node_index]
             headers = {
                 'X-Backend-Pivot-Account': acct,
                 'X-Backend-Pivot-Container': cont,
@@ -349,7 +363,7 @@ class ContainerController(BaseStorageServer):
 
             elif len(broker.get_pivot_ranges()) > 0:
                 # cannot put to a root shard container, find actual container
-                return self._find_shard_location(req, broker, drive, account,
+                return self._find_shard_location(req, broker, account,
                                                  container, obj, redirect=True)
             else:
                 broker.delete_object(obj, req.headers.get('x-timestamp'),
@@ -404,11 +418,61 @@ class ContainerController(BaseStorageServer):
         if obj_count > 0:
             return HTTPConflict(request=req)
 
+        node_index = self._get_node_index(req)
+        if not node_index:
+            # Looks like this isn't the primary node for this contaienr.
+            # so randomly pick and index (that's better then nothing)... maybe
+            # node_index = self._get_node_index(req, random=True)
+            return HTTPInternalServerError(request=req)
+
         successful_ranges = list()
+
+        def _make_requests(account, container, node_index=None, nodelist=None):
+            part, nodes = self.ring.get_nodes(account, container)
+            if nodelist:
+                shuffle(nodelist)
+                node = nodelist.pop()
+            elif node_index:
+                node = nodes.pop(node_index)
+            else:
+                shuffle(nodes)
+                node = nodes.pop()
+
+            try:
+                headers = HeaderKeyDict({
+                    'x-timestamp':
+                        req.timestamp or Timestamp(time.time()).internal})
+                direct_delete_container(node, part, acct, cont, headers=headers)
+                successful_ranges.append(pivot_range)
+            except DirectClientException as ex:
+                if ex.http_status == HTTPNotFound().status:
+                    # a 404 is considered a success but we wont recreate
+                    return
+                elif ex.http_status == HTTPConflict().status:
+                    # There was still an object in the container.. we need to
+                    # recreate any deleted containers, then return a
+                    # HTTPConflict.
+                    return HTTPConflict(req)
+                else:
+                    # Try a different node.. because we want to do our best
+                    # at deleting.
+                    if nodelist is not None and not nodelist:
+                        return HTTPInternalServerError(req)
+                    return _make_requests(account, container, nodelist=nodes)
+
         ranges = broker.build_pivot_ranges()
         for pivot_range in ranges:
             acct, cont = pivot_to_pivot_container(
                 broker.account, broker.container, pivot_range=pivot_range)
+            resp = _make_requests(acct, cont, node_index)
+            if resp:
+                # roll back
+                for piv_range in successful_ranges:
+                    headers
+            else:
+                successful_ranges.append(pivot_range)
+
+
             # TODO Still need to finish this, deciding on how much I should
             # reimplement that happens in the proxy. Ways forward:
             #  1. Reimplement a basic make requests/getting quorum.
@@ -529,7 +593,7 @@ class ContainerController(BaseStorageServer):
                 redirect_cont = None
                 if is_shard_empty:
                    redirect_cont = shard_full
-                return self._find_shard_location(req, broker, drive, account,
+                return self._find_shard_location(req, broker, account,
                                                  container, obj, redirect=True,
                                                  redirect_cont=redirect_cont)
             else:
