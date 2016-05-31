@@ -353,13 +353,15 @@ class ContainerController(BaseStorageServer):
                 req_timestamp = obj_timestamp or req.headers.get('x-timestamp')
 
                 # Level is required when putting a pivot point.
+                lower = req.headers.get('x-backend-pivot-lower')
                 upper = req.headers.get('x-backend-pivot-upper')
                 if not upper:
                     raise HTTPBadRequest()
                 broker.delete_object(
                     obj, req_timestamp,
-                    obj_policy_index, upper=upper, object_count=obj_count,
-                    bytes_used=bytes_used, record_type=int(record_type))
+                    obj_policy_index, lower=lower, upper=upper,
+                    object_count=obj_count, bytes_used=bytes_used,
+                    record_type=int(record_type))
 
             elif len(broker.get_pivot_ranges()) > 0:
                 # cannot put to a root shard container, find actual container
@@ -468,7 +470,8 @@ class ContainerController(BaseStorageServer):
             if resp:
                 # roll back
                 for piv_range in successful_ranges:
-                    headers
+                    # TODO Still need to complete cascaded deletes.
+                    pass
             else:
                 successful_ranges.append(pivot_range)
 
@@ -577,13 +580,14 @@ class ContainerController(BaseStorageServer):
                 req_timestamp = obj_timestamp or req_timestamp
 
                 # Level is required when putting a pivot point.
+                lower = req.headers.get('x-backend-pivot-lower')
                 upper = req.headers.get('x-backend-pivot-upper')
                 if not upper:
                     raise HTTPBadRequest()
                 broker.put_object(
                     obj, req_timestamp,
                     int(req.headers['x-size']), '', '', 0,
-                    upper=upper, object_count=obj_count,
+                    lower=lower, upper=upper, object_count=obj_count,
                     bytes_used=bytes_used, record_type=int(record_type))
 
             elif len(broker.get_pivot_ranges()) > 0 or is_shard_empty:

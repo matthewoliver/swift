@@ -29,6 +29,7 @@ import sqlite3
 from swift.common.utils import Timestamp, encode_timestamps, decode_timestamps, \
     extract_swift_bytes, PivotRange
 from swift.common.db import DatabaseBroker, utf8encode
+from swift.common.constraints import SHARD_CONTAINER_SIZE
 
 
 SQLITE_ARG_LIMIT = 999
@@ -282,13 +283,6 @@ def merge_pivots(item, existing):
     return True
 
 
-def middle_str(str1, str2):
-    result = []
-    for l, u in izip_longest(map(ord, str1), map(ord, str2), fillvalue=0):
-        result.append((l + u) // 2)
-    return u''.join(map(unichr, result))
-
-
 class ContainerBroker(DatabaseBroker):
     """Encapsulates working with a container database."""
     db_type = 'container'
@@ -410,6 +404,7 @@ class ContainerBroker(DatabaseBroker):
             conn.executescript("""
                 CREATE TABLE pivot_ranges (
                     ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT,
                     lower TEXT,
                     upper TEXT,
                     object_count INTEGER DEFAULT 0,
@@ -505,7 +500,7 @@ class ContainerBroker(DatabaseBroker):
             return (row[0] == 0)
 
     def delete_object(self, name, timestamp, storage_policy_index=0,
-                      upper=None, object_count=0, bytes_used=0,
+                      lower=None, upper=None, object_count=0, bytes_used=0,
                       record_type=RECORD_TYPE_OBJECT):
         """
         Mark an object deleted.
@@ -517,17 +512,19 @@ class ContainerBroker(DatabaseBroker):
 
         kargs = {}
         if record_type != RECORD_TYPE_OBJECT:
-            kargs.update(dict(upper=upper, object_count=object_count,
-                              bytes_used=bytes_used, record_type=record_type))
+            kargs.update(dict(
+                lower=lower, upper=upper, object_count=object_count,
+                bytes_used=bytes_used, record_type=record_type))
         self.put_object(name, timestamp, 0, 'application/deleted', 'noetag',
                         deleted=1, storage_policy_index=storage_policy_index,
                         **kargs)
 
     def make_tuple_for_pickle(self, record):
         if record['record_type'] == RECORD_TYPE_PIVOT_NODE:
-            return (record['lower'], record['created_at'], record['upper'],
-                    record['object_count'], record['bytes_used'],
-                    record['deleted'], 0, 0, 0, record['record_type'])
+            return (record['name'], record['created_at'], record['lower'],
+                    record['upper'], record['object_count'],
+                    record['bytes_used'], record['deleted'], 0, 0, 0,
+                    record['record_type'])
         return (record['name'], record['created_at'], record['size'],
                 record['content_type'], record['etag'], record['deleted'],
                 record['storage_policy_index'],
@@ -537,7 +534,7 @@ class ContainerBroker(DatabaseBroker):
 
     def put_object(self, name, timestamp, size, content_type, etag, deleted=0,
                    storage_policy_index=0, ctype_timestamp=None,
-                   meta_timestamp=None, upper=None, object_count=0,
+                   meta_timestamp=None, lower=None, upper=None, object_count=0,
                    bytes_used=0, record_type=RECORD_TYPE_OBJECT):
         """
         Creates an object in the DB with its metadata.
@@ -561,10 +558,10 @@ class ContainerBroker(DatabaseBroker):
                 name = None
             if upper == 'None':
                 upper = None
-            record = {'lower': name, 'created_at': timestamp, 'upper': upper,
-                      'object_count': object_count, 'bytes_used': bytes_used,
-                      'deleted': deleted, 'storage_policy_index': 0,
-                      'record_type': record_type}
+            record = {'name': name, 'created_at': timestamp, 'lower': lower,
+                      'upper': upper, 'object_count': object_count,
+                      'bytes_used': bytes_used, 'deleted': deleted,
+                      'storage_policy_index': 0, 'record_type': record_type}
         else:
             record = {'name': name, 'created_at': timestamp, 'size': size,
                       'content_type': content_type, 'etag': etag,
@@ -955,7 +952,7 @@ class ContainerBroker(DatabaseBroker):
                 keys = ('name', 'created_at', 'size', 'content_type', 'etag',
                         'deleted', 'storage_policy_index')
             else:
-                keys = ('lower', 'created_at', 'upper', 'object_count',
+                keys = ('name', 'created_at', 'lower', 'upper', 'object_count',
                         'bytes_used', 'deleted')
             return dict(zip(keys, rec))
         return None
@@ -972,7 +969,9 @@ class ContainerBroker(DatabaseBroker):
         """
         for item in item_list:
             item.setdefault('record_type', RECORD_TYPE_OBJECT)
-            cols = ['name'] if item.get('name') else ['lower', 'upper']
+            cols = ['name']
+            if item.get('lower'):
+                cols += ['lower', 'upper']
             for col in cols:
                 if isinstance(item[col], six.text_type):
                     item[col] = item[col].encode('utf-8')
@@ -995,23 +994,17 @@ class ContainerBroker(DatabaseBroker):
                     for record in curs.execute(sql, chunk))
 
         def get_records_pivot(curs, offset, rec_list, query_mod):
-                lower = []
-                upper = []
-                for record in rec_list[offset:offset + SQLITE_ARG_LIMIT]:
-                    lower.append(record['lower'])
-                    upper.append(record['upper'])
+                chunk = [record['name'] for record
+                         in rec_list[offset:offset + SQLITE_ARG_LIMIT]]
                 # None/NULL must be checked with the IS operator
-                sql = (('SELECT lower, created_at, upper, object_count, '
+                sql = (('SELECT name, created_at, lower, upper, object_count, '
                         'bytes_used, deleted '
                         'FROM pivot_ranges '
-                        'WHERE %s (lower IN (%s) OR lower IS NULL)'
-                        ' AND (upper IN (%s) OR upper IS NULL) '
-                        'ORDER BY lower, upper')
+                        'WHERE %s name IN (%s)')
                        % (query_mod,
-                          ','.join('?' * len(lower)),
-                          ','.join('?' * len(upper))))
-                return (((rec[0], rec[2]), rec)
-                        for rec in curs.execute(sql, lower + upper))
+                          ','.join('?' * len(chunk))))
+                return (((rec[0], rec[1], rec[2]), rec)
+                        for rec in curs.execute(sql, chunk))
 
         def _merge_items(curs, rec_list, is_object=True):
             query_mod = ''
@@ -1029,10 +1022,10 @@ class ContainerBroker(DatabaseBroker):
                 record_type = RECORD_TYPE_OBJECT
             else:
                 get_records = get_records_pivot
-                keys = ('lower', 'upper')
-                del_keys = ('lower', 'upper')
-                add_keys = ('lower', 'created_at', 'upper', 'object_count',
-                            'bytes_used', 'deleted')
+                keys = ('name',)
+                del_keys = ('name',)
+                add_keys = ('name', 'created_at', 'lower', 'upper',
+                            'object_count', 'bytes_used', 'deleted')
                 transform_item = merge_pivots
                 table = 'pivot_ranges'
                 record_type = RECORD_TYPE_PIVOT_NODE
@@ -1067,7 +1060,7 @@ class ContainerBroker(DatabaseBroker):
                 # the form of incremented '+|-<count>' or absolute
                 # '<count>'. If the former we need to increment before
                 # we delete the current values.
-                items = [i for i in to_add.itervalues() if i.get('prefixed')]
+                items = [i for i in to_add.values() if i.get('prefixed')]
                 for item in items:
                     self.update_pivot_usage(item)
 
@@ -1075,14 +1068,14 @@ class ContainerBroker(DatabaseBroker):
                 filters = ' AND '.join(['%s IS ?' % key for key in del_keys])
                 sql = 'DELETE FROM %s WHERE %s%s' % (table, query_mod, filters)
                 del_generator = (tuple([record[key] for key in del_keys])
-                                 for record in to_delete.itervalues())
+                                 for record in to_delete.values())
                 curs.executemany(sql, del_generator)
 
             if to_add:
                 vals = ','.join('?' * len(add_keys))
                 sql = 'INSERT INTO %s %s VALUES (%s)' % (table, add_keys, vals)
                 add_generator = (tuple([record[key] for key in add_keys])
-                                 for record in to_add.itervalues())
+                                 for record in to_add.values())
                 curs.executemany(sql, add_generator)
 
         def _really_merge_items(conn):
@@ -1270,7 +1263,7 @@ class ContainerBroker(DatabaseBroker):
         def _get_pivot_ranges(conn):
             try:
                 sql = '''
-                SELECT lower, created_at, upper, object_count, bytes_used
+                SELECT name, created_at, lower, upper, object_count, bytes_used
                 FROM pivot_ranges
                 WHERE deleted=0
                 ORDER BY lower, upper;
@@ -1351,12 +1344,13 @@ class ContainerBroker(DatabaseBroker):
         for item in nodes:
             try:
                 obj = {
-                    'lower': item[0],
+                    'name': item[0],
                     'created_at': item[1],
-                    'upper': item[2],
-                    'object_count': item[3],
-                    'bytes_used': item[4],
-                    'deleted': item[5] if len(item) > 5 else 0,
+                    'lower': item[2],
+                    'upper': item[3],
+                    'object_count': item[4],
+                    'bytes_used': item[5],
+                    'deleted': item[6] if len(item) > 5 else 0,
                     'storage_policy_index': 0,
                     'record_type': RECORD_TYPE_PIVOT_NODE}
                 result.append(obj)
@@ -1368,47 +1362,25 @@ class ContainerBroker(DatabaseBroker):
         ranges = list()
 
         for node in self.get_pivot_ranges():
-            ranges.append(PivotRange(node[0], node[2], node[1]))
+            ranges.append(PivotRange(node[0], node[2], node[3], node[1]))
         return ranges
 
     def _get_possible_pivot_point(self, conn):
         try:
-            data = conn.execute('''
-                SELECT name
-                FROM object
-                WHERE deleted=0 ORDER BY name LIMIT 1 OFFSET (
-                    SELECT object_count / 2
-                    FROM policy_stat);
-                ''')
+            lower = self.metadata.get(
+                'X-Container-Sysmeta-Shard-Lower', ['', ''])[0]
+            offset = int(SHARD_CONTAINER_SIZE) // 2
+
+            sql = 'SELECT name FROM object WHERE deleted=0 '
+            if lower:
+                sql += "AND name > '%s' " % lower
+            sql += "ORDER BY name LIMIT 1 OFFSET %d;" % offset
+            data = conn.execute(sql)
             if data:
                 data = data.fetchone()
                 return data['name']
             else:
                 return ''
-        except Exception:
-            return ''
-
-    def _get_fuzzy_pivot_point(self, conn):
-        try:
-            params = []
-            # SQLite's optimisation means if we do a single min or max
-            # hitting only an index means it'll jump straight to the first
-            # or last element in the index (linked list). If we combine the
-            # two in one we have to hit every record, we don't want that.
-            # So we do one at a time. This gives a HUGE speed improvement
-            # on even really large containers.
-            for fn in ('min', 'max'):
-                data = conn.execute('''
-                    SELECT %s(name) as name
-                    FROM object
-                    WHERE deleted=0;
-                    ''' % fn)
-                if data:
-                    data = data.fetchone()
-                    params.append(data['name'])
-                else:
-                    return ''
-            return middle_str(*params)
         except Exception:
             return ''
 
@@ -1425,10 +1397,10 @@ class ContainerBroker(DatabaseBroker):
 
         self._commit_puts_stale_ok()
         if connection:
-            return self._get_fuzzy_pivot_point(connection)
+            return self._get_possible_pivot_point(connection)
         else:
             with self.get() as conn:
-                return self._get_fuzzy_pivot_point(conn)
+                return self._get_possible_pivot_point(conn)
 
     def is_shrinking(self):
         return self.metadata.get('X-Container-Sysmeta-Shard-Full') or \

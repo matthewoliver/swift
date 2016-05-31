@@ -4009,10 +4009,19 @@ def get_md5_socket():
     return md5_sockfd
 
 class PivotRange(object):
-    def __init__(self, lower=None, upper=None, timestamp=None):
+    def __init__(self, name=None, lower=None, upper=None, timestamp=None):
+        self._name = name
         self._lower = lower
         self._upper = upper
         self._timestamp = timestamp
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name_setter(self, name):
+        self._name = name
 
     @property
     def lower(self):
@@ -4122,32 +4131,29 @@ def find_pivot_range(item, ranges):
         return None
 
 
-def pivot_to_pivot_container(account, container, lower=None, upper=None,
-                             pivot_range=None):
+def pivot_to_pivot_container(account, container, pivot=None, pivot_range=None):
         """
-        Using a specified lower and upper boundry, generate the required
+        Using a specified pivot range or pivot name and generate the required
         sharded account and container name.
 
-        Given something like ``acc, cont, orange, tomato`` it will return:
+        Given something like ``acc, cont, orange`` it will return:
 
-            .sharded_acc cont_orange_tomato
+            .sharded_acc cont_orange
 
         :param account: The root container's account
         :param container: The root container
-        :param lower: The lower boundry
-        :param upper: The upper boundry
+        :param pivot: The pivot name to use
         :param pivot_range: specify a pivotRange object to use
         :return: A tuple of (account, container) representing the sharded
                  container.
         """
         if pivot_range:
-            upper = pivot_range.upper
-            lower = pivot_range.lower
+            pivot = pivot_range.name
 
-        if not upper and not lower:
+        if not pivot:
             return account, container
         acc = ".sharded_%s" % account
-        cont = "%s_%s_to_%s" % (container, lower, upper)
+        cont = "%s_%s" % (container, pivot)
         return acc, cont
 
 
