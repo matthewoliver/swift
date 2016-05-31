@@ -772,6 +772,7 @@ class ContainerController(BaseStorageServer):
                     objects.extend(objs)
                     limit[0] -= len(objs)
                     params['limit'] = str(limit[0])
+                    params['marker'] = objs[-1]['name']
                 else:
                     end[0] = True
                 break
