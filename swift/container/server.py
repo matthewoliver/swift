@@ -556,19 +556,6 @@ class ContainerController(BaseStorageServer):
                     pass
             if not os.path.exists(broker.db_file):
                 return HTTPNotFound()
-            # There is a chance this is a sharded leaf container, that is in
-            # the middle of shrinking. If that's the case we need to know if
-            # it's a shard empty container, and if it is redirect to the full
-            # shard container. So objects get to where they need to live even
-            # if the sharder is slow or stopped.
-            is_shard_empty = False
-            shard_full = None
-
-            if broker.is_shrinking():
-                shrink_conts = broker.get_shrinking_containers()
-                if shrink_conts.get('empty') == broker.container:
-                    is_shard_empty = True
-                    shard_full = shrink_conts.get('full')
 
             record_type = req.headers.get('x-backend-record-type')
             if record_type == str(RECORD_TYPE_PIVOT_NODE):
@@ -590,13 +577,11 @@ class ContainerController(BaseStorageServer):
                     lower=lower, upper=upper, object_count=obj_count,
                     bytes_used=bytes_used, record_type=int(record_type))
 
-            elif len(broker.get_pivot_ranges()) > 0 or is_shard_empty:
+            elif len(broker.get_pivot_ranges()) > 0:
                 # cannot put to a root shard container, find actual container
                 # or redirect to the full container if in the middle of a
                 # shrinking phase.
                 redirect_cont = None
-                if is_shard_empty:
-                   redirect_cont = shard_full
                 return self._find_shard_location(req, broker, account,
                                                  container, obj, redirect=True,
                                                  redirect_cont=redirect_cont)

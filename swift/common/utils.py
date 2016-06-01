@@ -4147,13 +4147,11 @@ def pivot_to_pivot_container(account, container, pivot=None, pivot_range=None):
         :return: A tuple of (account, container) representing the sharded
                  container.
         """
-        if pivot_range:
-            pivot = pivot_range.name
-
-        if not pivot:
+        if not pivot and not pivot_range:
             return account, container
         acc = ".sharded_%s" % account
-        cont = "%s_%s" % (container, pivot)
+        cont = "%s_%s" % (container, pivot) if not pivot_range \
+            else pivot_range.name
         return acc, cont
 
 

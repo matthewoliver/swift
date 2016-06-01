@@ -323,22 +323,13 @@ class ContainerSharder(ContainerReplicator):
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
 
-        is_full = is_empty = False
-        shrink_conts = broker.get_shrinking_containers()
-        if broker.is_shrinking():
-            if shrink_conts.get('empty') == broker.container:
-                is_empty = True
-            elif shrink_conts.get('full') == broker.container:
-                is_full = True
-
         ranges = broker.get_pivot_ranges()
         # only the root container has a bunch of ranges. If root container also
         # happens to be in the list of ranges, it means we are still sharding
         # up the root container, so we need to treat it like any other shard in
         # regards to misplaced object checks.
         in_ranges = any([p.name == broker.container for p in ranges])
-        if (len(ranges) > 0 and not in_ranges) or broker.is_deleted() \
-                or is_empty:
+        if (len(ranges) > 0 and not in_ranges) or broker.is_deleted():
             # It's a sharded node or deleted, so anything in the object table
             # is misplaced.
             if broker.get_info()['object_count'] > 0:
@@ -351,22 +342,7 @@ class ContainerSharder(ContainerReplicator):
             return
         else:
             # it hasn't been sharded and isn't the root container, so we need
-            # to look for objects that shouldn't be in the object table
-            # there is a chance however, that this container is in the process
-            # of shrinking down. That is to say between phase 1 and 2. Where
-            # there is a shard full container and shard empty container. If
-            # it's the former, then we are temp holding more then its range.
-            if is_full:
-                # it is full, so it is holding it's current range and that of
-                # the empty container. So we need to find its range.
-                empty_range = self._get_empty_range(broker.account,
-                                                    shrink_conts['empty'])
-                if pivot < empty_range:
-                    pivot = PivotRange(pivot.lower, empty_range.upper,
-                                       pivot.timestamp)
-                else:
-                    pivot = PivotRange(empty_range.lower, pivot.upper,
-                                       pivot.timestamp)
+            # to look for objects that shouldn't be in the object table.
             if pivot.upper:
                 tmp_q = query.copy()
                 tmp_q['marker'] = pivot.upper
@@ -1045,64 +1021,7 @@ class ContainerSharder(ContainerReplicator):
         except Exception as ex:
             self.logger.error('There was a problem adding the metadata %s' % ex)
 
-        # TODO Move this into phase 2.
-        policy_index = broker.storage_policy_index
-        query = dict(marker='', end_marker='', prefix='', delimiter='',
-                     storage_policy_index=policy_index)
-
-        items = broker.list_objects_iter(CONTAINER_LISTING_LIMIT, **query)
-        if len(items) == CONTAINER_LISTING_LIMIT:
-            marker = items[-1][0]
-        else:
-            marker = ''
-
-        try:
-            new_part, new_broker, node_id = \
-                self._get_and_fill_shard_broker(
-                    n_pivot, items, root_account, root_container, policy_index)
-
-            # Delete the same items from current broker (while we have the
-            # same state)
-            delete_objs = self._generate_object_list(items, policy_index,
-                                                     delete=True)
-            broker.merge_items(delete_objs)
-        except DeviceUnavailable as duex:
-            self.logger.warning(_(str(duex)))
-            return
-
-        self._add_other_items(marker, broker, new_broker, query)
-
-        timestamp = Timestamp(time.time()).internal
-        shrink_meta = {
-            'X-Container-Sysmeta-Shard-Full': (new_broker.container, timestamp),
-            'X-Container-Sysmeta-Shard-Empty': (broker.container, timestamp)}
-        broker.update_metadata(shrink_meta)
-        new_broker.update_metadata(shrink_meta)
-
-        # We need to update the root container so the empty count is zeroed.
-        empty_piv = (pivot.lower, timestamp, pivot.upper, 0, 0)
-
-        # And to keep it as up to date as possible, send an update for the full
-        # container
-        tmp_info = new_broker.get_info()
-        new_obj_cont, new_bytes_used = (tmp_info['object_count'],
-                                        tmp_info['bytes_used'])
-        full_piv = (n_pivot.lower, timestamp, n_pivot.upper,
-                    "+%d" % new_obj_cont, "+%d" % new_bytes_used)
-        self._update_pivot_ranges(root_account, root_container, 'PUT',
-                                  [empty_piv, full_piv])
-
-        part = self.ring.get_part(broker.account, broker.container)
-        self.logger.info(_('Replicating phase 1 shrunk containers %s/%s and '
-                           '%s/%s'), new_broker.account, new_broker.container,
-                         broker.account, broker.container)
-        self.cpool.spawn(
-            self._replicate_object, new_part, new_broker.db_file, node_id)
-        self.cpool.spawn(
-            self._replicate_object, part, broker.db_file, node_id)
-        any(self.cpool)
-
-    def _get_empty_range(self, account, container):
+    def _get_merge_range(self, account, container):
         path = self.swift.make_path(account, container)
         headers = dict()
         try:
@@ -1124,88 +1043,51 @@ class ContainerSharder(ContainerReplicator):
         if not upper:
             upper = None
 
-        return PivotRange(lower, upper)
+        return PivotRange(container, lower, upper)
 
     def _shrink_phase_2(self, broker, root_account, root_container):
-        # firstly the phase 2 happens inside the full container. So if
-        # this isn't the full container, continue.
+        # We've set metadata last phase. lets make sure it's still the case.
         shrink_containers = broker.get_shrinking_containers()
-        empty_shard = shrink_containers.get('empty')
-        full_shard = shrink_containers.get('full')
+        shrink_shard = shrink_containers.get('shrink')
+        merge_shard = shrink_containers.get('merge')
 
+        # We move data from the shrinking container to the merge. So if this
+        # isn't the shrink container, then continue.
         if not shrink_containers or broker.container != \
-                shrink_containers['full']:
+                shrink_containers['shrink']:
             return
         self.logger.info(_('Starting Shrinking phase 2 on %s/%s.'),
                          broker.account, broker.container)
 
-        # OK we have a full container, now lets make sure we have a quorum on
-        # what the empty container is, just in case.
-
+        # OK we have a shrink container, now lets make sure we have a quorum on
+        # what the containers need to be, just in case.
         def is_success(resp):
-            return resp.getheader('X-Container-Sysmeta-Shard-Empty') == \
-                empty_shard \
-                and resp.getheader('X-Container-Sysmeta-Shard-Full') == \
-                full_shard
+            return resp.getheader('X-Container-Sysmeta-Shard-Shrink') == \
+                   shrink_shard \
+                   and resp.getheader('X-Container-Sysmeta-Shard-Merge') == \
+                       merge_shard
 
         if not self._get_quorum(broker, success=is_success):
             self.logger.info(_('Failed to reach quorum on a empty/full pivot '
                                'for shrinking %s/%s'), broker.account,
                              broker.container)
+            # TODO What should be do in this situation? Just wait and hope it
+            # still needs to replicate the missing or different metadata or
+            # attempt to abort shrinking.
             return
 
-        # Now it's time to make the new container
-        full_range = self.get_pivot_range(broker)
-        empty_range = self._get_empty_range(broker.account, empty_shard)
-
-        if not empty_range:
-            self.logger.info(_('Failed to find the range for the empty '
-                               'container %s/%s canceling shrinking of %s/%s'),
-                             broker.account, empty_shard, broker.account,
-                             broker.container)
-            return
-
-        timestamp = Timestamp(time.time()).internal
-        if empty_range < full_range:
-            lower = empty_range.lower
-            upper = full_range.upper
+        # OK so we agree, so now we can merge this container (shrink) into the
+        # merge container neighbour. First lets build the new pivot
+        shrink_range = self.get_pivot_range(broker)
+        merge_range = self._get_merge_range(broker.account, merge_shard)
+        if merge_range > shrink_range:
+            merge_range.lower = shrink_range.lower
         else:
-            lower = full_range.lower
-            upper = empty_range.upper
-        new_range = PivotRange(lower, upper, timestamp)
-        new_acct, new_cont = pivot_to_pivot_container(root_account,
-                                                      root_container,
-                                                      pivot_range=new_range)
-
-        ranges = self.range_cache.get('')
-        if not ranges:
-            ranges = self._get_pivot_ranges(root_account, root_container,
-                                            newest=True)
-            if ranges is None:
-                self.logger.error(
-                    _("Since the audit run of this container and "
-                      "now we can't access the root container "
-                      "%s/%s aborting."),
-                    root_account, root_container)
-                return
-            self.range_cache[''] = ranges
+            merge_range.upper = shrink_range.upper
 
         policy_index = broker.storage_policy_index
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
-
-        try:
-            policy = POLICIES.get_by_index(policy_index)
-            headers = {'X-Storage-Policy': policy.name}
-            self.swift.create_container(new_acct, new_cont, headers=headers)
-        except internal_client.UnexpectedResponse as ex:
-            self.logger.warning(_('Failed to put container: %s'),
-                                str(ex))
-            self.logger.error(_('PUT of new shard containers failed, cancelling'
-                                ' shrinking of %s/%s. Will try again next '
-                                'pass'),
-                              broker.account, broker.container)
-            return
 
         items = broker.list_objects_iter(CONTAINER_LISTING_LIMIT, **query)
         if len(items) == CONTAINER_LISTING_LIMIT:
@@ -1216,7 +1098,7 @@ class ContainerSharder(ContainerReplicator):
         try:
             new_part, new_broker, node_id = \
                 self._get_and_fill_shard_broker(
-                    new_range, items, root_account, root_container,
+                    merge_range, items, root_account, root_container,
                     policy_index)
 
             # Delete the same items from current broker (while we have the
@@ -1230,49 +1112,44 @@ class ContainerSharder(ContainerReplicator):
 
         self._add_other_items(marker, broker, new_broker, query)
 
-        self.cpool.spawn(
-            self._replicate_object, new_part, new_broker.db_file, node_id)
-        any(self.cpool)
-
-        tmp_info = new_broker.get_info()
-        new_obj_count, new_bytes_used = (tmp_info['object_count'],
-                                         tmp_info['bytes_used'])
-        pivot_ranges = [(new_range.lower, timestamp, new_range.upper,
-                         new_obj_count, new_bytes_used)]
-        items = self._generate_object_list(pivot_ranges, 0)
-        broker.merge_items(items)
-
+        timestamp = Timestamp(time.time()).internal
+        info = new_broker.get_info()
+        merge_piv = (merge_range.name, merge_range.lower, timestamp,
+                     merge_range.upper, "+%d" % info['object_count'],
+                     "+%d" % info['bytes_used'])
         # Push the new pivot range to the root container,
         # we do this so we can short circuit PUTs.
         self._update_pivot_ranges(root_account, root_container, 'PUT',
-                                  pivot_ranges)
+                                  (merge_piv,))
 
-        # blank out the current stats in root of this contianer now
-        # that it has been blanked.
-        pivot_ranges = list()
-        for r in (empty_range, full_range):
-            pivot_ranges.append((r.lower, timestamp, r.upper, 0, 0))
-
+        # We also need to remove the shrink pivot from the root container
+        empty_piv = (shrink_range.name, timestamp, shrink_range.lower,
+                     shrink_range.upper, 0, 0)
         self._update_pivot_ranges(root_account, root_container, 'DELETE',
-                                  pivot_ranges)
+                                  (empty_piv))
 
-        self.logger.info(_('Deleting empty (%s) and full (%s) containers '
-                         'that have now merged into %s/%s'), empty_shard,
-                         broker.container, new_acct, new_cont)
-        try:
-            self.swift.delete_container(broker.account, empty_shard)
-        except internal_client.UnexpectedResponse as ex:
-            self.logger.info(_('Failed to delete %s/%s during shrinking: %s'),
-                             broker.account, empty_shard, ex)
+        # Now we can delete the shrink container (it should be empty)
         broker.delete_db(timestamp)
 
-        # Now replicate the container we are working on
-        self.logger.info(_('Replicating container %s/%s'),
-                         broker.account, broker.container)
         part = self.ring.get_part(broker.account, broker.container)
+        self.logger.info(_('Replicating phase 2 shrunk containers %s/%s and '
+                           '%s/%s'), new_broker.account, new_broker.container,
+                         broker.account, broker.container)
+
+        # Remove shrinking headers from the merge container's new broker so
+        # they get cleared after replication.
+        new_broker.update_metadata({
+            'X-Container-Sysmeta-Shard-Merge': ('', timestamp),
+            'X-Container-Sysmeta-Shard-Shrink': ('', timestamp)})
+
+        # replicate merge container
+        self.cpool.spawn(
+            self._replicate_object, new_part, new_broker.db_file, node_id)
+        # replicate shrink
         self.cpool.spawn(
             self._replicate_object, part, broker.db_file, node_id)
         any(self.cpool)
+
 
     def _add_other_items(self, marker, broker, broker_to_update, qry):
         """
