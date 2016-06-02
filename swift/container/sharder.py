@@ -37,7 +37,7 @@ from swift.common.ring.utils import is_local_device
 from swift.common.utils import get_logger, config_true_value, \
     dump_recon_cache, whataremyips, hash_path, \
     storage_directory, Timestamp, PivotRange, pivot_to_pivot_container, \
-    find_pivot_range, ismount, majority_size
+    find_pivot_range, ismount, majority_size, GreenAsyncPile
 from swift.common.wsgi import ConfigString
 from swift.common.storage_policy import POLICIES
 
@@ -94,18 +94,19 @@ class ContainerSharder(ContainerReplicator):
     """Shards containers."""
 
     def __init__(self, conf, logger=None, **kargs):
-        super(ContainerReplicator, self).__init__(conf, logger=logger, **kargs)
+        super(ContainerReplicator, self).__init__(conf, logger=logger)
         self.conf = conf
         self.logger = logger or get_logger(conf, log_route='container-sharder')
         self.rcache = os.path.join(self.recon_cache_path,
                                    "container-sharder.recon")
         self.vm_test_mode = config_true_value(conf.get('vm_test_mode', 'no'))
 
-        self.shard_shrink_point = float(conf.get('shard_shrink_point', 50)
-                                        / 100.0)
+        self.shard_shrink_point = \
+            float(conf.get('shard_shrink_point', 50) / 100.0)
         self.shard_shrink_merge_point = \
             float(conf.get('shard_shrink_merge_point', 75) / 100.0)
         self.shard_split_size = SHARD_CONTAINER_SIZE // 2
+        self.cpool = GreenAsyncPile(self.cpool)
 
         # internal client
         self.conn_timeout = float(conf.get('conn_timeout', 5))
@@ -236,17 +237,7 @@ class ContainerSharder(ContainerReplicator):
                     timestamp = ts.internal
                 obj = {
                     'created_at': timestamp or item[1]}
-                if isinstance(item[2], int):
-                    # object item
-                    obj.update({
-                        'name': item[0],
-                        'size': item[2],
-                        'content_type': item[3],
-                        'etag': item[4],
-                        'deleted': 1 if delete else 0,
-                        'storage_policy_index': policy_index,
-                        'record_type': RECORD_TYPE_OBJECT})
-                else:
+                if len(item) > 5:
                     # pivot node
                     obj.update({
                         'name': item[0],
@@ -257,6 +248,16 @@ class ContainerSharder(ContainerReplicator):
                         'deleted': 1 if delete else 0,
                         'storage_policy_index': 0,
                         'record_type': RECORD_TYPE_PIVOT_NODE})
+                else:
+                    # object item
+                    obj.update({
+                        'name': item[0],
+                        'size': item[2],
+                        'content_type': item[3],
+                        'etag': item[4],
+                        'deleted': 1 if delete else 0,
+                        'storage_policy_index': policy_index,
+                        'record_type': RECORD_TYPE_OBJECT})
             except Exception:
                 self.logger.warning(_("Failed to add object %s, not in the"
                                       'right format'),
@@ -328,7 +329,7 @@ class ContainerSharder(ContainerReplicator):
         # happens to be in the list of ranges, it means we are still sharding
         # up the root container, so we need to treat it like any other shard in
         # regards to misplaced object checks.
-        in_ranges = any([p.name == broker.container for p in ranges])
+        in_ranges = any([p[0] == broker.container for p in ranges])
         if (len(ranges) > 0 and not in_ranges) or broker.is_deleted():
             # It's a sharded node or deleted, so anything in the object table
             # is misplaced.
@@ -502,7 +503,7 @@ class ContainerSharder(ContainerReplicator):
             # This is the root container, and therefore the tome of knowledge,
             # all we can do is check there is nothing screwy with the range
             ranges = broker.get_pivot_ranges()
-            ranges = [PivotRange(r[0], r[2], r[1]) for r in ranges]
+            ranges = [PivotRange(r[0], r[2], r[3], r[1]) for r in ranges]
             overlaps = ContainerSharder.find_overlapping_ranges(ranges)
             for overlap in overlaps:
                 self.logger.error(_('Range overlaps found, attempting to '
@@ -513,7 +514,7 @@ class ContainerSharder(ContainerReplicator):
                 # now delete the older overlaps, keeping only the newest
                 timestamp = Timestamp(newest.timestamp)
                 timestamp.offset += 1
-                pivots = [(r.lower, timestamp.internal, r.upper, 0, 0)
+                pivots = [(r.name, timestamp.internal, r.lower, r.upper, 0, 0)
                           for r in older]
                 self._update_pivot_ranges(root_account, root_container,
                                           'DELETE', pivots)
@@ -1206,10 +1207,10 @@ class ContainerSharder(ContainerReplicator):
         right_range = ContainerSharder.get_pivot_range(broker)
         if right_range is None:
             right_range = PivotRange()
-        left_range = PivotRange(lower=right_range.lower, upper=pivot)
         new_acct, new_left_cont = pivot_to_pivot_container(
-            root_account, root_container, pivot_range=left_range)
-        left_range.name = new_left_cont
+            root_account, root_container, pivot=pivot)
+        left_range = PivotRange(new_left_cont, lower=right_range.lower,
+                                upper=pivot)
         right_range.lower = pivot
 
         # pivot points are stored in root, Se we need to make sure we can grab
@@ -1330,7 +1331,7 @@ class ContainerSharder(ContainerReplicator):
         self.logger.info(_('Finished sharding %s/%s, new shard '
                            'container %s/%s. Sharded at pivot %s.'),
                          broker.account, broker.container,
-                         new_acct, new_left_cont, new_acct, pivot)
+                         new_acct, new_left_cont, pivot)
 
     def _push_pivot_ranges_to_container(self, pivot, root_account,
                                         root_container, pivot_point,

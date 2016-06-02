@@ -4020,7 +4020,7 @@ class PivotRange(object):
         return self._name
 
     @name.setter
-    def name_setter(self, name):
+    def name(self, name):
         self._name = name
 
     @property
@@ -4028,7 +4028,7 @@ class PivotRange(object):
         return self._lower
 
     @lower.setter
-    def lower_setter(self, lower):
+    def lower(self, lower):
         self._lower = lower
 
     @property
@@ -4036,7 +4036,7 @@ class PivotRange(object):
         return self._upper
 
     @upper.setter
-    def upper_setter(self, upper):
+    def upper(self, upper):
         self._upper = upper
 
     @property
