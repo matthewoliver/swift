@@ -662,17 +662,22 @@ class ContainerSharder(ContainerReplicator):
                 # If a pivot point is defined, we shard on it.. if it isn't
                 # then we see if we need to find a pivot point and set it for
                 # the next parse to shard.
+                pivot_required = \
+                    broker.metadata.get('X-Container-Sysmeta-Shard-Pivoted')
+                pivot_required = False if pivot_required is None else \
+                    not config_true_value(pivot_required[0])
+
                 new_pivot = \
                     broker.metadata.get('X-Container-Sysmeta-Shard-Pivot')
                 new_pivot = '' if new_pivot is None else new_pivot[0]
-                obj_count = broker.get_info()['object_count']
-                to_shard = obj_count > SHARD_CONTAINER_SIZE
 
-                if new_pivot:
+                obj_count = broker.get_info()['object_count']
+
+                if new_pivot and pivot_required:
                     # We need to shard on the pivot point
                     self._shard_on_pivot(new_pivot, broker, root_account,
                                          root_container, node_id)
-                elif to_shard:
+                elif obj_count > SHARD_CONTAINER_SIZE:
                     # No pivot, so check to see if a pivot needs to be found.
                     self._find_pivot_point(broker)
                 elif obj_count <= (SHARD_CONTAINER_SIZE *
@@ -842,31 +847,36 @@ class ContainerSharder(ContainerReplicator):
         found_pivot = [broker.get_info()['pivot_point']]
 
         def on_success(resp):
-            if resp.getheader('X-Container-Sysmeta-Shard-Pivot'):
-                # The other node already has a shard point defined, but
-                # the local one does't. Stop the search because I haven't
-                # been updated yet (or wait for a replication.
+            if not resp or not is_success(resp.status):
+                return False
+
+            pivoted = resp.getheader('X-Container-Sysmeta-Shard-Pivoted')
+            if pivoted is not None and not config_true_value(pivoted):
+                # The other node already has a shard point defined but is
+                # yes to pivot on it. Or it's waiting replication.
                 self.logger.warning(_("A container replica has a pivot "
-                                      "point defined but local container "
-                                      "doesn't. This means container "
-                                      "hasn't been updated yet. Aborting "
-                                      "search for pivot point"))
-                return
+                                      "pending. Can't listen to this "
+                                      "container."))
+                return False
+
             if int(resp.getheader('X-Container-Object-Count')) > obj_count[0]:
                 obj_count[0] = int(resp.getheader('X-Container-Object-Count'))
                 found_pivot[0] = resp.getheader('X-Backend-Pivot-Point')
 
-        if not self._get_quorum(broker, post_success=on_success):
+        if not self._get_quorum(broker, success=on_success):
             self.logger.info(_('Failed to reach quorum on a pivot point for '
                                '%s/%s'), broker.account, broker.container)
             return
         else:
             # Found a pivot point, so lets update all the other containers
-            headers = {'X-Container-Sysmeta-Shard-Pivot': found_pivot[0]}
+            headers = {'X-Container-Sysmeta-Shard-Pivot': found_pivot[0],
+                       'X-Container-Sysmeta-Shard-Pivoted': False}
 
+            timestamp = Timestamp(time.time()).internal
             broker.update_metadata({
                 'X-Container-Sysmeta-Shard-Pivot':
-                    (found_pivot[0], Timestamp(time.time()).internal)})
+                    (found_pivot[0], timestamp),
+                'X-Container-Sysmeta-Shard-Pivoted': False})
 
             if not self._get_quorum(broker, op='POST', headers=headers):
                 self.logger.info(_('Failed to set %s as the pivot point for '
@@ -1312,6 +1322,9 @@ class ContainerSharder(ContainerReplicator):
         self.cpool.spawn(
             self._replicate_object, part, broker.db_file, node_id)
         any(self.cpool)
+
+        broker.update_metadata({'X-Container-Sysmeta-Shard-Pivoted':
+                                    (True, Timestamp)})
 
         # delete this container as we do not need it anymore
         # if not is_root:
