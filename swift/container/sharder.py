@@ -863,6 +863,8 @@ class ContainerSharder(ContainerReplicator):
                 obj_count[0] = int(resp.getheader('X-Container-Object-Count'))
                 found_pivot[0] = resp.getheader('X-Backend-Pivot-Point')
 
+            return True
+
         if not self._get_quorum(broker, success=on_success):
             self.logger.info(_('Failed to reach quorum on a pivot point for '
                                '%s/%s'), broker.account, broker.container)
@@ -876,7 +878,7 @@ class ContainerSharder(ContainerReplicator):
             broker.update_metadata({
                 'X-Container-Sysmeta-Shard-Pivot':
                     (found_pivot[0], timestamp),
-                'X-Container-Sysmeta-Shard-Pivoted': False})
+                'X-Container-Sysmeta-Shard-Pivoted': (False, timestamp)})
 
             if not self._get_quorum(broker, op='POST', headers=headers):
                 self.logger.info(_('Failed to set %s as the pivot point for '
