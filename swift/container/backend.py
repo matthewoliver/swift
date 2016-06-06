@@ -19,7 +19,6 @@ Pluggable Back-ends for Container Server
 import os
 from uuid import uuid4
 import time
-from itertools import izip_longest
 
 import six
 import six.moves.cPickle as pickle
@@ -663,13 +662,8 @@ class ContainerBroker(DatabaseBroker):
             self.account = data['account']
             self.container = data['container']
 
-            if not self.get_pivot_ranges(connection=conn):
-                # This container can have objects, so find the current pivot
-                # point.
-                data['pivot_point'] = \
-                    self.get_possible_pivot_point(connection=conn)
-            else:
-                data['pivot_point'] = ''
+            data['pivot_point'] = \
+                self.get_possible_pivot_point(connection=conn)
 
             return data
 
@@ -1003,7 +997,7 @@ class ContainerBroker(DatabaseBroker):
                         'WHERE %s name IN (%s)')
                        % (query_mod,
                           ','.join('?' * len(chunk))))
-                return (((rec[0], rec[1], rec[2]), rec)
+                return (((rec[0],), rec)
                         for rec in curs.execute(sql, chunk))
 
         def _merge_items(curs, rec_list, is_object=True):
@@ -1350,7 +1344,7 @@ class ContainerBroker(DatabaseBroker):
                     'upper': item[3],
                     'object_count': item[4],
                     'bytes_used': item[5],
-                    'deleted': item[6] if len(item) > 5 else 0,
+                    'deleted': item[6] if len(item) > 6 else 0,
                     'storage_policy_index': 0,
                     'record_type': RECORD_TYPE_PIVOT_NODE}
                 result.append(obj)

@@ -412,9 +412,6 @@ class ContainerSharder(ContainerReplicator):
     @staticmethod
     def get_pivot_range(broker, timestamp=None):
         account, container = ContainerSharder.get_shard_root_path(broker)
-        if account == broker.account:
-            # This is the root container, so doesn't represent a range
-            return None
 
         _timestamp = None
         lower = broker.metadata.get('X-Container-Sysmeta-Shard-Lower')
@@ -1288,12 +1285,6 @@ class ContainerSharder(ContainerReplicator):
             return
 
         self._add_other_items(marker, broker, new_broker, q)
-        tmp_info = new_broker.get_info()
-        new_pivot_data[left_range] = (tmp_info['object_count'],
-                                      tmp_info['bytes_used'])
-        tmp_info = broker.get_info()
-        new_pivot_data[right_range] = (tmp_info['object_count'],
-                                       tmp_info['bytes_used'])
 
         self.logger.info(_('Replicating new shard container %s/%s'),
                          new_broker.account, new_broker.container)
@@ -1313,6 +1304,11 @@ class ContainerSharder(ContainerReplicator):
         if is_root:
             items = self._generate_object_list(pivot_ranges, 0)
             broker.merge_items(items)
+            broker.update_metadata({
+                'X-Container-Sysmeta-Shard-Lower':
+                    (right_range.lower, timestamp),
+                'X-Container-Sysmeta-Shard-Upper':
+                    (right_range.upper, timestamp)})
         else:
             # Push the new pivot range to the root container
             self._update_pivot_ranges(root_account, root_container, 'PUT',
