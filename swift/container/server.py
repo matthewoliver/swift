@@ -691,8 +691,8 @@ class ContainerController(BaseStorageServer):
             # Conversion has already happened (e.g. from a sharded node)
             return record
         if pivot:
-            (lower, created, upper, object_count, bytes_used) = record[:5]
-            response = {'lower': lower, 'upper': upper,
+            (name, created, lower, upper, object_count, bytes_used) = record[:6]
+            response = {'name': name, 'lower': lower, 'upper': upper,
                         'object_count': object_count,
                         'bytes_used': bytes_used,
                         'created_at': created}

@@ -39,11 +39,6 @@ def other_items_hook(broker):
     return broker.pivot_nodes_to_items(pivot_ranges)
 
 
-def other_items_hook(broker):
-    pivot_ranges = broker.get_pivot_ranges()
-    return broker.pivot_nodes_to_items(pivot_ranges)
-
-
 class ContainerReplicator(db_replicator.Replicator):
     server_type = 'container'
     brokerclass = ContainerBroker

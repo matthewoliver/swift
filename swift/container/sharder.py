@@ -171,7 +171,8 @@ class ContainerSharder(ContainerReplicator):
                 lower = pivot.get('lower') or None
                 upper = pivot.get('upper') or None
                 created_at = pivot.get('created_at') or None
-                ranges.append(PivotRange(pivot.name, lower, upper, created_at))
+                ranges.append(PivotRange(pivot['name'], lower, upper,
+                                         created_at))
         except ValueError:
             # Failed to decode the json response
             return None
@@ -634,9 +635,9 @@ class ContainerSharder(ContainerReplicator):
             # other, then this needs to be fixed. If, however, it doesn't
             # exist in either then this container may not exist anymore so
             # quarantine it.
-            if not self._audit_shard_container(broker, pivot, root_account,
-                                               root_container):
-                continue
+         #   if not self._audit_shard_container(broker, pivot, root_account,
+          #                                     root_container):
+           #     continue
 
             # now look and deal with misplaced objects.
             self._misplaced_objects(broker, root_account, root_container,
@@ -1218,7 +1219,7 @@ class ContainerSharder(ContainerReplicator):
 
         right_range = ContainerSharder.get_pivot_range(broker)
         if right_range is None:
-            right_range = PivotRange()
+            right_range = PivotRange(broker.container)
         new_acct, new_left_cont = pivot_to_pivot_container(
             root_account, root_container, pivot=pivot)
         left_range = PivotRange(new_left_cont, lower=right_range.lower,
@@ -1325,8 +1326,8 @@ class ContainerSharder(ContainerReplicator):
             self._replicate_object, part, broker.db_file, node_id)
         any(self.cpool)
 
-        broker.update_metadata({'X-Container-Sysmeta-Shard-Pivoted':
-                                    (True, Timestamp)})
+        broker.update_metadata({
+            'X-Container-Sysmeta-Shard-Pivoted': (True, timestamp)})
 
         # delete this container as we do not need it anymore
         # if not is_root:
