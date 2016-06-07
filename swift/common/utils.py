@@ -4149,6 +4149,9 @@ def pivot_to_pivot_container(account, container, pivot=None, pivot_range=None):
         """
         if not pivot and not pivot_range:
             return account, container
+        if pivot_range and pivot_range.name == container:
+            # The root container is a range.
+            return account, container
         acc = ".sharded_%s" % account
         cont = "%s_%s" % (container, pivot) if not pivot_range \
             else pivot_range.name

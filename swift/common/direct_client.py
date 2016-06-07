@@ -97,8 +97,12 @@ def _get_direct_account_container(path, stype, node, part,
         qs += '&delimiter=%s' % quote(delimiter)
     if 'reverse' in kargs:
         qs += '&reverse=%s' % quote(kargs.get('reverse', 'no'))
+    if 'end_marker' in kargs:
+        qs += '&end_marker=%s' % quote(kargs.get('end_marker', ''))
     if 'nodes' in kargs:
         qs += '&nodes=%s' % quote(kargs.get('nodes', ''))
+    if 'noshard' in kargs:
+        qs += '&noshard=%s' % quote(kargs.get('noshard', ''))
     with Timeout(conn_timeout):
         conn = http_connect(node['ip'], node['port'], node['device'], part,
                             'GET', path, query_string=qs,

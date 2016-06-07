@@ -21,7 +21,6 @@ from swift import gettext_ as _
 from xml.etree.cElementTree import Element, SubElement, tostring
 
 from eventlet import Timeout
-from operator import itemgetter
 from random import shuffle, randint
 
 import swift.common.db
@@ -717,7 +716,7 @@ class ContainerController(BaseStorageServer):
         objects = list()
         used_ranges = list()
         params = req.params.copy()
-        params.update({'format': 'json', 'limit': str(limit[0])})
+        params.update({'format': 'json', 'limit': limit[0]})
 
         def _talk_to_nodes(root_account, root_container, pivot, account=None,
                            container=None):
@@ -728,6 +727,8 @@ class ContainerController(BaseStorageServer):
                 piv_acct, piv_cont = account, container
             else:
                 return
+            if piv_acct == root_account and piv_cont == root_container:
+                params['noshard'] = 'on'
             part, nodes = self.ring.get_nodes(piv_acct, piv_cont)
             shuffle(nodes)
             for node in nodes:
@@ -739,16 +740,6 @@ class ContainerController(BaseStorageServer):
                     # move onto the next node.
                     continue
 
-                empty = hdrs.get('X-Container-Sysmeta-Shard-Empty')
-                full = hdrs.get('X-Container-Sysmeta-Shard-Full')
-                if full and empty == piv_cont:
-                    # We have an empty container, so we need to look in
-                    # the full one for this containers objects.
-                    if full not in used_ranges:
-                        used_ranges.append(full)
-                        _talk_to_nodes(root_account, root_container, None,
-                                       piv_acct, full)
-                        return
                 object_count[0] += \
                     int(hdrs.get('X-Container-Object-Count', 0))
                 object_bytes[0] += \
@@ -756,7 +747,7 @@ class ContainerController(BaseStorageServer):
                 if objs:
                     objects.extend(objs)
                     limit[0] -= len(objs)
-                    params['limit'] = str(limit[0])
+                    params['limit'] = limit[0]
                     params['marker'] = objs[-1]['name']
                 else:
                     end[0] = True
@@ -765,6 +756,9 @@ class ContainerController(BaseStorageServer):
         # Firstly we need the requested container's, the root container, pivot
         # tree.
         ranges = broker.build_pivot_ranges()
+        reverse = get_param(req, 'reverse')
+        if reverse:
+            ranges.reverse()
 
         # Now we need to find out where to start from.
         start = True
@@ -775,6 +769,9 @@ class ContainerController(BaseStorageServer):
 
         if end_marker:
             epiv = find_pivot_range(end_marker, ranges)
+            import q
+            q(epiv)
+            q(end_marker)
 
         for piv_range in ranges:
             if not start and spiv:
@@ -835,10 +832,11 @@ class ContainerController(BaseStorageServer):
         if is_deleted:
             return HTTPNotFound(request=req, headers=resp_headers)
         kargs = {}
+        skip_sharding = get_param(req, 'noshard')
         if nodes and nodes.lower() == "pivot":
             container_list = broker.get_pivot_ranges()
             kargs.update(dict(pivot=True))
-        elif len(broker.get_pivot_ranges()) > 0:
+        elif not skip_sharding and len(broker.get_pivot_ranges()) > 0:
             # Sharded container so we need to pass to GET_sharded
             return self.GET_sharded(req, broker, resp_headers, marker,
                                     end_marker, prefix, limit)
