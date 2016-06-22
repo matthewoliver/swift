@@ -769,9 +769,6 @@ class ContainerController(BaseStorageServer):
 
         if end_marker:
             epiv = find_pivot_range(end_marker, ranges)
-            import q
-            q(epiv)
-            q(end_marker)
 
         for piv_range in ranges:
             if not start and spiv:

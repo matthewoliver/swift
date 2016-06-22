@@ -449,11 +449,12 @@ class ContainerBroker(DatabaseBroker):
         data = pickle.loads(entry.decode('base64'))
         record_type = data[9] if len(data) > 9 else RECORD_TYPE_OBJECT
         if record_type and record_type == RECORD_TYPE_PIVOT_NODE:
-            (lower, timestamp, upper, object_count, bytes_used, deleted) = \
-                data[:6]
+            (name, timestamp, lower, upper, object_count, bytes_used, deleted) \
+                = data[:7]
             item = {
-                'lower': lower,
+                'name': name,
                 'created_at': timestamp,
+                'lower': lower,
                 'upper': upper,
                 'object_count': object_count,
                 'bytes_used': bytes_used,
@@ -522,7 +523,7 @@ class ContainerBroker(DatabaseBroker):
         if record['record_type'] == RECORD_TYPE_PIVOT_NODE:
             return (record['name'], record['created_at'], record['lower'],
                     record['upper'], record['object_count'],
-                    record['bytes_used'], record['deleted'], 0, 0, 0,
+                    record['bytes_used'], record['deleted'], 0, 0,
                     record['record_type'])
         return (record['name'], record['created_at'], record['size'],
                 record['content_type'], record['etag'], record['deleted'],

@@ -1259,9 +1259,14 @@ class ContainerSharder(ContainerReplicator):
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
 
-        new_pivot_data = {}
         q = query.copy()
         q.update({'end_marker': pivot, 'include_end_marker': True})
+        if 'X-Container-Sysmeta-Shard-Lower' in broker.metadata:
+            # A lower has been defined, so lets alter our query so we make sure
+            # we only grab the objects that should live in the new shard.
+            q.update({
+                'marker': broker.metadata['X-Container-Sysmeta-Shard-Lower'][0]}
+            )
         items = broker.list_objects_iter(CONTAINER_LISTING_LIMIT, **q)
 
         if len(items) == CONTAINER_LISTING_LIMIT:
