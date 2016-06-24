@@ -505,6 +505,9 @@ class Replicator(Daemon):
         shouldbehere = True
         try:
             broker = self.brokerclass(object_file, pending_timeout=30)
+            if self._is_locked(broker):
+                #TODO should do something about stats here.
+                return
             broker.reclaim(now - self.reclaim_age,
                            now - (self.reclaim_age * 2))
             info = broker.get_replication_info()
@@ -699,6 +702,9 @@ class Replicator(Daemon):
             elapsed = time.time() - begin
             if elapsed < self.interval:
                 sleep(self.interval - elapsed)
+
+    def _is_locked(self, broker):
+        return False
 
 
 class ReplicatorRpc(object):

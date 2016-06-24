@@ -19,6 +19,7 @@ Pluggable Back-ends for Container Server
 import os
 from uuid import uuid4
 import time
+from contextlib import contextmanager
 
 import six
 import six.moves.cPickle as pickle
@@ -1422,3 +1423,16 @@ class ContainerBroker(DatabaseBroker):
         also a type of root container.
         """
         return not self.metadata.get('X-Container-Sysmeta-Shard-Container')
+
+    @contextmanager
+    def sharding_lock(self):
+        lockpath = '%s/.sharding' % self.db_dir
+        try:
+            fd = os.open(lockpath, os.O_WRONLY | os.O_CREAT)
+            yield fd
+        finally:
+            os.unlink(lockpath)
+
+    def has_sharding_lock(self):
+        lockpath = '%s/.sharding' % self.db_dir
+        return os.path.exists(lockpath)

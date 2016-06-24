@@ -187,8 +187,6 @@ class ContainerSharder(ContainerReplicator):
         :param container: the container
         :returns: a local shard container broker
         """
-        if container in self.shard_brokers:
-            return self.shard_brokers[container][1]
         part = self.ring.get_part(account, container)
         node = self.find_local_handoff_for_part(part)
         if not node:
@@ -207,8 +205,7 @@ class ContainerSharder(ContainerReplicator):
 
         # Get the valid info into the broker.container, etc
         broker.get_info()
-        self.shard_brokers[container] = part, broker, node['id']
-        return broker
+        return part, broker, node['id']
 
     def _generate_object_list(self, items, policy_index, delete=False):
         """
@@ -267,44 +264,17 @@ class ContainerSharder(ContainerReplicator):
                 objs.append(obj)
         return objs
 
-    def _get_and_fill_shard_broker(self, pivot, items, account, container,
-                                   policy_index, delete=False):
-        """
-        Go grabs or creates a new container broker in a handoff partition
-        to use as the new shard for the container. It then sets the required
-        sharding metadata and adds the objects from either a list (as you get
-        from the container backend) or a ShardTrie object.
-
-        :param pivot: The pivot the shard belongs.
-        :param items: A list of objects or pivot points
-               objects from.
-        :param account: The root shard account (the original account).
-        :param container: The root shard container (the original container).
-        :param policy_index:
-        :param delete:
-        :return: A database broker or None (if failed to grab one)
-        """
-        acct, cont = pivot_to_pivot_container(account, container,
-                                              pivot_range=pivot)
-        try:
-            broker = self._get_shard_broker(acct, cont, policy_index)
-        except DeviceUnavailable as duex:
-            self.logger.warning(_(str(duex)))
-            return None
-
+    def _add_shard_metadata(self, broker, root_account, root_container,
+                            pivot):
         if not broker.metadata.get('X-Container-Sysmeta-Shard-Account') \
                 and pivot:
             timestamp = Timestamp(time.time()).internal
             broker.update_metadata({
-                'X-Container-Sysmeta-Shard-Account': (account, timestamp),
-                'X-Container-Sysmeta-Shard-Container': (container, timestamp),
+                'X-Container-Sysmeta-Shard-Account': (root_account, timestamp),
+                'X-Container-Sysmeta-Shard-Container':
+                    (root_container, timestamp),
                 'X-Container-Sysmeta-Shard-Lower': (pivot.lower, timestamp),
                 'X-Container-Sysmeta-Shard-Upper': (pivot.upper, timestamp)})
-
-        objects = self._generate_object_list(items, policy_index, delete)
-        broker.merge_items(objects)
-
-        return self.shard_brokers[cont]
 
     def _misplaced_objects(self, broker, root_account, root_container, pivot):
         """
@@ -361,11 +331,9 @@ class ContainerSharder(ContainerReplicator):
 
             # We have a list of misplaced objects, so we better find a home
             # for them
-            ranges = self.range_cache.get('')
-            if not ranges:
-                ranges = self._get_pivot_ranges(root_account, root_container,
-                                                newest=True)
-                self.range_cache[''] = ranges
+            if not self.ranges:
+                self.ranges = self._get_pivot_ranges(
+                    root_account, root_container, newest=True)
 
             pivot_to_obj = {}
             for obj in objs:
@@ -380,8 +348,18 @@ class ContainerSharder(ContainerReplicator):
             self.logger.info(_('preparing to move misplaced objects found '
                                'in %s/%s'), broker.account, broker.container)
             for piv, obj_list in pivot_to_obj.items():
-                part, new_broker, node_id = self._get_and_fill_shard_broker(
-                    piv, obj_list, root_account, root_container, policy_index)
+                acct, cont = pivot_to_pivot_container(root_account,
+                                                      root_container,
+                                                      pivot_range=piv)
+
+                part, new_broker, node_id = \
+                    self._get_shard_broker(acct, cont, policy_index)
+
+                self._add_shard_metadata(new_broker, root_account,
+                                         root_container, piv)
+
+                objects = self._generate_object_list(obj_list, policy_index)
+                new_broker.merge_items(objects)
 
                 self.cpool.spawn(
                     self._replicate_object, part, new_broker.db_file, node_id)
@@ -411,8 +389,6 @@ class ContainerSharder(ContainerReplicator):
 
     @staticmethod
     def get_pivot_range(broker, timestamp=None):
-        account, container = ContainerSharder.get_shard_root_path(broker)
-
         _timestamp = None
         lower = broker.metadata.get('X-Container-Sysmeta-Shard-Lower')
         if lower:
@@ -483,11 +459,14 @@ class ContainerSharder(ContainerReplicator):
         #      gaps in the ranges.
         # TODO Search for overlaps if you find some, keep the newest and
         #      attempt to correct (remove the older one).
+        # TODO If the shard container has a sharding lock then see if it's
+        #       needed. Maybe something as simple as sharding lock older then
+        #       reclaim age.
 
         self.logger.info(_('Auditing %s/%s'), broker.account, broker.container)
         continue_with_container = True
 
-        # if the container has been marked as deleted, we all metadata will
+        # if the container has been marked as deleted, all metadata will
         # have been erased so no point auditing. But we want it to pass, in
         # case any objects exist inside it.
         if broker.is_deleted():
@@ -526,34 +505,29 @@ class ContainerSharder(ContainerReplicator):
             return continue_with_container
 
         # Get the root view of the world.
-        ranges = self._get_pivot_ranges(root_account, root_container,
-                                        newest=True)
-        if ranges is None:
+        self.ranges = self._get_pivot_ranges(root_account, root_container,
+                                             newest=True)
+        if self.ranges is None:
             # failed to get the root tree. Error out for now.. we may need to
             # quarantine the container.
             self.logger.warning(_("Failed to get a pivot tree from root "
                                   "container %s/%s, it may not exist."),
                                 root_account, root_container)
             return False
-        if pivot in ranges or broker.is_deleted() or \
-                len(broker.get_pivot_ranges()):
-            # If pivot exists or is a parent container that has already been
-            # deleted, then let it continue. In the case of the latter, we let
-            # it through, in case it has misplaced objects to deal with.
+        if pivot in self.ranges:
             return continue_with_container
 
         # pivot isn't in ranges, if it overlaps with an item, were in trouble.
         # If there is overlap lets see if it's newer then this containers,
-        # if so, it's safe to delte (quarantine this container).
+        # if so, it's safe to delete (quarantine this container).
         # if it's newer, then it might not be updated yet, so just let it
         # continue (or maybe we shouldn't?).
-        overlaps = [r for r in ranges if r.overlaps(pivot)]
+        overlaps = [r for r in self.ranges if r.overlaps(pivot)]
         if overlaps:
             if max(overlaps + [pivot], key=lambda x: x.timestamp) == pivot:
                 # pivot is newest so leave it alone for now  as the root might
                 # not be updated  yet.
-                continue_with_container = False
-                return continue_with_container
+                return False
             else:
                 # There is a newer range that overlaps/covers this range.
                 # so we are safe to quarantine it.
@@ -562,6 +536,7 @@ class ContainerSharder(ContainerReplicator):
                                     'container (%s/%s) overlaps with another '
                                     'newer pivot'),
                                   broker.account, broker.container)
+                return False
         # pivot doesn't exist in the root containers ranges, but doesn't
         # overlap with anything
         return continue_with_container
@@ -620,7 +595,7 @@ class ContainerSharder(ContainerReplicator):
             if not sharded:
                 # Not a shard container
                 continue
-            self.range_cache = {}
+            self.ranges = []
             root_account, root_container = \
                 ContainerSharder.get_shard_root_path(broker)
             pivot = ContainerSharder.get_pivot_range(broker)
@@ -963,18 +938,16 @@ class ContainerSharder(ContainerReplicator):
         #      directly before, because the upper is always included in
         #      the range. (use find_pivot_range(lower, ranges).
         #   3. Upper + something is in the next range.
-        ranges = self.range_cache.get('')
-        if not ranges:
-            ranges = self._get_pivot_ranges(root_account, root_container,
-                                            newest=True)
-            if ranges is None:
+        if not self.ranges:
+            self.ranges = self._get_pivot_ranges(root_account, root_container,
+                                                 newest=True)
+            if self.ranges is None:
                 self.logger.error(
                     _("Since the audit run of this container and "
                       "now we can't access the root container "
                       "%s/%s aborting."),
                     root_account, root_container)
                 return
-        self.range_cache[''] = ranges
         lower_n = upper_n = None
         lower_c = upper_c = SHARD_CONTAINER_SIZE
         if pivot.lower:
@@ -1100,28 +1073,22 @@ class ContainerSharder(ContainerReplicator):
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
 
-        items = broker.list_objects_iter(CONTAINER_LISTING_LIMIT, **query)
-        if len(items) == CONTAINER_LISTING_LIMIT:
-            marker = items[-1][0]
-        else:
-            marker = ''
-
         try:
-            new_part, new_broker, node_id = \
-                self._get_and_fill_shard_broker(
-                    merge_range, items, root_account, root_container,
-                    policy_index)
+            acct, cont = pivot_to_pivot_container(root_account, root_container,
+                                                  pivot_range=merge_range)
 
-            # Delete the same items from current broker (while we have the
-            # same state)
-            delete_objs = self._generate_object_list(items, policy_index,
-                                                     delete=True)
-            broker.merge_items(delete_objs)
+            new_part, new_broker, node_id = \
+                self._get_shard_broker(acct, cont, policy_index)
+
+            self._add_shard_metadata(broker, root_account, root_container,
+                                     merge_range)
+
+            with new_broker.sharding_lock():
+                self._add_items(broker, new_broker, query)
+
         except DeviceUnavailable as duex:
             self.logger.warning(_(str(duex)))
             return
-
-        self._add_other_items(marker, broker, new_broker, query)
 
         timestamp = Timestamp(time.time()).internal
         info = new_broker.get_info()
@@ -1137,7 +1104,7 @@ class ContainerSharder(ContainerReplicator):
         empty_piv = (shrink_range.name, timestamp, shrink_range.lower,
                      shrink_range.upper, 0, 0)
         self._update_pivot_ranges(root_account, root_container, 'DELETE',
-                                  (empty_piv))
+                                  (empty_piv,))
 
         # Now we can delete the shrink container (it should be empty)
         broker.delete_db(timestamp)
@@ -1161,17 +1128,15 @@ class ContainerSharder(ContainerReplicator):
             self._replicate_object, part, broker.db_file, node_id)
         any(self.cpool)
 
-
-    def _add_other_items(self, marker, broker, broker_to_update, qry):
+    def _add_items(self, broker, broker_to_update, qry):
         """
-        Add other items from one broker to another.
+        Move items from one broker to another.
 
         The qry is a query dict in the form of:
             dict(marker='', end_marker='', prefix='', delimiter='',
                  storage_policy_index=policy_index)
         """
-        while marker:
-            qry['marker'] = marker
+        while True:
             new_items = broker.list_objects_iter(
                 CONTAINER_LISTING_LIMIT, **qry)
 
@@ -1185,10 +1150,10 @@ class ContainerSharder(ContainerReplicator):
                 new_items, broker.storage_policy_index, delete=True)
             broker.merge_items(delete_objs)
 
-            if len(new_items) == CONTAINER_LISTING_LIMIT:
-                marker = new_items[-1][0]
+            if len(new_items) >= CONTAINER_LISTING_LIMIT:
+                qry['marker'] = new_items[-1][0]
             else:
-                marker = ''
+                break
 
     def _shard_on_pivot(self, pivot, broker, root_account, root_container,
                         node_id):
@@ -1225,21 +1190,19 @@ class ContainerSharder(ContainerReplicator):
 
         # pivot points are stored in root, Se we need to make sure we can grab
         # the root ranges before we move anything.
-        ranges = self.range_cache.get('')
-        if not ranges:
+        if not self.ranges:
             if is_root:
-                ranges = broker.build_pivot_ranges()
+                self.ranges = broker.build_pivot_ranges()
             else:
-                ranges = self._get_pivot_ranges(root_account, root_container,
-                                                newest=True)
-                if ranges is None:
+                self.ranges = self._get_pivot_ranges(
+                    root_account, root_container, newest=True)
+                if self.ranges is None:
                     self.logger.error(
                         _("Since the audit ran on this container and "
                           "now we can't access the root container "
                           "%s/%s aborting."),
                         root_account, root_container)
                     return
-            self.range_cache[''] = ranges
 
         # Make sure the account exists and the new container entry
         # is added by running a container PUT.
@@ -1267,29 +1230,23 @@ class ContainerSharder(ContainerReplicator):
             q.update({
                 'marker': broker.metadata['X-Container-Sysmeta-Shard-Lower'][0]}
             )
-        items = broker.list_objects_iter(CONTAINER_LISTING_LIMIT, **q)
-
-        if len(items) == CONTAINER_LISTING_LIMIT:
-            marker = items[-1][0]
-        else:
-            marker = ''
 
         try:
-            new_part, new_broker, node_id = \
-                self._get_and_fill_shard_broker(
-                    left_range, items, root_account, root_container,
-                    policy_index)
+            acct, cont = pivot_to_pivot_container(root_account, root_container,
+                                                  pivot_range=left_range)
 
-            # Delete the same items from current broker (while we have the
-            # same state)
-            delete_objs = self._generate_object_list(items, policy_index,
-                                                     delete=True)
-            broker.merge_items(delete_objs)
+            new_part, new_broker, node_id = \
+                self._get_shard_broker(acct, cont, policy_index)
+
+            self._add_shard_metadata(broker, root_account, root_container,
+                                     left_range)
+
+            with new_broker.sharding_lock():
+                self._add_items(broker, new_broker, q)
+
         except DeviceUnavailable as duex:
             self.logger.warning(_(str(duex)))
             return
-
-        self._add_other_items(marker, broker, new_broker, q)
 
         self.logger.info(_('Replicating new shard container %s/%s'),
                          new_broker.account, new_broker.container)
@@ -1355,9 +1312,10 @@ class ContainerSharder(ContainerReplicator):
                                         storage_policy_index):
         # Push the new distributed node to the container.
         part, root_broker, node_id = \
-            self._get_and_fill_shard_broker(
-                pivot, pivot_point, root_account, root_container,
-                storage_policy_index)
+            self._get_shard_broker(root_account, root_container,
+                                   storage_policy_index)
+        objects = self._generate_object_list(pivot_point, storage_policy_index)
+        root_broker.merge_items(objects)
         self.cpool.spawn(
             self._replicate_object, part, root_broker.db_file, node_id)
         any(self.cpool)

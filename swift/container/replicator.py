@@ -275,6 +275,10 @@ class ContainerReplicator(db_replicator.Replicator):
     def _other_items_hook(self, broker):
         return other_items_hook(broker)
 
+    def _is_locked(self, broker):
+        return broker.has_sharding_lock()
+
+
 
 class ContainerReplicatorRpc(db_replicator.ReplicatorRpc):
 
