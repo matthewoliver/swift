@@ -1080,7 +1080,7 @@ class ContainerSharder(ContainerReplicator):
             new_part, new_broker, node_id = \
                 self._get_shard_broker(acct, cont, policy_index)
 
-            self._add_shard_metadata(broker, root_account, root_container,
+            self._add_shard_metadata(new_broker, root_account, root_container,
                                      merge_range)
 
             with new_broker.sharding_lock():
@@ -1238,7 +1238,7 @@ class ContainerSharder(ContainerReplicator):
             new_part, new_broker, node_id = \
                 self._get_shard_broker(acct, cont, policy_index)
 
-            self._add_shard_metadata(broker, root_account, root_container,
+            self._add_shard_metadata(new_broker, root_account, root_container,
                                      left_range)
 
             with new_broker.sharding_lock():
