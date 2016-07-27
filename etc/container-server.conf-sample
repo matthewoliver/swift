@@ -228,3 +228,56 @@ use = egg:swift#xprofile
 #
 # unwind the iterator of applications
 # unwind = false
+
+[container-sharder]
+# You can override the default log routing for this app here (don't use set!):
+# log_name = container-sharder
+# log_facility = LOG_LOCAL0
+# log_level = INFO
+# log_address = /dev/log
+#
+# Container sharder specific settings
+# Shard_container_size is the size (number of objects) in which a sharding range will
+# be split (pivoted).
+# shard_container_size = 1000000
+#
+# Shrinking has a few more settings, the first is the shard_shrink_point. This is the
+# point at which to start looking to shrink the sharded container. The point is a
+# percentage of shard_container_size. 50 means 50% of the shard_container_size.
+# shard_shrink_point = 50
+#
+# Shard_shrink_merge_point is the similar to shard_shrink_size, but is the max size
+# the sharded container plus the neighbour needs to be to continue with the merge.
+# Again this is a percentage of shard_container_size. 
+# shard_shrink_merge_point = 75
+#
+# For example, by default the shard_container_size is 1 million, shard_shrink_point is 50
+# and shard_shrink_merge_point is 75. Meaning start looking to merge with neighbours when
+# the current shard container is <= 500k, and only merge if this container and a neighbour's
+# combined object count <= 750k.
+#
+# Because the container-sharder is a type of container-replicator, it accepts
+# the same configuration.
+#
+# vm_test_mode = no
+# per_diff = 1000
+# max_diffs = 100
+# concurrency = 8
+#
+# Time in seconds to wait between replication passes
+# interval = 30
+# run_pause is deprecated, use interval instead
+# run_pause = 30
+#
+# node_timeout = 10
+# conn_timeout = 0.5
+#
+# The replicator also performs reclamation
+# reclaim_age = 604800
+#
+# Allow rsync to compress data which is transmitted to destination node
+# during sync. However, this is applicable only when destination node is in
+# a different region than the local one.
+# rsync_compress = no
+#
+# recon_cache_path = /var/cache/swift

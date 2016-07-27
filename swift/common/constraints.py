@@ -39,6 +39,7 @@ MAX_ACCOUNT_NAME_LENGTH = 256
 MAX_CONTAINER_NAME_LENGTH = 256
 VALID_API_VERSIONS = ["v1", "v1.0"]
 EXTRA_HEADER_COUNT = 0
+SHARD_CONTAINER_SIZE = 1000000
 
 # If adding an entry to DEFAULT_CONSTRAINTS, note that
 # these constraints are automatically published by the
@@ -58,6 +59,7 @@ DEFAULT_CONSTRAINTS = {
     'max_container_name_length': MAX_CONTAINER_NAME_LENGTH,
     'valid_api_versions': VALID_API_VERSIONS,
     'extra_header_count': EXTRA_HEADER_COUNT,
+    'shard_container_size': SHARD_CONTAINER_SIZE,
 }
 
 SWIFT_CONSTRAINTS_LOADED = False

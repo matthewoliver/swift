@@ -1710,7 +1710,9 @@ class TestPipelineModification(unittest.TestCase):
             """ % (tempdir, server_type)
             with open(conf_path, 'w') as f:
                 f.write(dedent(conf_body))
-            app = wsgi.loadapp(conf_path)
+            # Container sharding container server requires an objct ring
+            with mock.patch('swift.common.ring.Ring'):
+                app = wsgi.loadapp(conf_path)
             self.assertTrue(isinstance(app, controller))
 
     def test_pipeline_property(self):

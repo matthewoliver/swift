@@ -62,6 +62,7 @@ from six.moves import range
 from six.moves.urllib.parse import ParseResult
 from six.moves.urllib.parse import quote as _quote
 from six.moves.urllib.parse import urlparse as stdlib_urlparse
+from six import string_types
 
 from swift import gettext_ as _
 import swift.common.exceptions
@@ -3873,3 +3874,174 @@ def get_md5_socket():
         raise IOError(ctypes.get_errno(), "Failed to accept MD5 socket")
 
     return md5_sockfd
+
+class PivotRange(object):
+    def __init__(self, name=None, lower=None, upper=None, timestamp=None):
+        self._name = name
+        self._lower = lower
+        self._upper = upper
+        self._timestamp = timestamp
+
+    @property
+    def name(self):
+        return self._name
+
+    @name.setter
+    def name(self, name):
+        self._name = name
+
+    @property
+    def lower(self):
+        return self._lower
+
+    @lower.setter
+    def lower(self, lower):
+        self._lower = lower
+
+    @property
+    def upper(self):
+        return self._upper
+
+    @upper.setter
+    def upper(self, upper):
+        self._upper = upper
+
+    @property
+    def timestamp(self):
+        return self._timestamp
+
+    def __contains__(self, item):
+        if not self._lower and not self._upper:
+            # No limits so must match
+            return True
+        elif not self._lower:
+            return item <= self._upper
+        elif not self._upper:
+            return self.lower < item
+        else:
+            return self.lower < item <= self._upper
+
+    def __lt__(self, other):
+        if self._upper is None:
+            return False
+        if isinstance(other, PivotRange):
+            return self._upper < other.lower or self._lower < other.lower
+        else:
+            return self._upper < other
+
+    def __gt__(self, other):
+        if self._lower is None:
+            return False
+        if isinstance(other, PivotRange):
+            return self._lower >= other.upper or self._upper > other.upper
+        else:
+            return self._lower >= other
+
+    def __eq__(self, other):
+        if not isinstance(other, PivotRange):
+            return False
+        return self._lower == other.lower and self._upper == other.upper
+
+    def __repr__(self):
+        return '(%s to %s as of %s)' % (self.lower, self.upper, self.timestamp)
+
+    def entire_namespace(self):
+        return self._lower is None and self._upper is None
+
+    def overlaps(self, other):
+        if not isinstance(other, PivotRange):
+            return False
+        if self.lower is None and other.lower is None:
+            return True
+        elif self.upper is None and other.upper is None:
+            return True
+        elif self.entire_namespace() or other.entire_namespace():
+            return True
+        elif self.upper is None:
+            return other.upper > self.lower
+        elif other.upper is None:
+            return self.upper > other.lower
+        return other.upper > self._upper > other.lower or \
+               other.upper > self._lower > other.lower or \
+               self._upper > other.upper > self._lower or \
+               self._upper > other.lower > self._lower or \
+               (self._upper > other.upper and self._lower < other.lower) or \
+               (other.lower < self._lower and other.upper > self._upper)
+
+    def newer(self, other):
+        if self._timestamp:
+            return self._timestamp > other.timestamp
+        else:
+            return False
+
+
+def find_pivot_range(item, ranges):
+    """
+
+    :param item: The item that that need to be placed
+    :param ranges: Byte order sorted list of ranges.
+    :return:
+    """
+    lower_bound = 0
+    upper_bound = len(ranges)
+    index = upper_bound / 2
+    try:
+        while item not in ranges[index]:
+            if ranges[index] < item:
+                lower_bound = index + 1
+            else:
+                upper_bound = index - 1
+            index = lower_bound + ((upper_bound - lower_bound) / 2)
+
+        return ranges[index]
+    except Exception:
+        return None
+
+
+def pivot_to_pivot_container(account, container, pivot=None, pivot_range=None):
+        """
+        Using a specified pivot range or pivot name and generate the required
+        sharded account and container name.
+
+        Given something like ``acc, cont, orange`` it will return:
+
+            .sharded_acc cont_orange
+
+        :param account: The root container's account
+        :param container: The root container
+        :param pivot: The pivot name to use
+        :param pivot_range: specify a pivotRange object to use
+        :return: A tuple of (account, container) representing the sharded
+                 container.
+        """
+        if not pivot and not pivot_range:
+            return account, container
+        if pivot_range and pivot_range.name == container:
+            # The root container is a range.
+            return account, container
+        acc = ".sharded_%s" % account
+        cont = "%s_%s" % (container, pivot) if not pivot_range \
+            else pivot_range.name
+        return acc, cont
+
+
+def verify_pivot_usage_header(value):
+    """
+    Takes in the value of a pivot usage header (X-Backend-Pivot-Used-Bytes or
+    X-Backend-Pivot-Object-Count), which takes the form of:
+
+    "[+-]<int>"
+
+    The + or - allows to increment the existing count, without these it's
+    setting to total counts.
+
+    :param value: The header value.
+    :return: True if its a valid header, False otherwise.
+    """
+    if not isinstance(value, string_types):
+        return False
+    try:
+        int(value)
+    except ValueError:
+        return False
+    return True

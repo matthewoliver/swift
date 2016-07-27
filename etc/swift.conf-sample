@@ -182,3 +182,9 @@ aliases = yellow, orange
 # api versions are by default excluded from /info.
 
 # valid_api_versions = v1,v1.0
+
+# shard_container_size defines the size at which a container with container-sharding
+# enabled would start to shard. It also indirectly determines how big a slice to take
+# off a container when sharding, the slice size being shard_container_size // 2.
+#
+#shard_container_size = 1000000

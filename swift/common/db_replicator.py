@@ -332,6 +332,7 @@ class Replicator(Daemon):
             point = objects[-1]['ROWID']
             objects = broker.get_items_since(point, self.per_diff)
         if objects:
+            self._sync_other_items(broker, local_id, http)
             self.logger.debug(
                 'Synchronization for %s has fallen more than '
                 '%s rows behind; moving on and will try again next pass.',
@@ -339,6 +340,9 @@ class Replicator(Daemon):
             self.stats['diff_capped'] += 1
             self.logger.increment('diff_caps')
         else:
+            self._sync_other_items(broker, local_id, http)
+
+            # Now merge_syncs
             with Timeout(self.node_timeout):
                 response = http.replicate('merge_syncs', sync_table)
             if response and 200 <= response.status < 300:
@@ -347,6 +351,32 @@ class Replicator(Daemon):
                                    incoming=False)
                 return True
         return False
+
+    def _sync_other_items(self, broker, local_id, http):
+
+        # Attempt to sync other items
+        # Note the following will have to be cleaned up at some point. The
+        # hook here is to grab other items (non-objects) to replicate,
+        # namely the pivot points stored in a container database. The
+        # number of these should always been _much_ less then normal
+        # objects, however for completeness we should probably have a
+        # limit and pointer here too.
+        other_items = self._other_items_hook(broker)
+        if other_items:
+            with Timeout(self.node_timeout):
+                response = http.replicate('merge_items', other_items,
+                                            local_id)
+            if not response or response.status >= 300 \
+                    or response.status < 200:
+                if response:
+                    self.logger.error(_('ERROR Bad response %(status)s '
+                                        'from %(host)s'),
+                                        {'status': response.status,
+                                        'host': http.host})
+                return False
+
+    def _other_items_hook(self, broker):
+        return []
 
     def _in_sync(self, rinfo, info, broker, local_sync):
         """
@@ -438,7 +468,7 @@ class Replicator(Daemon):
             # rsync then do a remote merge.
             # NOTE: difference > per_diff stops us from dropping to rsync
             # on smaller containers, who have only a few rows to sync.
-            if rinfo['max_row'] / float(info['max_row']) < 0.5 and \
+            if rinfo['max_row'] / float(info['max_row']) < 0.55 and \
                     info['max_row'] - rinfo['max_row'] > self.per_diff:
                 self.stats['remote_merge'] += 1
                 self.logger.increment('remote_merges')
@@ -474,6 +504,9 @@ class Replicator(Daemon):
         shouldbehere = True
         try:
             broker = self.brokerclass(object_file, pending_timeout=30)
+            if self._is_locked(broker):
+                #TODO should do something about stats here.
+                return
             broker.reclaim(now - self.reclaim_age,
                            now - (self.reclaim_age * 2))
             info = broker.get_replication_info()
@@ -671,6 +704,9 @@ class Replicator(Daemon):
             if elapsed < self.interval:
                 sleep(self.interval - elapsed)
 
+    def _is_locked(self, broker):
+        return False
+
 
 class ReplicatorRpc(object):
     """Handle Replication RPC calls.  TODO(redbo): document please :)"""
@@ -822,9 +858,17 @@ class ReplicatorRpc(object):
             point = objects[-1]['ROWID']
             objects = existing_broker.get_items_since(point, 1000)
             sleep()
+        # Note the following hook will need to change to using a pointer and
+        # limit in the future.
+        other_items = self._other_items_hook(existing_broker)
+        if other_items:
+            new_broker.merge_items(other_items)
         new_broker.newid(args[0])
         renamer(old_filename, db_file)
         return HTTPNoContent()
+
+    def _other_items_hook(self, broker):
+        return []
 
 # Footnote [1]:
 #   This orders the nodes so that, given nodes a b c, a will contact b then c,
