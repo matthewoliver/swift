@@ -27,8 +27,8 @@ from six.moves import range
 import sqlite3
 
 from swift.common.utils import Timestamp, encode_timestamps, decode_timestamps, \
-    extract_swift_bytes, PivotRange
-from swift.common.db import DatabaseBroker, utf8encode
+    extract_swift_bytes, PivotRange, hash_path
+from swift.common.db import DatabaseBroker, utf8encode, BROKER_TIMEOUT
 from swift.common.constraints import SHARD_CONTAINER_SIZE
 
 
@@ -38,6 +38,11 @@ DATADIR = 'containers'
 
 RECORD_TYPE_OBJECT = 0
 RECORD_TYPE_PIVOT_NODE = 1
+
+DB_STATE_NOTFOUND = 0
+DB_STATE_UNSHARDED = 1
+DB_STATE_SHARDING = 2
+DB_STATE_SHARDED = 3
 
 POLICY_STAT_TABLE_CREATE = '''
     CREATE TABLE policy_stat (
@@ -288,6 +293,42 @@ class ContainerBroker(DatabaseBroker):
     db_type = 'container'
     db_contains_type = 'object'
     db_reclaim_timestamp = 'created_at'
+
+    def __init__(self, db_file, timeout=BROKER_TIMEOUT, logger=None,
+                 account=None, container=None, pending_timeout=None,
+                 stale_reads_ok=False):
+        super(ContainerBroker, self).__init__(db_file, timeout, logger,
+              account, container, pending_timeout, stale_reads_ok)
+        hsh = hash_path(self.account, self.container)
+        self._pivot_db_file = os.path.join(self.db_dir, hsh + "_pivot.db")
+
+        # The auditor will create a backend using the pivot_db as the db_file.
+        if self._pivot_db_file == self._db_file:
+            self._db_file = ''
+
+    def get_db_state(self):
+        db_exists = os.path.exists(self._db_file)
+        pivot_exists = os.path.exists(self._pivot_db_file)
+        if db_exists and not pivot_exists:
+            return DB_STATE_UNSHARDED
+        elif db_exists and pivot_exists:
+            return DB_STATE_SHARDING
+        elif not db_exists and pivot_exists:
+            return DB_STATE_SHARDED
+        else:
+            # Both Pivot db and db doesn't doesn't exist.
+            return DB_STATE_NOTFOUND
+
+    @property
+    def db_file(self):
+        db_state = self.get_db_state()
+        if db_state in (DB_STATE_NOTFOUND, DB_STATE_UNSHARDED):
+            return self._db_file
+        elif db_state in (DB_STATE_SHARDING, DB_STATE_SHARDED):
+            return self._pivot_db_file
+
+    def _db_exists(self):
+        return not self.get_db_state() == DB_STATE_NOTFOUND
 
     @property
     def storage_policy_index(self):
@@ -606,7 +647,8 @@ class ContainerBroker(DatabaseBroker):
         :returns: a tuple, in the form (info, is_deleted) info is a dict as
                   returned by get_info and is_deleted is a boolean.
         """
-        if self.db_file != ':memory:' and not os.path.exists(self.db_file):
+        if self._db_file != ':memory:' and \
+                self.get_db_state() == DB_STATE_NOTFOUND:
             return {}, True
         info = self.get_info()
         return info, self._is_deleted_info(**info)

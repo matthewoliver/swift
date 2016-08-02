@@ -29,8 +29,9 @@ import pickle
 import json
 
 from swift.container.backend import ContainerBroker, \
-    update_new_item_from_existing
-from swift.common.utils import Timestamp, encode_timestamps
+    update_new_item_from_existing, DB_STATE_NOTFOUND, DB_STATE_UNSHARDED, \
+    DB_STATE_SHARDING, DB_STATE_SHARDED
+from swift.common.utils import Timestamp, encode_timestamps, hash_path
 from swift.common.storage_policy import POLICIES
 
 import mock
@@ -46,7 +47,7 @@ class TestContainerBroker(unittest.TestCase):
     def test_creation(self):
         # Test ContainerBroker.__init__
         broker = ContainerBroker(':memory:', account='a', container='c')
-        self.assertEqual(broker.db_file, ':memory:')
+        self.assertEqual(broker._db_file, ':memory:')
         broker.initialize(Timestamp('1').internal, 0)
         with broker.get() as conn:
             curs = conn.cursor()
@@ -618,6 +619,75 @@ class TestContainerBroker(unittest.TestCase):
         # and metadata timestamps
         broker = ContainerBroker(':memory:', account='a', container='c')
         self._test_put_object_multiple_encoded_timestamps(broker)
+
+    @with_tempdir
+    def test_get_db_state(self, tempdir):
+        # test that the get db state code. This checks for existence of the
+        # db_file and/or the pivot_fb_file.
+        acct = 'account'
+        cont = 'continer'
+        hsh = hash_path(acct, cont)
+        db_file = "%s.db" % hsh
+        db_pivot_file = "%s_pivot.db" % hsh
+        db_path = os.path.join(tempdir, db_file)
+        db_pivot_path = os.path.join(tempdir, db_pivot_file)
+        ts = Timestamp(time())
+
+        # First test NOTFOUND state
+        broker = ContainerBroker(db_path, account=acct, container=cont)
+        self.assertEqual(broker.get_db_state(), DB_STATE_NOTFOUND)
+
+        # Test UNSHARDED state, that is when db_file exists and pivot_db_file
+        # doesn't
+        broker.initialize(ts.internal, 0)
+        self.assertEqual(broker.get_db_state(), DB_STATE_UNSHARDED)
+
+        # Test the SHARDING state, this is the period when both the db_file and
+        # the pivot_db_file exist
+        piv_broker = ContainerBroker(db_pivot_path, account=acct,
+                                     container=cont)
+        piv_broker.initialize(ts.internal, 0)
+        self.assertEqual(broker.get_db_state(), DB_STATE_SHARDING)
+
+        # Finally test the SHARDED state, this is when only pivot_db_file
+        # exists.
+        os.unlink(db_path)
+        self.assertEqual(broker.get_db_state(), DB_STATE_SHARDED)
+
+    @with_tempdir
+    def test_db_file_property(self, tempdir):
+        # test that the get db state code. This checks for existence of the
+        # db_file and/or the pivot_fb_file.
+        acct = 'account'
+        cont = 'continer'
+        hsh = hash_path(acct, cont)
+        db_file = "%s.db" % hsh
+        db_pivot_file = "%s_pivot.db" % hsh
+        db_path = os.path.join(tempdir, db_file)
+        db_pivot_path = os.path.join(tempdir, db_pivot_file)
+        ts = Timestamp(time())
+
+        # First test NOTFOUND state, this will return the default db_file
+        broker = ContainerBroker(db_path, account=acct, container=cont)
+        self.assertEqual(broker.db_file, db_path)
+
+        # Test UNSHARDED state, that is when db_file exists and pivot_db_file
+        # doesn't, so it should return the db_path
+        broker.initialize(ts.internal, 0)
+        self.assertEqual(broker.db_file, db_path)
+
+        # Test the SHARDING state, this is the period when both the db_file and
+        # the pivot_db_file exist, in this case it should return the
+        # pivot_db_path
+        piv_broker = ContainerBroker(db_pivot_path, account=acct,
+                                     container=cont)
+        piv_broker.initialize(ts.internal, 0)
+        self.assertEqual(broker.db_file, db_pivot_path)
+
+        # Finally test the SHARDED state, this is when only pivot_db_file
+        # exists, so obviously this should return the pivot_db_path
+        os.unlink(db_path)
+        self.assertEqual(broker.db_file, db_pivot_path)
 
     @with_tempdir
     def test_put_object_multiple_encoded_timestamps_using_file(self, tempdir):
