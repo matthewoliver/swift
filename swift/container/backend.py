@@ -43,6 +43,11 @@ DB_STATE_NOTFOUND = 0
 DB_STATE_UNSHARDED = 1
 DB_STATE_SHARDING = 2
 DB_STATE_SHARDED = 3
+DB_STATE = [
+    'notfound',
+    'unsharded',
+    'sharding',
+    'sharded']
 
 POLICY_STAT_TABLE_CREATE = '''
     CREATE TABLE policy_stat (
@@ -1478,3 +1483,36 @@ class ContainerBroker(DatabaseBroker):
     def has_sharding_lock(self):
         lockpath = '%s/.sharding' % self.db_dir
         return os.path.exists(lockpath)
+
+    def set_sharding_state(self):
+        db_state = self.get_db_state()
+        if not db_state == DB_STATE_UNSHARDED:
+            self.logger.warn("Container '%s/%s' cannot be set to sharding "
+                             "state while in %s state", self.account,
+                             self.container, DB_STATE[db_state])
+            return False
+
+        # For this initial version, we'll create a new container along side.
+        # Later we will remove parts so the pivot DB only has what it really
+        # needs
+        sub_broker = ContainerBroker(self._pivot_db_file, self.timeout,
+                                     self.logger, self.account, self.container,
+                                     self.pending_timeout, self.stale_reads_ok)
+        sub_broker.initialize(Timestamp(time.time()).internal,
+                              self.storage_policy_index)
+        sub_broker.update_metadata(self.metadata)
+
+        # TODO do we need to sync the sync points? that is if we want to
+        #      continue to replicate
+        return True
+
+    def set_sharded_state(self):
+        db_state = self.get_db_state()
+        if not db_state == DB_STATE_SHARDING:
+            self.logger.warn("Container '%s/%s' cannot be set to sharded "
+                             "state while in %s state", self.account,
+                             self.container, DB_STATE[db_state])
+            return False
+
+        # TODO add some checks to see if we are ready to unlink the old db
+        os.unlink(self._db_file)
