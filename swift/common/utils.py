@@ -3987,18 +3987,21 @@ def find_pivot_range(item, ranges):
     index = upper_bound / 2
     try:
         while item not in ranges[index]:
+            last_index = index
             if ranges[index] < item:
                 lower_bound = index + 1
             else:
                 upper_bound = index - 1
             index = lower_bound + ((upper_bound - lower_bound) / 2)
+            if last_index == index:
+                return None
 
         return ranges[index]
     except Exception:
         return None
 
 
-def pivot_to_pivot_container(account, container, pivot=None, pivot_range=None):
+def pivot_to_pivot_container(account, container, pivot=None):
         """
         Using a specified pivot range or pivot name and generate the required
         sharded account and container name.
@@ -4009,21 +4012,19 @@ def pivot_to_pivot_container(account, container, pivot=None, pivot_range=None):
 
         :param account: The root container's account
         :param container: The root container
-        :param pivot: The pivot name to use
-        :param pivot_range: specify a pivotRange object to use
+        :param pivot: The pivot range object
         :return: A tuple of (account, container) representing the sharded
                  container.
         """
-        if not pivot and not pivot_range:
+        if not pivot:
             return account, container
-        if pivot_range and pivot_range.name == container:
-            # The root container is a range.
-            return account, container
-        acc = ".sharded_%s" % account
-        cont = "%s_%s" % (container, pivot) if not pivot_range \
-            else pivot_range.name
-        return acc, cont
+        acc = account_to_pivot_account(account)
+        return acc, pivot.name
 
+def account_to_pivot_account(account):
+    if not account:
+        return account
+    return ".sharded_%s" % account
 
 def verify_pivot_usage_header(value):
     """

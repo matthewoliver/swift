@@ -712,7 +712,7 @@ class ContainerBroker(DatabaseBroker):
             self.container = data['container']
 
             data['pivot_point'] = \
-                self.get_possible_pivot_point(connection=conn)
+                self.get_next_pivot_point(connection=conn)
 
             return data
 
@@ -841,7 +841,7 @@ class ContainerBroker(DatabaseBroker):
 
     def list_objects_iter(self, limit, marker, end_marker, prefix, delimiter,
                           path=None, storage_policy_index=0, reverse=False,
-                          include_end_marker=False):
+                          include_end_marker=False, include_deleted=False):
         """
         Get a list of objects sorted by name starting at marker onward, up
         to limit entries.  Entries will begin with the prefix and will not
@@ -857,9 +857,10 @@ class ContainerBroker(DatabaseBroker):
         :param storage_policy_index: storage policy index for query
         :param reverse: reverse the result order.
         :param include_end_marker: Include the item at end_marker in results
+        :param include_deleted: Include items that have the delete marker set
 
         :returns: list of tuples of (name, created_at, size, content_type,
-                  etag)
+                  etag, deleted)
         """
         delim_force_gte = False
         (marker, end_marker, prefix, delimiter, path) = utf8encode(
@@ -881,8 +882,12 @@ class ContainerBroker(DatabaseBroker):
         with self.get() as conn:
             results = []
             while len(results) < limit:
-                query = '''SELECT name, created_at, size, content_type, etag
-                           FROM object WHERE'''
+                query = 'SELECT name, created_at, size, content_type, etag'
+                if self.get_db_version(conn) < 1:
+                    query += ', +deleted '
+                else:
+                    query += ', deleted '
+                query += 'FROM object WHERE'
                 query_args = []
                 if end_marker and (not prefix or end_marker < end_prefix):
                     if include_end_marker:
@@ -895,20 +900,21 @@ class ContainerBroker(DatabaseBroker):
                     query_args.append(end_prefix)
 
                 if delim_force_gte:
-                    query += ' name >= ? AND'
+                    query += ' name >= ? '
                     query_args.append(marker)
                     # Always set back to False
                     delim_force_gte = False
                 elif marker and marker >= prefix:
-                    query += ' name > ? AND'
+                    query += ' name > ? '
                     query_args.append(marker)
                 elif prefix:
-                    query += ' name >= ? AND'
+                    query += ' name >= ? '
                     query_args.append(prefix)
-                if self.get_db_version(conn) < 1:
-                    query += ' +deleted = 0'
-                else:
-                    query += ' deleted = 0'
+                if not include_deleted:
+                    if self.get_db_version(conn) < 1:
+                        query += 'AND +deleted = 0'
+                    else:
+                        query += 'AND deleted = 0'
                 orig_tail_query = '''
                     ORDER BY name %s LIMIT ?
                 ''' % ('DESC' if reverse else '')
@@ -1408,15 +1414,13 @@ class ContainerBroker(DatabaseBroker):
             ranges.append(PivotRange(node[0], node[2], node[3], node[1]))
         return ranges
 
-    def _get_possible_pivot_point(self, conn):
+    def _get_next_pivot_point(self, last_upper, conn):
         try:
-            lower = self.metadata.get(
-                'X-Container-Sysmeta-Shard-Lower', ['', ''])[0]
             offset = int(SHARD_CONTAINER_SIZE) // 2
 
             sql = 'SELECT name FROM object WHERE deleted=0 '
-            if lower:
-                sql += "AND name > '%s' " % lower
+            if last_upper:
+                sql += "AND name > '%s' " % last_upper
             sql += "ORDER BY name LIMIT 1 OFFSET %d;" % offset
             data = conn.execute(sql)
             if data:
@@ -1427,7 +1431,7 @@ class ContainerBroker(DatabaseBroker):
         except Exception:
             return ''
 
-    def get_possible_pivot_point(self, connection=None):
+    def get_next_pivot_point(self, last_upper=None, connection=None):
         """
         Finds the middle entry of the table that could be used as a pivot
         point when sharding. It finds the middle object and returns it.
@@ -1440,10 +1444,10 @@ class ContainerBroker(DatabaseBroker):
 
         self._commit_puts_stale_ok()
         if connection:
-            return self._get_possible_pivot_point(connection)
+            return self._get_next_pivot_point(last_upper, connection)
         else:
             with self.get() as conn:
-                return self._get_possible_pivot_point(conn)
+                return self._get_next_pivot_point(last_upper, conn)
 
     def is_shrinking(self):
         return self.metadata.get('X-Container-Sysmeta-Shard-Merge') or \
@@ -1492,6 +1496,12 @@ class ContainerBroker(DatabaseBroker):
                              self.container, DB_STATE[db_state])
             return False
 
+        # firstly lets ensure we have a connection, otherwise we could start
+        # playing with the wrong database while setting up the pivot database
+        if not self.conn:
+            with self.get():
+                pass
+
         # For this initial version, we'll create a new container along side.
         # Later we will remove parts so the pivot DB only has what it really
         # needs
@@ -1502,8 +1512,37 @@ class ContainerBroker(DatabaseBroker):
                               self.storage_policy_index)
         sub_broker.update_metadata(self.metadata)
 
-        # TODO do we need to sync the sync points? that is if we want to
-        #      continue to replicate
+        # If there are pivot_ranges defined.. which can happen when the scanner
+        # node finds the first pivot then replicates out to the others who
+        # are still in the UNSHARDED state.
+        pivot_ranges = self.get_pivot_ranges()
+        if pivot_ranges:
+            sub_broker.merge_items(self._record_to_dict(
+                pivot_ranges, record_type=RECORD_TYPE_PIVOT_NODE))
+
+        # We also need to sync the sync tables as we have no idea how long
+        # sharding will take and we want to be able to continue replication
+        # (albeit we only ever usync in sharding state, but we need to keep
+        # the sync point mutable)
+        for incoming in (True, False):
+            syncs = self.get_syncs(incoming)
+            sub_broker.merge_syncs(syncs, incoming)
+
+        # Initialise the rowid to continue from where the last one ended
+        max_row = self.get_max_row()
+        with sub_broker.get() as conn:
+            try:
+                sql = "INSERT into object " \
+                      "(ROWID, name, created_at, size, content_type, etag) " \
+                    "values (?, 'pivted_remove', ?, 0, '', ?);"
+                conn.execute(sql, max_row, Timestamp(time.time()).internal,
+                             '68b329da9893e34099c7d8ad5cb9c940')
+                conn.execute('DELETE FROM object WHERE ROWID = ?;', max_row)
+            except sqlite3.OperationalError as err:
+                self.logger.error(_('Failed to set the ROWID of the pivot '
+                                    'database for %s/%s: ?'), self.account,
+                                  self.container, err)
+
         return True
 
     def set_sharded_state(self):
@@ -1516,3 +1555,50 @@ class ContainerBroker(DatabaseBroker):
 
         # TODO add some checks to see if we are ready to unlink the old db
         os.unlink(self._db_file)
+
+    def get_brokers(self):
+        brokers = []
+        state = self.get_db_state()
+        if state != DB_STATE_SHARDING:
+            brokers.append(ContainerBroker(
+                self.db_file, self.timeout, self.logger, self.account,
+                self.container, self.pending_timeout, self.stale_reads_ok))
+        else:
+            brokers.append(ContainerBroker(
+                self._db_file, self.timeout, self.logger, self.account,
+                self.container, self.pending_timeout, self.stale_reads_ok))
+            brokers[0]._pivot_db_file = self._db_file
+            brokers.append(ContainerBroker(
+                self._pivot_db_file, self.timeout, self.logger, self.account,
+                self.container, self.pending_timeout, self.stale_reads_ok))
+        return brokers
+
+    def get_items_since(self, start, count):
+        """
+        Get a list of objects in the database between start and end.
+
+        :param start: start ROWID
+        :param count: number to get
+        :returns: list of objects between start and end
+        """
+        if self.get_db_state() == DB_STATE_SHARDING:
+            # When in sharding state the there are 2 databases that may
+            # contain the items. So based on where the point and the max_row
+            # of the old readonly database we can figure out where to read from.
+            self._create_connection(self._db_file)
+            old_max_row = self.get_max_row()
+            if old_max_row > start:
+                self._create_connection(self._pivot_db_file)
+                return \
+                    super(ContainerBroker, self).get_items_since(start, count)
+
+            objs = super(ContainerBroker, self).get_items_since(start, count)
+            if objs[-1]['ROWID'] < old_max_row or len(objs) == count:
+                return objs
+
+            self._create_connection(self._pivot_db_file)
+            objs.extend(super(ContainerBroker, self).get_items_since(
+                old_max_row, count - len(objs)))
+            return objs
+        else:
+            return super(ContainerBroker, self).get_items_since(start, count)

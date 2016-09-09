@@ -235,7 +235,7 @@ class Replicator(Daemon):
         """
         Sync a single file using rsync. Used by _rsync_db to handle syncing.
 
-        :param db_file: file to be synced
+        :param db_file: file or list of files to be synced
         :param remote_file: remote location to sync the DB file to
         :param whole-file: if True, uses rsync's --whole-file flag
         :param different_region: if True, the destination node is in a
@@ -254,13 +254,20 @@ class Replicator(Daemon):
             # a different region than the local one.
             popen_args.append('--compress')
 
-        popen_args.extend([db_file, remote_file])
-        proc = subprocess.Popen(popen_args)
-        proc.communicate()
-        if proc.returncode != 0:
-            self.logger.error(_('ERROR rsync failed with %(code)s: %(args)s'),
-                              {'code': proc.returncode, 'args': popen_args})
-        return proc.returncode == 0
+        if not isinstance(db_file, (list, tuple)):
+            db_file = [db_file]
+
+        for db_f in db_file:
+            args = popen_args.copy()
+            args.extend([db_f, remote_file])
+            proc = subprocess.Popen(popen_args)
+            proc.communicate()
+            if proc.returncode != 0:
+                self.logger.error(
+                    _('ERROR rsync failed with %(code)s: %(args)s'),
+                    {'code': proc.returncode, 'args': popen_args})
+                return False
+        return True
 
     def _rsync_db(self, broker, device, http, local_id,
                   replicate_method='complete_rsync', replicate_timeout=None,
@@ -280,8 +287,9 @@ class Replicator(Daemon):
         rsync_module = rsync_module_interpolation(self.rsync_module, device)
         rsync_path = '%s/tmp/%s' % (device['device'], local_id)
         remote_file = '%s/%s' % (rsync_module, rsync_path)
+        db_files = [b.db_file for b in broker.get_brokers()]
         mtime = os.path.getmtime(broker.db_file)
-        if not self._rsync_file(broker.db_file, remote_file,
+        if not self._rsync_file(db_files, remote_file,
                                 different_region=different_region):
             return False
         # perform block-level sync if the db was modified during the first sync
@@ -289,12 +297,13 @@ class Replicator(Daemon):
                 os.path.getmtime(broker.db_file) > mtime:
             # grab a lock so nobody else can modify it
             with broker.lock():
-                if not self._rsync_file(broker.db_file, remote_file,
+                if not self._rsync_file(db_files, remote_file,
                                         whole_file=False,
                                         different_region=different_region):
                     return False
+        db_filenames = [os.path.basename(d) for d in db_files]
         with Timeout(replicate_timeout or self.node_timeout):
-            response = http.replicate(replicate_method, local_id)
+            response = http.replicate(replicate_method, local_id, db_filenames)
         return response and 200 <= response.status < 300
 
     def _usync_db(self, point, broker, http, remote_id, local_id):
@@ -469,7 +478,8 @@ class Replicator(Daemon):
             # NOTE: difference > per_diff stops us from dropping to rsync
             # on smaller containers, who have only a few rows to sync.
             if rinfo['max_row'] / float(info['max_row']) < 0.55 and \
-                    info['max_row'] - rinfo['max_row'] > self.per_diff:
+                    info['max_row'] - rinfo['max_row'] > self.per_diff and \
+                    len(broker.get_brokers()) == 1:
                 self.stats['remote_merge'] += 1
                 self.logger.increment('remote_merges')
                 return self._rsync_db(broker, node, http, info['id'],
@@ -835,14 +845,31 @@ class ReplicatorRpc(object):
         return HTTPAccepted()
 
     def complete_rsync(self, drive, db_file, args):
-        old_filename = os.path.join(self.root, drive, 'tmp', args[0])
-        if os.path.exists(db_file):
-            return HTTPNotFound()
-        if not os.path.exists(old_filename):
-            return HTTPNotFound()
-        broker = self.broker_class(old_filename)
-        broker.newid(args[0])
-        renamer(old_filename, db_file)
+        local_id = args.pop(0)
+        filenames = []
+        if args:
+            filenames = args.pop(0)
+        num_files = max(len(filenames), 1)
+        completed = 0
+        while completed < num_files:
+            if not filenames:
+                filename = local_id
+            else:
+                filename = "%s%s" % (local_id, filenames[completed])
+            old_filename = os.path.join(self.root, drive, 'tmp', filename)
+            if os.path.exists(db_file):
+                return HTTPNotFound()
+            if not os.path.exists(old_filename):
+                return HTTPNotFound()
+            broker = self.broker_class(old_filename)
+            broker.newid(local_id)
+            if len(filenames) > 1:
+                basename = os.path.basename(old_filename)
+                basename = basename[len(local_id):]
+                db_filename = os.path.join(os.path.dirname(db_file), basename)
+                renamer(old_filename, db_filename)
+            renamer(old_filename, db_file)
+            completed += 1
         return HTTPNoContent()
 
     def rsync_then_merge(self, drive, db_file, args):

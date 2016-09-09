@@ -20,12 +20,14 @@ import time
 
 from swift import gettext_ as _
 from random import random
+from hashlib import md5
 
 from eventlet import Timeout
 
 from swift.container.replicator import ContainerReplicator
 from swift.container.backend import ContainerBroker, DATADIR, \
-    RECORD_TYPE_PIVOT_NODE, RECORD_TYPE_OBJECT
+    RECORD_TYPE_PIVOT_NODE, RECORD_TYPE_OBJECT, DB_STATE, DB_STATE_NOTFOUND, \
+    DB_STATE_UNSHARDED, DB_STATE_SHARDING, DB_STATE_SHARDED
 from swift.common import internal_client, db_replicator
 from swift.common.bufferedhttp import http_connect
 from swift.common.db import DatabaseAlreadyExists
@@ -37,7 +39,8 @@ from swift.common.ring.utils import is_local_device
 from swift.common.utils import get_logger, config_true_value, \
     dump_recon_cache, whataremyips, hash_path, \
     storage_directory, Timestamp, PivotRange, pivot_to_pivot_container, \
-    find_pivot_range, ismount, majority_size, GreenAsyncPile
+    find_pivot_range, ismount, majority_size, GreenAsyncPile, \
+    account_to_pivot_account
 from swift.common.wsgi import ConfigString
 from swift.common.storage_policy import POLICIES
 
@@ -89,6 +92,12 @@ use = egg:swift#catch_errors
 # See proxy-server.conf-sample for options
 """.lstrip()
 
+PR_NAME = 0
+PR_CREATED_AT = 1
+PR_LOWER = 2
+PR_UPPER = 3
+PR_OBJECT_COUNT = 4
+PR_BYTES_USED = 5
 
 class ContainerSharder(ContainerReplicator):
     """Shards containers."""
@@ -103,10 +112,12 @@ class ContainerSharder(ContainerReplicator):
 
         self.shard_shrink_point = \
             float(conf.get('shard_shrink_point', 50) / 100.0)
-        self.shard_shrink_merge_point = \
+        self.shrink_merge_point = \
             float(conf.get('shard_shrink_merge_point', 75) / 100.0)
-        self.shard_split_size = SHARD_CONTAINER_SIZE // 2
+        self.split_size = SHARD_CONTAINER_SIZE // 2
         self.cpool = GreenAsyncPile(self.cpool)
+        self.scanner_batch_size = int(conf.get('shard_scanner_batch_size', 10))
+        self.shard_batch_size = int(conf.get('shard_shard_batch_size', 2))
 
         # internal client
         self.conn_timeout = float(conf.get('conn_timeout', 5))
@@ -153,7 +164,7 @@ class ContainerSharder(ContainerReplicator):
 
     def _get_pivot_ranges(self, account, container, newest=False):
         path = self.swift.make_path(account, container) + \
-            '?nodes=pivot&format=json'
+            '?items=pivot&format=json'
         headers = dict()
         if newest:
             headers['X-Newest'] = 'true'
@@ -263,6 +274,12 @@ class ContainerSharder(ContainerReplicator):
             else:
                 objs.append(obj)
         return objs
+
+    def _get_node_index(self):
+        nodes = self.ring.get_part_nodes(self.part)
+        indices = [node['index'] for node in nodes
+                   if node['id'] == self.node_id]
+        return indices[0] if indices else None
 
     def _add_shard_metadata(self, broker, root_account, root_container,
                             pivot):
@@ -553,6 +570,24 @@ class ContainerSharder(ContainerReplicator):
                  tmp_info['object_count'], tmp_info['bytes_used'])
         self._update_pivot_ranges(root_account, root_container, 'PUT', [pivot])
 
+    def get_metadata_item(self, broker, header):
+        item = broker.metadata.get(header)
+        return None if item is None else item[0]
+
+    @staticmethod
+    def roundrobin_datadirs(datadirs):
+        data = []
+        idx = {}
+        for datadir, node_idx in datadirs:
+            data.append(datadir)
+            idx[datadir[-1]] = node_idx
+
+        for cont in db_replicator.roundrobin_datadirs(data):
+            if cont:
+                yield list(cont) + [idx[cont[-1]]]
+            else:
+                raise StopIteration()
+
     def _one_shard_pass(self, reported):
         """
         The main function, everything the sharder does forks from this method.
@@ -587,8 +622,9 @@ class ContainerSharder(ContainerReplicator):
                 datadir = os.path.join(self.root, node['device'], self.datadir)
                 if os.path.isdir(datadir):
                     self._local_device_ids.add(node['id'])
-                    dirs.append((datadir, node['id']))
-        for part, path, node_id in db_replicator.roundrobin_datadirs(dirs):
+                    dirs.append(((datadir, node['id']), node['index']))
+        for part, path, node_id, node_idx in \
+                ContainerSharder.roundrobin_datadirs(dirs):
             broker = ContainerBroker(path)
             sharded = broker.metadata.get('X-Container-Sysmeta-Sharding') or \
                 broker.metadata.get('X-Container-Sysmeta-Shard-Account')
@@ -596,6 +632,8 @@ class ContainerSharder(ContainerReplicator):
                 # Not a shard container
                 continue
             self.ranges = []
+            self.node_idx = node_idx
+            self.node_id = node_id
             root_account, root_container = \
                 ContainerSharder.get_shard_root_path(broker)
             pivot = ContainerSharder.get_pivot_range(broker)
@@ -621,6 +659,10 @@ class ContainerSharder(ContainerReplicator):
                 # have new objects in sitting in them that may need to move.
                 continue
 
+            self.state = broker.get_db_state()
+            if self.state in (DB_STATE_SHARDED, DB_STATE_NOTFOUND):
+                continue
+
             self.shard_brokers = dict()
             self.shard_cleanups = dict()
 
@@ -631,35 +673,46 @@ class ContainerSharder(ContainerReplicator):
                     self._shrink(broker, root_account, root_container)
                     continue
 
-                # Sharding is 2 phase
-                # If a pivot point is defined, we shard on it.. if it isn't
-                # then we see if we need to find a pivot point and set it for
-                # the next parse to shard.
-                pivot_required = \
-                    broker.metadata.get('X-Container-Sysmeta-Shard-Pivoted')
-                pivot_required = False if pivot_required is None else \
-                    not config_true_value(pivot_required[0])
+                # The sharding mechanism is rather interesting. If the container
+                # requires sharding.. that is big enough and sharding hasn't
+                # started yet. Then we need to identify a primary node to scan
+                # for shards. The others will wait for shards to appear in there
+                # pivot_ranges table (via replication). They will start the
+                # sharding process
 
-                new_pivot = \
-                    broker.metadata.get('X-Container-Sysmeta-Shard-Pivot')
-                new_pivot = '' if new_pivot is None else new_pivot[0]
+                if self.state == DB_STATE_UNSHARDED:
+                    obj_count = broker.get_info()['object_count']
+                    if obj_count <= (SHARD_CONTAINER_SIZE *
+                                     self.shard_shrink_point):
+                        # Shrink
+                        self._shrink(broker, root_account, root_container)
+                    elif obj_count <= SHARD_CONTAINER_SIZE:
+                        continue
 
-                obj_count = broker.get_info()['object_count']
+                # We are either in the sharding state or we need to start
+                # sharding. So find out if this is suppose to be the scanning
+                # node, if defined
+                scan_idx = self.get_metadata_item(
+                    broker, 'X-Container-Sysmeta-Shard-Scanner')
+                scan_complete = config_true_value(self.get_metadata_item(
+                    broker, 'X-Container-Sysmeta-Sharding-Scan-Done'))
 
-                if new_pivot and pivot_required:
-                    # We need to shard on the pivot point
-                    self._shard_on_pivot(new_pivot, broker, root_account,
-                                         root_container, node_id)
-                elif obj_count > SHARD_CONTAINER_SIZE:
-                    # No pivot, so check to see if a pivot needs to be found.
-                    self._find_pivot_point(broker)
-                elif obj_count <= (SHARD_CONTAINER_SIZE *
-                                   self.shard_shrink_point):
-                    # Shrink
-                    self._shrink(broker, root_account, root_container)
+                if not scan_idx and not scan_complete:
+                    try:
+                        scan_idx = self._find_scanner_node(broker)
+                    except Exception:
+                        # todo log and continue
+                        continue
+
+                if scan_idx and scan_idx == self.node_id and not scan_complete:
+                    self._find_pivot_points(broker)
+                else:
+                    self._shard_on_pivot(broker, root_account,
+                                         root_container)
+            finally:
                 self._update_pivot_counts(root_account, root_container,
                                           broker)
-            finally:
+
                 # wipe out the cache do disable bypass in delete_db
                 cleanups = self.shard_cleanups
                 self.shard_cleanups = None
@@ -699,7 +752,7 @@ class ContainerSharder(ContainerReplicator):
         # return reported
 
     def _send_request(self, ip, port, contdevice, partition, op, path,
-                      headers_out={}):
+                      headers_out={}, node_id=None):
         if 'user-agent' not in headers_out:
             headers_out['user-agent'] = 'container-sharder %s' % \
                                         os.getpid()
@@ -711,11 +764,11 @@ class ContainerSharder(ContainerReplicator):
                                     op, path, headers_out)
             with Timeout(self.node_timeout):
                 response = conn.getresponse()
-                return response
+                return response, node_id
         except (Exception, Timeout) as x:
             self.logger.info(str(x))
             # Need to do something here.
-            return None
+            return None, node_id
 
     def _update_pivot_ranges(self, account, container, op, pivots):
         path = "/%s/%s" % (account, container)
@@ -766,6 +819,82 @@ class ContainerSharder(ContainerReplicator):
 
         return result
 
+    def _find_scanner_node(self, broker):
+        self.logger.info(_('Started searching for best node to be pivot point '
+                           'scanner for %s/%s'),
+                         broker.account, broker.container)
+        obj_count = [broker.get_info()['object_count']]
+        scanner_id = [self._get_node_index()]
+        scanner_ids = {}
+
+        def on_success(resp, node_id):
+            if not resp or not is_success(resp.status):
+                return False
+
+            found_scan_id = resp.getheader('X-Container-Sysmeta-Shard-Scanner')
+            found_obj_count = int(resp.getheader('X-Container-Object-Count'))
+
+            if found_scan_id:
+                if scanner_ids.get(found_scan_id):
+                    scanner_ids[found_scan_id] += 1
+                else:
+                    scanner_ids[found_scan_id] = 1
+
+            if found_obj_count > obj_count[0]:
+                obj_count[0] = found_obj_count
+                scanner_id[0] = node_id
+
+            return True
+
+        if not self._get_quorum(broker, success=on_success):
+            self.logger.info(_('Failed to reach quorum on a pivot scanner for '
+                               '%s/%s'), broker.account, broker.container)
+            return
+
+        # We have a quorum of responses but if there is already a node out
+        # there with a scan_id set, then this means that there was a quorum
+        # previously, and most probably this node failed the POSTing of the
+        # metadata OR the POSTing of the metadata failed to get quorum.
+        # In either case, we'll just use it, as replication should have/will
+        # move the scan_id around anyway. And a scanner will always ask for
+        # quorum before adding an item to pivot_ranges, so all should be good.
+        if scanner_ids:
+            if len(scanner_ids) > 1:
+                # find the most occurring or if a tie wait for replication to
+                # choose the best
+                max_id = max(scanner_ids.items(), key=lambda x: x[1])
+
+                # We need to make sure there isn't a tie, if there is we want
+                # to bail and let replication decide
+                max_ids = filter(lambda x: x == max_id[1], scanner_ids)
+                if len(max_ids) > 1:
+                    self.logger.warn(_("Cannot find a scanner node, too many "
+                                       "potential scanners nodes (%s). Leaving "
+                                       "for replication to determine."),
+                                     ",".join([ str(i) for i, c in max_ids]))
+                    return
+                scanner_id[0] = max_id[0]
+            else:
+                scanner_id[0] = scanner_ids.keys()[0]
+
+        # Found a node to be the scanner
+        headers = {'X-Container-Sysmeta-Shard-Scanner': scanner_id[0]}
+
+        timestamp = Timestamp(time.time()).internal
+        broker.update_metadata({
+            'X-Container-Sysmeta-Shard-Scanner': (scanner_id[0], timestamp)})
+
+        if not self._get_quorum(broker, op='POST', headers=headers):
+            self.logger.info(_('Failed to set node %d as the pivot scanner '
+                               'for %s/%s on remote servers'),
+                             scanner_id, broker.account, broker.container)
+            return
+
+        self.logger.info(_('Best pivot scanner for %s/%s is node %d'),
+                         broker.account, broker.container, scanner_id)
+
+        return scanner_id
+
     def _get_quorum(self, broker, success=None, quorum=None, op='HEAD',
                     headers=None, post_success=None, post_fail=None,
                     account=None, container=None):
@@ -780,7 +909,7 @@ class ContainerSharder(ContainerReplicator):
         if not headers:
             headers = {}
 
-        def default_success(resp):
+        def default_success(resp, node_id):
             return resp and is_success(resp.status)
 
         if not success:
@@ -797,71 +926,158 @@ class ContainerSharder(ContainerReplicator):
         for node in nodes:
             self.cpool.spawn(
                 self._send_request, node['ip'], node['port'], node['device'],
-                part, op, path, headers)
+                part, op, path, headers, node_id=node['id'])
 
         successes = 1 if local else 0
-        for resp in self.cpool:
+        for resp, node_id in self.cpool:
             if not resp:
                 continue
-            if success(resp):
+            if success(resp, node_id):
                 successes += 1
                 if post_success:
-                    post_success(resp)
+                    post_success(resp, node_id)
             else:
                 if post_fail:
-                    post_fail(resp)
+                    post_fail(resp, node_id)
                 continue
         return successes >= quorum
 
-    def _find_pivot_point(self, broker):
-        self.logger.info(_('Started searching for best pivot point for %s/%s'),
-                         broker.account, broker.container)
-        obj_count = [broker.get_info()['object_count']]
-        found_pivot = [broker.get_info()['pivot_point']]
+    def _find_pivot_points(self, broker):
+        """
+        This function is the main work horse of a scanner node, it:
+          - look at the pivot_ranges table to see where to continue on from.
+          - Once it finds the next pivot_range it'll ask for a quorum as to
+             whether this node is still in fact a scanner node.
+          - If it is still the pivot, it's time to add it to the pivot_ranges
+            table.
 
-        def on_success(resp):
+        :param broker:
+        :return:
+        """
+        self.logger.info(_('Started searching for pivot points on %s/%s'),
+                         broker.account, broker.container)
+
+        # get the last pivot point found to continue from
+        pivot_ranges = broker.get_pivot_ranges()
+        marker = pivot_ranges[-1][PR_UPPER] if pivot_ranges else None
+        progress = len(pivot_ranges) * self.split_size
+        obj_count = [broker.get_info()['object_count']]
+
+        def found_last():
+            return progress + self.split_size >= obj_count
+
+        if found_last():
+            self.logger.info(_("Already found all pivots"))
+            return
+
+        found_pivots = []
+
+        for i in range(self.scanner_batch_size):
+            next_pivot = broker.get_next_pivot_point(marker)
+            if not next_pivot:
+                # something happened and we couldn't find pivot. Stop where we
+                # are but don't mark complete.
+                break
+
+            progress += self.split_size
+            found_pivots.append(next_pivot)
+            if found_last():
+                break
+
+        if not i:
+            # we didn't find anything
+            self.logger.warning(_("No pivots found, something went wrong. We "
+                                  "will try again next pass."))
+            return
+
+        # make sure this node is still the scanner (a split brain might have
+        # happened and now someone else is).
+        def on_success(resp, node_id):
             if not resp or not is_success(resp.status):
                 return False
 
-            pivoted = resp.getheader('X-Container-Sysmeta-Shard-Pivoted')
-            if pivoted is not None and not config_true_value(pivoted):
-                # The other node already has a shard point defined but is
-                # yes to pivot on it. Or it's waiting replication.
-                self.logger.warning(_("A container replica has a pivot "
-                                      "pending. Can't listen to this "
-                                      "container."))
-                return False
+            found_scan_id = resp.getheader('X-Container-Sysmeta-Shard-Scanner')
 
-            if int(resp.getheader('X-Container-Object-Count')) > obj_count[0]:
-                obj_count[0] = int(resp.getheader('X-Container-Object-Count'))
-                found_pivot[0] = resp.getheader('X-Backend-Pivot-Point')
+            if found_scan_id:
+                if found_scan_id != self.node_id:
+                    return False
 
             return True
 
         if not self._get_quorum(broker, success=on_success):
-            self.logger.info(_('Failed to reach quorum on a pivot point for '
-                               '%s/%s'), broker.account, broker.container)
+            self.logger.info(_('Failed to reach quorum node %d may not be the '
+                               'scanner for %s/%s anymore. Aborting scan.'),
+                             self.node_id, broker.account, broker.container)
             return
-        else:
-            # Found a pivot point, so lets update all the other containers
-            headers = {'X-Container-Sysmeta-Shard-Pivot': found_pivot[0],
-                       'X-Container-Sysmeta-Shard-Pivoted': False}
 
+        # we are still the scanner, so lets write the pivot points.
+        pivot_ranges = []
+        root_account, root_container = \
+                ContainerSharder.get_shard_root_path(broker)
+        piv_account = account_to_pivot_account(root_account)
+        lower = marker if marker else None
+        for i, pivot in enumerate(found_pivots):
+            timestamp = Timestamp(time.time()).internal
+            piv_name = self.generate_pivot_name(root_container, self.node_id,
+                                                pivot, timestamp)
+            try:
+                policy = POLICIES.get_by_index(broker.storage_policy_index)
+                headers = {'X-Storage-Policy': policy.name}
+                self.swift.create_container(piv_account, piv_name,
+                                            headers=headers)
+            except internal_client.UnexpectedResponse as ex:
+                self.logger.warning(_('Failed to put container: %s'), str(ex))
+                self.logger.error(_('PUT of new shard containers failed, '
+                                    'cancelling split of %s/%s. '
+                                    'Will try again next pass'),
+                                  broker.account, broker.container)
+                break
+            pivot_ranges.append((piv_name, timestamp, lower, pivot, 0, 0))
+            lower = pivot
+
+        if i < len(found_pivots):
+            found_pivots = found_pivots[:i]
+            progress = (len(pivot_ranges) + len(found_pivots)) * self.split_size
+
+        if found_last():
+            # We need to add the final pivot range as well.
+            timestamp = Timestamp(time.time()).internal
+            piv_name = self.generate_pivot_name(root_container, self.node_id,
+                                                '', timestamp)
+            pivot_ranges.append((piv_name, timestamp, lower, None, 0, 0))
+            # add something the found_pivots so the stats will be correct.
+            found_pivots.append('last one')
+            try:
+                policy = POLICIES.get_by_index(broker.storage_policy_index)
+                headers = {'X-Storage-Policy': policy.name}
+                self.swift.create_container(piv_account, piv_name,
+                                            headers=headers)
+            except internal_client.UnexpectedResponse as ex:
+                self.logger.warning(_('Failed to put container: %s'), str(ex))
+                self.logger.error(_('PUT of new shard containers failed, '
+                                    'cancelling split of %s/%s. '
+                                    'Will try again next pass'),
+                                  broker.account, broker.container)
+
+        items = self._generate_object_list(pivot_ranges, 0)
+        broker.merge_items(items)
+
+        self.logger.info(_("Scan pass completed, found %d new pivots."),
+                         len(found_pivots))
+        if found_last():
+            # We've found the last pivot, so mark that in metadata
             timestamp = Timestamp(time.time()).internal
             broker.update_metadata({
-                'X-Container-Sysmeta-Shard-Pivot':
-                    (found_pivot[0], timestamp),
-                'X-Container-Sysmeta-Shard-Pivoted': (False, timestamp)})
+                'X-Container-Sysmeta-Sharding-Scan-Done', (True, timestamp)})
+            self.logger.info(_(" Final pivot reached."))
 
-            if not self._get_quorum(broker, op='POST', headers=headers):
-                self.logger.info(_('Failed to set %s as the pivot point for '
-                                   '%s/%s on remote servers'),
-                                 found_pivot[0], broker.account,
-                                 broker.container)
-                return
+    def generate_pivot_name(self, container, node_id, pivot, timestamp=None):
+        if not timestamp:
+            timestamp = Timestamp(time.time()).internal
 
-        self.logger.info(_('Best pivot point for %s/%s is %s'),
-                         broker.account, broker.container, found_pivot[0])
+        md5sum = md5()
+        md5sum.update("%s-%s" % (pivot, timestamp))
+        return "%s-%d-%s" % (container, node_id, md5sum.hexdigest())
 
     def _shrink(self, broker, root_account, root_container):
         """shrinking is a 2 phase process
@@ -977,14 +1193,14 @@ class ContainerSharder(ContainerReplicator):
         neighbours = {lower_c: lower_n, upper_c: upper_n}
         smallest = min(neighbours.keys())
         if smallest + curr_obj_count > SHARD_CONTAINER_SIZE * \
-                self.shard_shrink_merge_point:
+                self.shrink_merge_point:
             _acct, cont = pivot_to_pivot_container(
                 root_account, root_container, pivot_range=neighbours[smallest])
             self.logger.info(
                 _('If this container merges with it\'s smallest neighbour (%s) '
                   'there will be too many objects. %d (merged) > %d '
                   '(shard_merge_point)'), cont, smallest + curr_obj_count,
-                SHARD_CONTAINER_SIZE * self.shard_shrink_merge_point)
+                SHARD_CONTAINER_SIZE * self.shrink_merge_point)
             return
 
         # So we now have valid neighbour, so we want to move our objects in to
@@ -1128,7 +1344,7 @@ class ContainerSharder(ContainerReplicator):
             self._replicate_object, part, broker.db_file, node_id)
         any(self.cpool)
 
-    def _add_items(self, broker, broker_to_update, qry):
+    def _add_items(self, broker, broker_to_update, qry, ignore_state=False):
         """
         Move items from one broker to another.
 
@@ -1136,6 +1352,14 @@ class ContainerSharder(ContainerReplicator):
             dict(marker='', end_marker='', prefix='', delimiter='',
                  storage_policy_index=policy_index)
         """
+        if not ignore_state:
+            db_state = broker.get_db_state()
+            if db_state == DB_STATE_SHARDING:
+                brokers = broker.get_brokers()
+                for b in brokers:
+                    q = qry.copy()
+                    self._add_items(b, broker_to_update, q, ignore_state=True)
+            return
         while True:
             new_items = broker.list_objects_iter(
                 CONTAINER_LISTING_LIMIT, **qry)
@@ -1155,157 +1379,104 @@ class ContainerSharder(ContainerReplicator):
             else:
                 break
 
-    def _shard_on_pivot(self, pivot, broker, root_account, root_container,
-                        node_id):
-        is_root = root_container == broker.container
-        self.logger.info(_('Asking for quorum on a pivot point %s for '
-                           '%s/%s'), pivot, broker.account, broker.container)
-        # Before we go and split the tree, lets confirm the rest of the
-        # containers have a quorum
-
-        def on_success(resp):
-            return resp.getheader('X-Container-Sysmeta-Shard-Pivot') == pivot
-
-        if not self._get_quorum(broker, success=on_success):
-            self.logger.info(_('Failed to reach quorum on a pivot point for '
-                               '%s/%s'), broker.account, broker.container)
-            return
-        else:
-            self.logger.info(_('Reached quorum on a pivot point %s for '
-                               '%s/%s'), pivot, broker.account,
-                             broker.container)
-
-        # Now that we have quorum we can split.
-        self.logger.info(_('sharding container %s on pivot %s'),
-                         broker.container, pivot)
-
-        right_range = ContainerSharder.get_pivot_range(broker)
-        if right_range is None:
-            right_range = PivotRange(broker.container)
-        new_acct, new_left_cont = pivot_to_pivot_container(
-            root_account, root_container, pivot=pivot)
-        left_range = PivotRange(new_left_cont, lower=right_range.lower,
-                                upper=pivot)
-        right_range.lower = pivot
-
-        # pivot points are stored in root, Se we need to make sure we can grab
-        # the root ranges before we move anything.
-        if not self.ranges:
-            if is_root:
-                self.ranges = broker.build_pivot_ranges()
-            else:
-                self.ranges = self._get_pivot_ranges(
-                    root_account, root_container, newest=True)
-                if self.ranges is None:
-                    self.logger.error(
-                        _("Since the audit ran on this container and "
-                          "now we can't access the root container "
-                          "%s/%s aborting."),
-                        root_account, root_container)
-                    return
-
-        # Make sure the account exists and the new container entry
-        # is added by running a container PUT.
-        try:
-            policy = POLICIES.get_by_index(broker.storage_policy_index)
-            headers = {'X-Storage-Policy': policy.name}
-            self.swift.create_container(new_acct, new_left_cont, headers=headers)
-        except internal_client.UnexpectedResponse as ex:
-            self.logger.warning(_('Failed to put container: %s'),
-                                str(ex))
-            self.logger.error(_('PUT of new shard containers failed, cancelling'
-                                ' split of %s/%s. Will try again next pass'),
-                              broker.account, broker.container)
-            return
-
-        policy_index = broker.storage_policy_index
-        query = dict(marker='', end_marker='', prefix='', delimiter='',
-                     storage_policy_index=policy_index)
-
-        q = query.copy()
-        q.update({'end_marker': pivot, 'include_end_marker': True})
-        if 'X-Container-Sysmeta-Shard-Lower' in broker.metadata:
-            # A lower has been defined, so lets alter our query so we make sure
-            # we only grab the objects that should live in the new shard.
-            q.update({
-                'marker': broker.metadata['X-Container-Sysmeta-Shard-Lower'][0]}
-            )
-
-        try:
-            acct, cont = pivot_to_pivot_container(root_account, root_container,
-                                                  pivot_range=left_range)
-
-            new_part, new_broker, node_id = \
-                self._get_shard_broker(acct, cont, policy_index)
-
-            self._add_shard_metadata(new_broker, root_account, root_container,
-                                     left_range)
-
-            with new_broker.sharding_lock():
-                self._add_items(broker, new_broker, q)
-
-        except DeviceUnavailable as duex:
-            self.logger.warning(_(str(duex)))
-            return
-
-        self.logger.info(_('Replicating new shard container %s/%s'),
-                         new_broker.account, new_broker.container)
-        self.cpool.spawn(
-            self._replicate_object, new_part, new_broker.db_file, node_id)
-        any(self.cpool)
-
-        # Make sure the new distributed node has been added.
-        timestamp = Timestamp(time.time()).internal
-        pivot_ranges = list()
-        for r, b in zip((left_range, right_range), (new_broker, broker)):
-            tmp_info = b.get_info()
-            pivot_ranges.append(
-                (r.name, timestamp, r.lower, r.upper, tmp_info['object_count'],
-                 tmp_info['bytes_used']))
-
-        if is_root:
-            items = self._generate_object_list(pivot_ranges, 0)
-            broker.merge_items(items)
-            broker.update_metadata({
-                'X-Container-Sysmeta-Shard-Lower':
-                    (right_range.lower, timestamp),
-                'X-Container-Sysmeta-Shard-Upper':
-                    (right_range.upper, timestamp)})
-        else:
-            # Push the new pivot range to the root container
+    def _sharding_complete(self, root_account, root_container, broker):
+        if root_container != broker.container:
+            # We aren't in the root container.
             self._update_pivot_ranges(root_account, root_container, 'PUT',
-                                      pivot_ranges)
+                                      broker.get_pivot_ranges())
+            # TODO question when do we delete? wait until all are done?
+        broker.set_sharded_state()
 
-        # Now replicate the container we are working on
-        self.logger.info(_('Replicating container %s/%s'),
-                         broker.account, broker.container)
-        part = self.ring.get_part(broker.account, broker.container)
-        self.cpool.spawn(
-            self._replicate_object, part, broker.db_file, node_id)
+    def _shard_on_pivot(self, broker, root_account, root_container):
+        last_pivot = self.get_metadata_item(
+            broker, 'X-Container-Sysmeta-Shard-Last-%d' % self.node_id)
+        scan_complete = self.get_metadata_item(
+            broker, 'X-Container-Sysmeta-Sharding-Scan-Done')
+
+        pivot_ranges = broker.get_pivot_ranges()
+        if not pivot_ranges:
+            # No pivot points yet defined.
+            return
+        elif broker.get_db_state() == DB_STATE_UNSHARDED:
+            # We have a pivot range, which means its time to start sharding
+            broker.set_sharding_state()
+
+        pivots_todo = [
+            PivotRange(p[PR_NAME], p[PR_LOWER], p[PR_UPPER], p[PR_CREATED_AT])
+            for p in pivot_ranges
+            if p[PR_UPPER] > last_pivot or p[PR_LOWER] > last_pivot]
+        if not pivots_todo:
+            # This means no new pivot_ranges have been added since last pass.
+            # If the scanner is complete, then we have finished sharding.
+            if scan_complete:
+                self._sharding_complete(broker)
+                return
+            else:
+                self.logger.info(_('No new pivot of %s/%s found, will try '
+                                   'again next pass'),
+                                 broker.account, broker.container)
+                return
+
+        if last_pivot:
+            self.logger.info(_('Continuing to shard %s/%s'),
+                             broker.account, broker.container)
+        else:
+            self.logger.info(_('Starting to shard %s/%s'),
+                             broker.account, broker.container)
+
+        for i in range(self.shard_batch_size):
+            if pivot_ranges:
+                pivot = pivots_todo.pop(0)
+            else:
+                break
+
+            self.logger.info(_('Sharding %s/%s on pivot %s'),
+                             broker.account, broker.container, pivot.upper)
+
+            policy_index = broker.storage_policy_index
+            query = dict(marker='', end_marker='', prefix='', delimiter='',
+                         storage_policy_index=policy_index)
+
+            q = query.copy()
+            q.update({'marker': pivot.lower or '',
+                      'end_marker': pivot.upper or ''})
+            if pivot.upper:
+                      q.update({'include_end_marker': True})
+            try:
+                acct = account_to_pivot_account(root_account)
+                new_part, new_broker, node_id = \
+                    self._get_shard_broker(acct, pivot.name, policy_index)
+
+                self._add_shard_metadata(new_broker, root_account,
+                                         root_container, pivot)
+
+                with new_broker.sharding_lock():
+                    self._add_items(broker, new_broker, q)
+
+            except DeviceUnavailable as duex:
+                self.logger.warning(_(str(duex)))
+                return
+
+            self.logger.info(_('Replicating new shard container %s/%s'),
+                             new_broker.account, new_broker.container)
+            self.cpool.spawn(
+                self._replicate_object, new_part, new_broker.db_file, node_id)
+            last_pivot = pivot.upper
+            self.logger.info(_('Node %d sharded %s/%s at pivot %s.'),
+                             self.node_id, broker.account, broker.container,
+                             pivot.upper)
         any(self.cpool)
 
-        broker.update_metadata({
-            'X-Container-Sysmeta-Shard-Pivoted': (True, timestamp)})
-
-        # delete this container as we do not need it anymore
-        # if not is_root:
-        #    self.logger.info(_('Removing unused shard container %s'),
-        #                     broker.container)
-        #    try:
-        #        self.swift.delete_container(broker.account, broker.container)
-        #    except Exception as exception:
-                # TODO (blmartin):
-                # We need to be sure to remove the container later.
-                # it will not hurt anything by staying around (as it is empty).
-                # Should delete in shard audit
-        #        self.logger.warning(_('Could not delete container %s/%s'
-        #                            ' due to %s. Ignoring for now'),
-        #                            exception, broker.account, broker.container)
-
-        self.logger.info(_('Finished sharding %s/%s, new shard '
-                           'container %s/%s. Sharded at pivot %s.'),
-                         broker.account, broker.container,
-                         new_acct, new_left_cont, pivot)
+        if scan_complete and not pivots_todo:
+            # we've finished sharding this container.
+            broker.update_metadata({
+                'X-Container-Sysmeta-Shard-Last-%d' % self.node_id:
+                    ('', Timestamp(time.time()).internal)})
+            self._sharding_complete()
+        else:
+            broker.update_metadata({
+                'X-Container-Sysmeta-Shard-Last-%d' % self.node_id:
+                    (last_pivot, Timestamp(time.time()).internal)})
 
     def _push_pivot_ranges_to_container(self, pivot, root_account,
                                         root_container, pivot_point,

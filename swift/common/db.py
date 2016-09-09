@@ -365,15 +365,20 @@ class DatabaseBroker(object):
     def db_file(self):
         return self._db_file
 
+    def _create_connection(self, db_file=None):
+        if not db_file:
+            db_file = self.db_file
+        try:
+            self.conn = get_db_connection(db_file, self.timeout)
+        except (sqlite3.DatabaseError, DatabaseConnectionError):
+            self.possibly_quarantine(*sys.exc_info())
+
     @contextmanager
     def get(self):
         """Use with the "with" statement; returns a database connection."""
         if not self.conn:
             if self.db_file != ':memory:' and self._db_exists():
-                try:
-                    self.conn = get_db_connection(self.db_file, self.timeout)
-                except (sqlite3.DatabaseError, DatabaseConnectionError):
-                    self.possibly_quarantine(*sys.exc_info())
+                self._create_connection()
             else:
                 raise DatabaseConnectionError(self.db_file, "DB doesn't exist")
         conn = self.conn
@@ -909,3 +914,6 @@ class DatabaseBroker(object):
             'UPDATE %s_stat SET status_changed_at = ?'
             ' WHERE status_changed_at < ?' % self.db_type,
             (timestamp, timestamp))
+
+    def get_brokers(self):
+        return self

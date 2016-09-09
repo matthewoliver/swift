@@ -237,9 +237,6 @@ use = egg:swift#xprofile
 # log_address = /dev/log
 #
 # Container sharder specific settings
-# Shard_container_size is the size (number of objects) in which a sharding range will
-# be split (pivoted).
-# shard_container_size = 1000000
 #
 # Shrinking has a few more settings, the first is the shard_shrink_point. This is the
 # point at which to start looking to shrink the sharded container. The point is a
@@ -255,6 +252,16 @@ use = egg:swift#xprofile
 # and shard_shrink_merge_point is 75. Meaning start looking to merge with neighbours when
 # the current shard container is <= 500k, and only merge if this container and a neighbour's
 # combined object count <= 750k.
+#
+# When sharding one primary node becomes the scanner and scans for pivot
+# points. In one shard pass a scanner will search for up to
+# shard_scanner_batch_size pivots before moveing to the next container and
+# will find more on the next pass. You can change the number to search for below
+# shard_scanner_batch_size = 10
+#
+# When sharding how many pivots should it shard in one shard pass before moving
+# onto the next.
+# shard_shard_batch_size = 2
 #
 # Because the container-sharder is a type of container-replicator, it accepts
 # the same configuration.
