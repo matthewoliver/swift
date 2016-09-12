@@ -261,7 +261,7 @@ use = egg:swift#xprofile
 #
 # When sharding how many pivots should it shard in one shard pass before moving
 # onto the next.
-# shard_shard_batch_size = 2
+# shard_batch_size = 2
 #
 # Because the container-sharder is a type of container-replicator, it accepts
 # the same configuration.

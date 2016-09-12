@@ -921,17 +921,16 @@ class ContainerController(BaseStorageServer):
         kargs = {}
         include_deleted = False
         skip_sharding = get_param(req, 'noshard')
-        if items:
-            if items.lower() == "pivot":
-                container_list = broker.get_pivot_ranges()
-                kargs.update(dict(pivot=True))
-            elif items.lower() == 'all':
-                include_deleted = True
+        if items and items.lower() == "pivot":
+            container_list = broker.get_pivot_ranges()
+            kargs.update(dict(pivot=True))
         elif not skip_sharding and len(broker.get_pivot_ranges()) > 0:
             # Sharded container so we need to pass to GET_sharded
             return self.GET_sharded(req, broker, resp_headers, marker,
                                     end_marker, prefix, limit)
         else:
+            if items and items.lower() == 'all':
+                include_deleted = True
             container_list = broker.list_objects_iter(
                 limit, marker, end_marker, prefix, delimiter, path,
                 storage_policy_index=info['storage_policy_index'],

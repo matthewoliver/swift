@@ -117,7 +117,7 @@ class ContainerSharder(ContainerReplicator):
         self.split_size = SHARD_CONTAINER_SIZE // 2
         self.cpool = GreenAsyncPile(self.cpool)
         self.scanner_batch_size = int(conf.get('shard_scanner_batch_size', 10))
-        self.shard_batch_size = int(conf.get('shard_shard_batch_size', 2))
+        self.shard_batch_size = int(conf.get('shard_batch_size', 2))
 
         # internal client
         self.conn_timeout = float(conf.get('conn_timeout', 5))

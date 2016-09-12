@@ -900,21 +900,24 @@ class ContainerBroker(DatabaseBroker):
                     query_args.append(end_prefix)
 
                 if delim_force_gte:
-                    query += ' name >= ? '
+                    query += ' name >= ? AND'
                     query_args.append(marker)
                     # Always set back to False
                     delim_force_gte = False
                 elif marker and marker >= prefix:
-                    query += ' name > ? '
+                    query += ' name > ? AND'
                     query_args.append(marker)
                 elif prefix:
-                    query += ' name >= ? '
+                    query += ' name >= ? AND'
                     query_args.append(prefix)
-                if not include_deleted:
+                if include_deleted and query.endswith(' AND'):
+                    query = query[:-4]
+                else:
                     if self.get_db_version(conn) < 1:
-                        query += 'AND +deleted = 0'
+                        query += ' +deleted = 0'
                     else:
-                        query += 'AND deleted = 0'
+                        query += ' deleted = 0'
+
                 orig_tail_query = '''
                     ORDER BY name %s LIMIT ?
                 ''' % ('DESC' if reverse else '')
