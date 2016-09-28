@@ -304,12 +304,12 @@ class ContainerBroker(DatabaseBroker):
                  stale_reads_ok=False):
         super(ContainerBroker, self).__init__(db_file, timeout, logger,
               account, container, pending_timeout, stale_reads_ok)
-        hsh = hash_path(self.account, self.container)
-        self._pivot_db_file = os.path.join(self.db_dir, hsh + "_pivot.db")
-
         # The auditor will create a backend using the pivot_db as the db_file.
-        if self._pivot_db_file == self._db_file:
+        if db_file.endswith("_pivot.db"):
+            self._pivot_db_file = db_file
             self._db_file = ''
+        else:
+            self._pivot_db_file = db_file[:0 - len('.db')] + "_pivot.db"
 
     def get_db_state(self):
         db_exists = os.path.exists(self._db_file)

@@ -99,6 +99,7 @@ PR_UPPER = 3
 PR_OBJECT_COUNT = 4
 PR_BYTES_USED = 5
 
+
 class ContainerSharder(ContainerReplicator):
     """Shards containers."""
 
@@ -574,19 +575,15 @@ class ContainerSharder(ContainerReplicator):
         item = broker.metadata.get(header)
         return None if item is None else item[0]
 
-    @staticmethod
-    def roundrobin_datadirs(datadirs):
-        data = []
-        idx = {}
-        for datadir, node_idx in datadirs:
-            data.append(datadir)
-            idx[datadir[-1]] = node_idx
-
-        for cont in db_replicator.roundrobin_datadirs(data):
-            if cont:
-                yield list(cont) + [idx[cont[-1]]]
-            else:
-                raise StopIteration()
+    def roundrobin_datadirs(self, datadirs):
+        for part, path, node_id in db_replicator.roundrobin_datadirs(datadirs):
+            index = [node['index'] for node in
+                     self.ring.get_part_nodes(int(part))
+                     if node['id'] == node_id]
+            if not index:
+                # TODO Should probably log something here
+                continue
+            yield part, path, node_id, index[0]
 
     def _one_shard_pass(self, reported):
         """
@@ -622,9 +619,8 @@ class ContainerSharder(ContainerReplicator):
                 datadir = os.path.join(self.root, node['device'], self.datadir)
                 if os.path.isdir(datadir):
                     self._local_device_ids.add(node['id'])
-                    dirs.append(((datadir, node['id']), node['index']))
-        for part, path, node_id, node_idx in \
-                ContainerSharder.roundrobin_datadirs(dirs):
+                    dirs.append((datadir, node['id']))
+        for part, path, node_id, node_idx in self.roundrobin_datadirs(dirs):
             broker = ContainerBroker(path)
             sharded = broker.metadata.get('X-Container-Sysmeta-Sharding') or \
                 broker.metadata.get('X-Container-Sysmeta-Shard-Account')
@@ -634,6 +630,7 @@ class ContainerSharder(ContainerReplicator):
             self.ranges = []
             self.node_idx = node_idx
             self.node_id = node_id
+            self.part = int(part)
             root_account, root_container = \
                 ContainerSharder.get_shard_root_path(broker)
             pivot = ContainerSharder.get_pivot_range(broker)
@@ -704,7 +701,8 @@ class ContainerSharder(ContainerReplicator):
                         # todo log and continue
                         continue
 
-                if scan_idx and scan_idx == self.node_id and not scan_complete:
+                if scan_idx and scan_idx == self.node_idx and \
+                        not scan_complete:
                     self._find_pivot_points(broker)
                 else:
                     self._shard_on_pivot(broker, root_account,
@@ -752,7 +750,7 @@ class ContainerSharder(ContainerReplicator):
         # return reported
 
     def _send_request(self, ip, port, contdevice, partition, op, path,
-                      headers_out={}, node_id=None):
+                      headers_out={}, node_idx=None):
         if 'user-agent' not in headers_out:
             headers_out['user-agent'] = 'container-sharder %s' % \
                                         os.getpid()
@@ -764,11 +762,11 @@ class ContainerSharder(ContainerReplicator):
                                     op, path, headers_out)
             with Timeout(self.node_timeout):
                 response = conn.getresponse()
-                return response, node_id
+                return response, node_idx
         except (Exception, Timeout) as x:
             self.logger.info(str(x))
             # Need to do something here.
-            return None, node_id
+            return None, node_idx
 
     def _update_pivot_ranges(self, account, container, op, pivots):
         path = "/%s/%s" % (account, container)
@@ -827,7 +825,7 @@ class ContainerSharder(ContainerReplicator):
         scanner_id = [self._get_node_index()]
         scanner_ids = {}
 
-        def on_success(resp, node_id):
+        def on_success(resp, node_idx):
             if not resp or not is_success(resp.status):
                 return False
 
@@ -842,7 +840,7 @@ class ContainerSharder(ContainerReplicator):
 
             if found_obj_count > obj_count[0]:
                 obj_count[0] = found_obj_count
-                scanner_id[0] = node_id
+                scanner_id[0] = node_idx
 
             return True
 
@@ -891,9 +889,9 @@ class ContainerSharder(ContainerReplicator):
             return
 
         self.logger.info(_('Best pivot scanner for %s/%s is node %d'),
-                         broker.account, broker.container, scanner_id)
+                         broker.account, broker.container, scanner_id[0])
 
-        return scanner_id
+        return scanner_id[0]
 
     def _get_quorum(self, broker, success=None, quorum=None, op='HEAD',
                     headers=None, post_success=None, post_fail=None,
@@ -909,7 +907,7 @@ class ContainerSharder(ContainerReplicator):
         if not headers:
             headers = {}
 
-        def default_success(resp, node_id):
+        def default_success(resp, node_idx):
             return resp and is_success(resp.status)
 
         if not success:
@@ -926,19 +924,19 @@ class ContainerSharder(ContainerReplicator):
         for node in nodes:
             self.cpool.spawn(
                 self._send_request, node['ip'], node['port'], node['device'],
-                part, op, path, headers, node_id=node['id'])
+                part, op, path, headers, node_idx=node['index'])
 
         successes = 1 if local else 0
-        for resp, node_id in self.cpool:
+        for resp, node_idx in self.cpool:
             if not resp:
                 continue
-            if success(resp, node_id):
+            if success(resp, node_idx):
                 successes += 1
                 if post_success:
-                    post_success(resp, node_id)
+                    post_success(resp, node_idx)
             else:
                 if post_fail:
-                    post_fail(resp, node_id)
+                    post_fail(resp, node_idx)
                 continue
         return successes >= quorum
 
@@ -959,9 +957,9 @@ class ContainerSharder(ContainerReplicator):
 
         # get the last pivot point found to continue from
         pivot_ranges = broker.get_pivot_ranges()
-        marker = pivot_ranges[-1][PR_UPPER] if pivot_ranges else None
+        old_piv = marker = pivot_ranges[-1][PR_UPPER] if pivot_ranges else None
         progress = len(pivot_ranges) * self.split_size
-        obj_count = [broker.get_info()['object_count']]
+        obj_count = broker.get_info().get('object_count', 0)
 
         def found_last():
             return progress + self.split_size >= obj_count
@@ -980,6 +978,7 @@ class ContainerSharder(ContainerReplicator):
                 break
 
             progress += self.split_size
+            marker = next_pivot
             found_pivots.append(next_pivot)
             if found_last():
                 break
@@ -992,14 +991,14 @@ class ContainerSharder(ContainerReplicator):
 
         # make sure this node is still the scanner (a split brain might have
         # happened and now someone else is).
-        def on_success(resp, node_id):
+        def on_success(resp, node_idx):
             if not resp or not is_success(resp.status):
                 return False
 
             found_scan_id = resp.getheader('X-Container-Sysmeta-Shard-Scanner')
 
             if found_scan_id:
-                if found_scan_id != self.node_id:
+                if found_scan_id != str(self.node_idx):
                     return False
 
             return True
@@ -1007,7 +1006,7 @@ class ContainerSharder(ContainerReplicator):
         if not self._get_quorum(broker, success=on_success):
             self.logger.info(_('Failed to reach quorum node %d may not be the '
                                'scanner for %s/%s anymore. Aborting scan.'),
-                             self.node_id, broker.account, broker.container)
+                             self.node_idx, broker.account, broker.container)
             return
 
         # we are still the scanner, so lets write the pivot points.
@@ -1015,10 +1014,10 @@ class ContainerSharder(ContainerReplicator):
         root_account, root_container = \
                 ContainerSharder.get_shard_root_path(broker)
         piv_account = account_to_pivot_account(root_account)
-        lower = marker if marker else None
+        lower = old_piv if old_piv else None
         for i, pivot in enumerate(found_pivots):
             timestamp = Timestamp(time.time()).internal
-            piv_name = self.generate_pivot_name(root_container, self.node_id,
+            piv_name = self.generate_pivot_name(root_container, self.node_idx,
                                                 pivot, timestamp)
             try:
                 policy = POLICIES.get_by_index(broker.storage_policy_index)
@@ -1068,7 +1067,7 @@ class ContainerSharder(ContainerReplicator):
             # We've found the last pivot, so mark that in metadata
             timestamp = Timestamp(time.time()).internal
             broker.update_metadata({
-                'X-Container-Sysmeta-Sharding-Scan-Done', (True, timestamp)})
+                'X-Container-Sysmeta-Sharding-Scan-Done': (True, timestamp)})
             self.logger.info(_(" Final pivot reached."))
 
     def generate_pivot_name(self, container, node_id, pivot, timestamp=None):
