@@ -292,7 +292,8 @@ class ContainerSharder(ContainerReplicator):
                 'X-Container-Sysmeta-Shard-Container':
                     (root_container, timestamp),
                 'X-Container-Sysmeta-Shard-Lower': (pivot.lower, timestamp),
-                'X-Container-Sysmeta-Shard-Upper': (pivot.upper, timestamp)})
+                'X-Container-Sysmeta-Shard-Upper': (pivot.upper, timestamp),
+                'X-Container-Sysmeta-Sharding': (None, timestamp)})
 
     def _misplaced_objects(self, broker, root_account, root_container, pivot):
         """
@@ -312,6 +313,10 @@ class ContainerSharder(ContainerReplicator):
         policy_index = broker.storage_policy_index
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
+
+        # TODO is containre is in sharding state then we need to only look where
+        # the current node is up to. Then look for misplaced objects below that
+        # in the pivoted object table.
 
         ranges = broker.get_pivot_ranges()
         # only the root container has a bunch of ranges. If root container also
@@ -678,9 +683,11 @@ class ContainerSharder(ContainerReplicator):
                 # sharding process
 
                 if self.state == DB_STATE_UNSHARDED:
+                    skip_shrinking = self.get_metadata_item(
+                        broker, 'X-Container-Sysmeta-Sharding')
                     obj_count = broker.get_info()['object_count']
-                    if obj_count <= (SHARD_CONTAINER_SIZE *
-                                     self.shard_shrink_point):
+                    if not skip_shrinking and obj_count <= \
+                            (SHARD_CONTAINER_SIZE * self.shard_shrink_point):
                         # Shrink
                         self._shrink(broker, root_account, root_container)
                     elif obj_count <= SHARD_CONTAINER_SIZE:
@@ -1015,13 +1022,20 @@ class ContainerSharder(ContainerReplicator):
                 ContainerSharder.get_shard_root_path(broker)
         piv_account = account_to_pivot_account(root_account)
         lower = old_piv if old_piv else None
+        policy = POLICIES.get_by_index(broker.storage_policy_index)
+        headers = {
+            'X-Storage-Policy': policy.name,
+            'X-Container-Sysmeta-Shard-Account': root_account,
+            'X-Container-Sysmeta-Shard-Container': root_container,
+            'X-Container-Sysmeta-Sharding': True}
         for i, pivot in enumerate(found_pivots):
             timestamp = Timestamp(time.time()).internal
             piv_name = self.generate_pivot_name(root_container, self.node_idx,
                                                 pivot, timestamp)
             try:
-                policy = POLICIES.get_by_index(broker.storage_policy_index)
-                headers = {'X-Storage-Policy': policy.name}
+                headers.update({
+                    'X-Container-Sysmeta-Shard-Lower': lower,
+                    'X-Container-Sysmeta-Shard-Upper': pivot})
                 self.swift.create_container(piv_account, piv_name,
                                             headers=headers)
             except internal_client.UnexpectedResponse as ex:
@@ -1034,21 +1048,22 @@ class ContainerSharder(ContainerReplicator):
             pivot_ranges.append((piv_name, timestamp, lower, pivot, 0, 0))
             lower = pivot
 
-        if i < len(found_pivots):
+        if i + 1 < len(found_pivots):
             found_pivots = found_pivots[:i]
             progress = (len(pivot_ranges) + len(found_pivots)) * self.split_size
 
         if found_last():
             # We need to add the final pivot range as well.
             timestamp = Timestamp(time.time()).internal
-            piv_name = self.generate_pivot_name(root_container, self.node_id,
+            piv_name = self.generate_pivot_name(root_container, self.node_idx,
                                                 '', timestamp)
             pivot_ranges.append((piv_name, timestamp, lower, None, 0, 0))
             # add something the found_pivots so the stats will be correct.
             found_pivots.append('last one')
             try:
-                policy = POLICIES.get_by_index(broker.storage_policy_index)
-                headers = {'X-Storage-Policy': policy.name}
+                headers.update({
+                    'X-Container-Sysmeta-Shard-Lower': lower,
+                    'X-Container-Sysmeta-Shard-Upper': None})
                 self.swift.create_container(piv_account, piv_name,
                                             headers=headers)
             except internal_client.UnexpectedResponse as ex:
@@ -1060,6 +1075,12 @@ class ContainerSharder(ContainerReplicator):
 
         items = self._generate_object_list(pivot_ranges, 0)
         broker.merge_items(items)
+
+        self.cpool.spawn(
+            self._replicate_object, self.part, broker.db_file, self.node_id)
+
+        if  broker.get_db_state == DB_STATE_UNSHARDED:
+            broker.set_sharding_state()
 
         self.logger.info(_("Scan pass completed, found %d new pivots."),
                          len(found_pivots))
@@ -1117,7 +1138,7 @@ class ContainerSharder(ContainerReplicator):
 
         obj_count = [broker.get_info()['object_count']]
 
-        def on_success(resp):
+        def on_success(resp, node_idx):
             # We need to make sure that if this neighbour is in the middle
             # of shrinking, it isn't chosen as neighbour to merge into.
             shrink = resp.getheader('X-Container-Sysmeta-Shard-Shrink')
@@ -1166,7 +1187,7 @@ class ContainerSharder(ContainerReplicator):
         lower_n = upper_n = None
         lower_c = upper_c = SHARD_CONTAINER_SIZE
         if pivot.lower:
-            lower_n = find_pivot_range(pivot.lower, ranges)
+            lower_n = find_pivot_range(pivot.lower, self.ranges)
 
             obj_count = [0]
             acct, cont = pivot_to_pivot_container(root_account, root_container,
@@ -1178,7 +1199,7 @@ class ContainerSharder(ContainerReplicator):
 
         if pivot.upper:
             upper = str(pivot.upper)[:-1] + chr(ord(str(pivot.upper)[-1]) + 1)
-            upper_n = find_pivot_range(upper, ranges)
+            upper_n = find_pivot_range(upper, self.ranges)
 
             obj_count = [0]
             acct, cont = pivot_to_pivot_container(root_account, root_container,
@@ -1260,7 +1281,7 @@ class ContainerSharder(ContainerReplicator):
 
         # OK we have a shrink container, now lets make sure we have a quorum on
         # what the containers need to be, just in case.
-        def is_success(resp):
+        def is_success(resp, node_idx):
             return resp.getheader('X-Container-Sysmeta-Shard-Shrink') == \
                    shrink_shard \
                    and resp.getheader('X-Container-Sysmeta-Shard-Merge') == \
