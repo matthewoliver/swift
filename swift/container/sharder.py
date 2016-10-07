@@ -112,7 +112,7 @@ class ContainerSharder(ContainerReplicator):
         self.vm_test_mode = config_true_value(conf.get('vm_test_mode', 'no'))
 
         self.shard_shrink_point = \
-            float(conf.get('shard_shrink_point', 50) / 100.0)
+            float(conf.get('shard_shrink_point', 25) / 100.0)
         self.shrink_merge_point = \
             float(conf.get('shard_shrink_merge_point', 75) / 100.0)
         self.split_size = SHARD_CONTAINER_SIZE // 2
@@ -247,7 +247,7 @@ class ContainerSharder(ContainerReplicator):
                     timestamp = ts.internal
                 obj = {
                     'created_at': timestamp or item[1]}
-                if len(item) > 5:
+                if not isinstance(item[2], int):
                     # pivot node
                     obj.update({
                         'name': item[0],
@@ -313,25 +313,31 @@ class ContainerSharder(ContainerReplicator):
         policy_index = broker.storage_policy_index
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
-
-        # TODO is containre is in sharding state then we need to only look where
-        # the current node is up to. Then look for misplaced objects below that
-        # in the pivoted object table.
-
+        state = broker.get_db_state()
         ranges = broker.get_pivot_ranges()
-        # only the root container has a bunch of ranges. If root container also
-        # happens to be in the list of ranges, it means we are still sharding
-        # up the root container, so we need to treat it like any other shard in
-        # regards to misplaced object checks.
-        in_ranges = any([p[0] == broker.container for p in ranges])
-        if (len(ranges) > 0 and not in_ranges) or broker.is_deleted():
+
+        if state == DB_STATE_SHARDED or broker.is_deleted():
             # It's a sharded node or deleted, so anything in the object table
-            # is misplaced.
+            # is treated as a misplaced object.
             if broker.get_info()['object_count'] > 0:
                 queries.append(query.copy())
             else:
                 return
-        elif pivot is None:
+        elif state == DB_STATE_SHARDING:
+            # This state is a little more complicated. Only objects in the
+            # object table that is less then (<) the pivot this node it up to is
+            # considered misplaced, anything above is being held.
+            last_pivot = self.get_metadata_item(
+                broker, 'X-Container-Sysmeta-Shard-Last-%d' % self.node_id)
+            if not last_pivot:
+                # This node hasn't pivoted/sharded anything yet, so all objects
+                # in object table are suppose to be there (in holding).
+                return
+            tmp_q = query.copy()
+            tmp_q['end_marker'] = last_pivot
+            queries.append(tmp_q)
+
+        elif pivot is None or state == DB_STATE_NOTFOUND:
             # This is an unsharded root container, so we don't need to
             # query anything.
             return
@@ -567,14 +573,15 @@ class ContainerSharder(ContainerReplicator):
     def _update_pivot_counts(self, root_account, root_container, broker):
         if broker.container == root_container:
             return
-        timestamp = Timestamp(time.time())
+        timestamp = Timestamp(time.time()).internal
         pivot = self.get_pivot_range(broker, timestamp)
         if not pivot:
             return
         tmp_info = broker.get_info()
         pivot = (pivot.name, pivot.timestamp, pivot.lower, pivot.upper,
                  tmp_info['object_count'], tmp_info['bytes_used'])
-        self._update_pivot_ranges(root_account, root_container, 'PUT', [pivot])
+        self._update_pivot_ranges(root_account, root_container, 'PUT',
+                                  [pivot])
 
     def get_metadata_item(self, broker, header):
         item = broker.metadata.get(header)
@@ -689,7 +696,8 @@ class ContainerSharder(ContainerReplicator):
                     if not skip_shrinking and obj_count <= \
                             (SHARD_CONTAINER_SIZE * self.shard_shrink_point):
                         # Shrink
-                        self._shrink(broker, root_account, root_container)
+                        # self._shrink(broker, root_account, root_container)
+                        continue
                     elif obj_count <= SHARD_CONTAINER_SIZE:
                         continue
 
@@ -796,7 +804,7 @@ class ContainerSharder(ContainerReplicator):
             for node in nodes:
                 self.cpool.spawn(
                     self._send_request, node['ip'], node['port'],
-                    node['device'], part, op, obj_path, headers)
+                    node['device'], part, op, obj_path, headers, node['index'])
             all(self.cpool)
 
     @staticmethod
@@ -1409,7 +1417,7 @@ class ContainerSharder(ContainerReplicator):
 
     def _shard_on_pivot(self, broker, root_account, root_container):
         last_pivot = self.get_metadata_item(
-            broker, 'X-Container-Sysmeta-Shard-Last-%d' % self.node_id)
+            broker, 'X-Container-Sysmeta-Shard-Last-%d' % self.node_idx)
         scan_complete = self.get_metadata_item(
             broker, 'X-Container-Sysmeta-Sharding-Scan-Done')
 
@@ -1429,7 +1437,7 @@ class ContainerSharder(ContainerReplicator):
             # This means no new pivot_ranges have been added since last pass.
             # If the scanner is complete, then we have finished sharding.
             if scan_complete:
-                self._sharding_complete(broker)
+                self._sharding_complete(root_account, root_container, broker)
                 return
             else:
                 self.logger.info(_('No new pivot of %s/%s found, will try '
@@ -1490,12 +1498,12 @@ class ContainerSharder(ContainerReplicator):
         if scan_complete and not pivots_todo:
             # we've finished sharding this container.
             broker.update_metadata({
-                'X-Container-Sysmeta-Shard-Last-%d' % self.node_id:
+                'X-Container-Sysmeta-Shard-Last-%d' % self.node_idx:
                     ('', Timestamp(time.time()).internal)})
-            self._sharding_complete()
+            self._sharding_complete(root_account, root_container, broker)
         else:
             broker.update_metadata({
-                'X-Container-Sysmeta-Shard-Last-%d' % self.node_id:
+                'X-Container-Sysmeta-Shard-Last-%d' % self.node_idx:
                     (last_pivot, Timestamp(time.time()).internal)})
 
     def _push_pivot_ranges_to_container(self, pivot, root_account,

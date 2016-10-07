@@ -26,8 +26,8 @@ import six.moves.cPickle as pickle
 from six.moves import range
 import sqlite3
 
-from swift.common.utils import Timestamp, encode_timestamps, decode_timestamps, \
-    extract_swift_bytes, PivotRange, hash_path
+from swift.common.utils import Timestamp, encode_timestamps, \
+    decode_timestamps, extract_swift_bytes, PivotRange
 from swift.common.db import DatabaseBroker, utf8encode, BROKER_TIMEOUT
 from swift.common.constraints import SHARD_CONTAINER_SIZE
 
@@ -307,12 +307,13 @@ class ContainerBroker(DatabaseBroker):
         # The auditor will create a backend using the pivot_db as the db_file.
         if db_file.endswith("_pivot.db"):
             self._pivot_db_file = db_file
-            self._db_file = ''
+            # self._db_file = ''
         else:
             self._pivot_db_file = db_file[:0 - len('.db')] + "_pivot.db"
 
     def get_db_state(self):
-        db_exists = os.path.exists(self._db_file)
+        db_exists = os.path.exists(self._db_file) and \
+            self._db_file != self._pivot_db_file
         pivot_exists = os.path.exists(self._pivot_db_file)
         if db_exists and not pivot_exists:
             return DB_STATE_UNSHARDED
@@ -1006,7 +1007,9 @@ class ContainerBroker(DatabaseBroker):
             else:
                 keys = ('name', 'created_at', 'lower', 'upper', 'object_count',
                         'bytes_used', 'deleted')
-            return dict(zip(keys, rec))
+                result = dict(zip(keys, rec))
+                result.update({'record_type': record_type})
+                return result
         return None
 
     def merge_items(self, item_list, source=None):
@@ -1520,8 +1523,10 @@ class ContainerBroker(DatabaseBroker):
         # are still in the UNSHARDED state.
         pivot_ranges = self.get_pivot_ranges()
         if pivot_ranges:
-            sub_broker.merge_items(self._record_to_dict(
-                pivot_ranges, record_type=RECORD_TYPE_PIVOT_NODE))
+            pivot_ranges = \
+                [self._record_to_dict(list(r) + [0], RECORD_TYPE_PIVOT_NODE)
+                 for r in pivot_ranges]
+            sub_broker.merge_items(pivot_ranges)
 
         # We also need to sync the sync tables as we have no idea how long
         # sharding will take and we want to be able to continue replication
@@ -1537,13 +1542,13 @@ class ContainerBroker(DatabaseBroker):
             try:
                 sql = "INSERT into object " \
                       "(ROWID, name, created_at, size, content_type, etag) " \
-                    "values (?, 'pivted_remove', ?, 0, '', ?);"
-                conn.execute(sql, max_row, Timestamp(time.time()).internal,
-                             '68b329da9893e34099c7d8ad5cb9c940')
-                conn.execute('DELETE FROM object WHERE ROWID = ?;', max_row)
+                    "values (?, 'pivted_remove', ?, 0, '', ?)"
+                conn.execute(sql, (max_row, Timestamp(time.time()).internal,
+                                   '68b329da9893e34099c7d8ad5cb9c940'))
+                conn.execute('DELETE FROM object WHERE ROWID = %d' % max_row)
             except sqlite3.OperationalError as err:
                 self.logger.error(_('Failed to set the ROWID of the pivot '
-                                    'database for %s/%s: ?'), self.account,
+                                    'database for %s/%s: %s'), self.account,
                                   self.container, err)
 
         return True

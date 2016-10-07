@@ -560,8 +560,8 @@ class ContainerController(BaseStorageServer):
             args = [
                 obj, req_timestamp.internal,
                 int(req.headers['x-size']),
-                req.headers['x-content-type'],
-                req.headers['x-etag'], 0,
+                req.headers.get('x-content-type'),
+                req.headers.get('x-etag'), 0,
                 obj_policy_index,
                 req.headers.get('x-content-type-timestamp'),
                 req.headers.get('x-meta-timestamp')]
@@ -576,12 +576,12 @@ class ContainerController(BaseStorageServer):
                     bytes_used=req.headers.get('x-backend-pivot-bytes'),
                     record_type=int(record_type),
                     lower=req.headers.get('x-backend-pivot-lower'),
-                    uppder=req.headers.get('x-backend-pivot-upper')))
+                    upper=req.headers.get('x-backend-pivot-upper')))
 
                 obj_timestamp = req.headers.get('x-backend-timestamp')
                 req_timestamp = obj_timestamp or req_timestamp
 
-                args = [obj, req_timestamp.internal,
+                args = [obj, req_timestamp,
                         int(req.headers['x-size']), '', '', 0]
 
             elif len(broker.get_pivot_ranges()) > 0:

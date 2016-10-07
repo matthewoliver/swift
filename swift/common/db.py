@@ -221,7 +221,7 @@ class DatabaseBroker(object):
         The baseline implementation returns a full pathname to a database.
         This is vital for useful diagnostics.
         """
-        return self._db_file
+        return self.db_file
 
     def initialize(self, put_timestamp=None, storage_policy_index=None):
         """
@@ -296,13 +296,13 @@ class DatabaseBroker(object):
             conn.close()
             with open(tmp_db_file, 'r+b') as fp:
                 os.fsync(fp.fileno())
-            with lock_parent_directory(self._db_file, self.pending_timeout):
+            with lock_parent_directory(self.db_file, self.pending_timeout):
                 if self._db_exists():
                     # It's as if there was a "condition" where different parts
                     # of the system were "racing" each other.
-                    raise DatabaseAlreadyExists(self._db_file)
-                renamer(tmp_db_file, self._db_file)
-            self.conn = get_db_connection(self._db_file, self.timeout)
+                    raise DatabaseAlreadyExists(self.db_file)
+                renamer(tmp_db_file, self.db_file)
+            self.conn = get_db_connection(self.db_file, self.timeout)
         else:
             self.conn = conn
 
@@ -581,7 +581,7 @@ class DatabaseBroker(object):
             self.merge_items([record])
             return
         if not self._db_exists():
-            raise DatabaseConnectionError(self._db_file, "DB doesn't exist")
+            raise DatabaseConnectionError(self.db_file, "DB doesn't exist")
         with lock_parent_directory(self.pending_file, self.pending_timeout):
             pending_size = 0
             try:
@@ -707,7 +707,7 @@ class DatabaseBroker(object):
                 pm += 50
                 yield pm * MB
 
-        stat = os.stat(self._db_file)
+        stat = os.stat(self.db_file)
         file_size = stat.st_size
         allocated_size = stat.st_blocks * 512
         for point in prealloc_points():
@@ -715,7 +715,7 @@ class DatabaseBroker(object):
                 prealloc_size = point
                 break
         if allocated_size < prealloc_size:
-            with open(self._db_file, 'rb+') as fp:
+            with open(self.db_file, 'rb+') as fp:
                 fallocate(fp.fileno(), int(prealloc_size))
 
     def get_raw_metadata(self):

@@ -219,9 +219,9 @@ class Replicator(Daemon):
              'replication_last': now},
             self.rcache, self.logger)
         self.logger.info(' '.join(['%s:%s' % item for item in
-                         self.stats.items() if item[0] in
-                         ('no_change', 'hashmatch', 'rsync', 'diff', 'ts_repl',
-                          'empty', 'diff_capped')]))
+                                   self.stats.items() if item[0] in
+                                   ('no_change', 'hashmatch', 'rsync', 'diff', 'ts_repl',
+                                    'empty', 'diff_capped')]))
 
     def _add_failure_stats(self, failure_devs_info):
         for node, dev in failure_devs_info:
@@ -258,14 +258,15 @@ class Replicator(Daemon):
             db_file = [db_file]
 
         for db_f in db_file:
-            args = popen_args.copy()
-            args.extend([db_f, remote_file])
-            proc = subprocess.Popen(popen_args)
+            args = list(popen_args)
+            rfile = "%s%s" % (remote_file, os.path.basename(db_f))
+            args.extend([db_f, rfile])
+            proc = subprocess.Popen(args)
             proc.communicate()
             if proc.returncode != 0:
                 self.logger.error(
                     _('ERROR rsync failed with %(code)s: %(args)s'),
-                    {'code': proc.returncode, 'args': popen_args})
+                    {'code': proc.returncode, 'args': args})
                 return False
         return True
 
@@ -374,14 +375,14 @@ class Replicator(Daemon):
         if other_items:
             with Timeout(self.node_timeout):
                 response = http.replicate('merge_items', other_items,
-                                            local_id)
+                                          local_id)
             if not response or response.status >= 300 \
                     or response.status < 200:
                 if response:
                     self.logger.error(_('ERROR Bad response %(status)s '
                                         'from %(host)s'),
-                                        {'status': response.status,
-                                        'host': http.host})
+                                      {'status': response.status,
+                                       'host': http.host})
                 return False
 
     def _other_items_hook(self, broker):
@@ -515,7 +516,7 @@ class Replicator(Daemon):
         try:
             broker = self.brokerclass(object_file, pending_timeout=30)
             if self._is_locked(broker):
-                #TODO should do something about stats here.
+                # TODO should do something about stats here.
                 return
             broker.reclaim(now - self.reclaim_age,
                            now - (self.reclaim_age * 2))
