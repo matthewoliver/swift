@@ -3463,19 +3463,21 @@ cluster_dfw1 = http://dfw1.host/v1/
         for x in ('a', 'z', 'zzzz', '124fsdf', '', 1234):
             self.assertTrue(x in inf_pr)
 
+        ts = utils.Timestamp(time.time()).internal
+
         # test basic boundries
-        atof = utils.PivotRange('a', 'f')
-        ftol = utils.PivotRange('f', 'l')
-        ltor = utils.PivotRange('l', 'r')
-        rtoz = utils.PivotRange('r', 'z')
+        atof = utils.PivotRange('a-f', ts, 'a', 'f')
+        ftol = utils.PivotRange('f-l', ts, 'f', 'l')
+        ltor = utils.PivotRange('l-r', ts, 'l', 'r')
+        rtoz = utils.PivotRange('r-z', ts, 'r', 'z')
 
         # overlapping ranges
-        dtof = utils.PivotRange('d', 'f')
-        dtom = utils.PivotRange('d', 'm')
+        dtof = utils.PivotRange('d-f', ts, 'd', 'f')
+        dtom = utils.PivotRange('d-m', ts, 'd', 'm')
 
         # nones
-        nonetol = utils.PivotRange(None, 'l')
-        ltonone = utils.PivotRange('l', None)
+        nonetol = utils.PivotRange('None-l', ts, None, 'l')
+        ltonone = utils.PivotRange('l-None', ts, 'l', None)
 
         # test range > and <
         self.assertTrue(atof < ftol)
@@ -3517,10 +3519,11 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertFalse(nonetol.overlaps(ltonone))
 
     def test_find_pivot_range(self):
-        atof = utils.PivotRange('a', 'f')
-        ftol = utils.PivotRange('f', 'l')
-        ltor = utils.PivotRange('l', 'r')
-        rtoz = utils.PivotRange('r', 'z')
+        ts = utils.Timestamp(time.time()).internal
+        atof = utils.PivotRange('a-f', ts, 'a', 'f')
+        ftol = utils.PivotRange('f-l', ts, 'f', 'l')
+        ltor = utils.PivotRange('l-r', ts, 'l', 'r')
+        rtoz = utils.PivotRange('r-z', ts, 'r', 'z')
         ranges = [atof, ftol, ltor, rtoz]
 
         range = utils.find_pivot_range('b', ranges)

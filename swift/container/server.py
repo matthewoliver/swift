@@ -563,9 +563,8 @@ class ContainerController(BaseStorageServer):
                 req.headers.get('x-content-type'),
                 req.headers.get('x-etag'), 0,
                 obj_policy_index,
-                req.headers.get('x-content-type-timestamp'),
-                req.headers.get('x-meta-timestamp')]
-            kargs = {}
+                req.headers.get('x-content-type-timestamp')]
+            kargs = {'meta_timestamp': req.headers.get('x-meta-timestamp')}
 
             record_type = req.headers.get('x-backend-record-type')
             if record_type == str(RECORD_TYPE_PIVOT_NODE):
@@ -690,11 +689,13 @@ class ContainerController(BaseStorageServer):
             # Conversion has already happened (e.g. from a sharded node)
             return record
         if pivot:
-            (name, created, lower, upper, object_count, bytes_used) = record[:6]
+            (name, created, lower, upper, object_count, bytes_used,
+             meta_timestamp) = record[:7]
             response = {'name': name, 'lower': lower, 'upper': upper,
                         'object_count': object_count,
                         'bytes_used': bytes_used,
-                        'created_at': created}
+                        'created_at': created,
+                        'meta_timestamp': meta_timestamp}
         else:
             (name, created, size, content_type, etag) = record[:5]
             if content_type is None:
@@ -951,8 +952,8 @@ class ContainerController(BaseStorageServer):
             doc = Element('container', name=container.decode('utf-8'))
             fields = ["name", "hash", "bytes", "content_type", "last_modified"]
             if pivot:
-                fields = ["lower", "upper", "object_count", "bytes_used",
-                          "last_modified"]
+                fields = ["name", "lower", "upper", "object_count",
+                          "bytes_used", "last_modified", "meta_timestamp"]
             for obj in container_list:
                 record = self.update_data_record(obj, pivot)
                 if 'subdir' in record:

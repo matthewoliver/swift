@@ -3878,11 +3878,12 @@ def get_md5_socket():
 
 class PivotRange(object):
     def __init__(self, name=None, timestamp=None, lower=None, upper=None,
-                 obj_count=0, bytes_used=0):
+                 obj_count=0, bytes_used=0, meta_timestamp=None):
         self._name = name
         self._lower = lower
         self._upper = upper
         self._timestamp = timestamp
+        self._meta_timestamp = meta_timestamp if meta_timestamp else timestamp
         self._count = obj_count
         self._bytes = bytes_used
 
@@ -3914,12 +3915,17 @@ class PivotRange(object):
     def timestamp(self):
         return self._timestamp
 
+    @timestamp.setter
+    def timestamp(self, ts):
+        self._timestamp = ts
+
     @property
     def obj_count(self):
         return self._count
 
     @obj_count.setter
     def obj_count(self, count):
+        self.meta_timestamp = Timestamp(time.time()).internal
         self._count = count
 
     @property
@@ -3928,7 +3934,16 @@ class PivotRange(object):
 
     @bytes_used.setter
     def bytes_used(self, bytes_used):
+        self.meta_timestamp = Timestamp(time.time()).internal
         self._bytes = bytes_used
+
+    @property
+    def meta_timestamp(self):
+        return self._meta_timestamp
+
+    @meta_timestamp.setter
+    def meta_timestamp(self, ts):
+        self._meta_timestamp = ts
 
     def __contains__(self, item):
         if not self._lower and not self._upper:
@@ -4000,7 +4015,7 @@ class PivotRange(object):
 
     def __iter__(self):
         for x in (self.name, self.timestamp, self.lower, self.upper,
-                  self.obj_count, self.bytes_used):
+                  self.obj_count, self.bytes_used, self.meta_timestamp):
             yield x
 
 

@@ -274,9 +274,15 @@ def merge_data(item, existing):
 def merge_pivots(item, existing):
     if not existing:
         return True
-    if existing['created_at'] > item['created_at']:
+    if existing['created_at'] < item['created_at']:
+        return True
+    elif existing['created_at'] > item['created_at']:
+        return False
+
+    # created_at must be the same, now we need to look for meta data updates
+    if existing['meta_timestamp'] > item['meta_timestamp']:
         item, existing = existing, item
-    if existing['created_at'] == item['created_at']:
+    if existing['meta_timestamp'] == item['meta_timestamp']:
         return False
     for col in ('object_count', 'bytes_used'):
         item[col] = str(item[col])
@@ -457,6 +463,7 @@ class ContainerBroker(DatabaseBroker):
                     object_count INTEGER DEFAULT 0,
                     bytes_used INTEGER DEFAULT 0,
                     created_at TEXT,
+                    meta_timestamp TEXT,
                     deleted INTEGER DEFAULT 0
                 );
             """)
@@ -571,8 +578,8 @@ class ContainerBroker(DatabaseBroker):
         if record['record_type'] == RECORD_TYPE_PIVOT_NODE:
             return (record['name'], record['created_at'], record['lower'],
                     record['upper'], record['object_count'],
-                    record['bytes_used'], record['deleted'], 0, 0,
-                    record['record_type'])
+                    record['bytes_used'], record['meta_timestamp'],
+                    record['deleted'], 0, record['record_type'])
         return (record['name'], record['created_at'], record['size'],
                 record['content_type'], record['etag'], record['deleted'],
                 record['storage_policy_index'],
@@ -602,14 +609,16 @@ class ContainerBroker(DatabaseBroker):
                             object data or a pivot point)
         """
         if record_type == RECORD_TYPE_PIVOT_NODE:
-            if name == 'None':
+            if lower == 'None':
                 name = None
             if upper == 'None':
                 upper = None
             record = {'name': name, 'created_at': timestamp, 'lower': lower,
                       'upper': upper, 'object_count': object_count,
                       'bytes_used': bytes_used, 'deleted': deleted,
-                      'storage_policy_index': 0, 'record_type': record_type}
+                      'storage_policy_index': 0,
+                      'meta_timestamp': meta_timestamp,
+                      'record_type': record_type}
         else:
             record = {'name': name, 'created_at': timestamp, 'size': size,
                       'content_type': content_type, 'etag': etag,
@@ -1006,7 +1015,7 @@ class ContainerBroker(DatabaseBroker):
                         'deleted', 'storage_policy_index')
             else:
                 keys = ('name', 'created_at', 'lower', 'upper', 'object_count',
-                        'bytes_used', 'deleted')
+                        'bytes_used', 'meta_timestamp', 'deleted')
                 result = dict(zip(keys, rec))
                 result.update({'record_type': record_type})
                 return result
@@ -1053,7 +1062,7 @@ class ContainerBroker(DatabaseBroker):
                          in rec_list[offset:offset + SQLITE_ARG_LIMIT]]
                 # None/NULL must be checked with the IS operator
                 sql = (('SELECT name, created_at, lower, upper, object_count, '
-                        'bytes_used, deleted '
+                        'bytes_used, meta_timestamp, deleted '
                         'FROM pivot_ranges '
                         'WHERE %s name IN (%s)')
                        % (query_mod,
@@ -1080,7 +1089,8 @@ class ContainerBroker(DatabaseBroker):
                 keys = ('name',)
                 del_keys = ('name',)
                 add_keys = ('name', 'created_at', 'lower', 'upper',
-                            'object_count', 'bytes_used', 'deleted')
+                            'object_count', 'bytes_used', 'meta_timestamp',
+                            'deleted')
                 transform_item = merge_pivots
                 table = 'pivot_ranges'
                 record_type = RECORD_TYPE_PIVOT_NODE
@@ -1318,7 +1328,8 @@ class ContainerBroker(DatabaseBroker):
         def _get_pivot_ranges(conn):
             try:
                 sql = '''
-                SELECT name, created_at, lower, upper, object_count, bytes_used
+                SELECT name, created_at, lower, upper, object_count, bytes_used,
+                    meta_timestamp
                 FROM pivot_ranges
                 WHERE deleted=0
                 ORDER BY lower, upper;
@@ -1406,6 +1417,7 @@ class ContainerBroker(DatabaseBroker):
                         'upper': item.upper,
                         'object_count': item.obj_count,
                         'bytes_used': item.bytes_used,
+                        'meta_timestamp': item.meta_timestamp,
                         'deleted': 0}
                 else:
                     obj = {

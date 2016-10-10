@@ -185,8 +185,10 @@ class ContainerSharder(ContainerReplicator):
                 created_at = pivot.get('created_at') or None
                 object_count = pivot.get('object_count') or 0
                 bytes_used = pivot.get('bytes_used') or 0
+                meta_timestamp = pivot.get('meta_timestamp') or None
                 ranges.append(PivotRange(pivot['name'], created_at, lower,
-                                         `upper, object_count, bytes_used))
+                                         upper, object_count, bytes_used,
+                                         meta_timestamp))
         except ValueError:
             # Failed to decode the json response
             return None
@@ -237,6 +239,8 @@ class ContainerSharder(ContainerReplicator):
         timestamp = None
         for item in items:
             try:
+                if isinstance(item, PivotRange):
+                    item = tuple(item)
                 if delete:
                     # Generate a new delete timestamp based off the existing
                     # created_at, this way we don't clobber other objects that
@@ -257,6 +261,7 @@ class ContainerSharder(ContainerReplicator):
                         'upper': item[3],
                         'object_count': item[4],
                         'bytes_used': item[5],
+                        'meta_timestamp': item[6],
                         'deleted': 1 if delete else 0,
                         'storage_policy_index': 0,
                         'record_type': RECORD_TYPE_PIVOT_NODE})
@@ -285,9 +290,9 @@ class ContainerSharder(ContainerReplicator):
         return indices[0] if indices else None
 
     def _add_shard_metadata(self, broker, root_account, root_container,
-                            pivot):
+                            pivot, force=False):
         if not broker.metadata.get('X-Container-Sysmeta-Shard-Account') \
-                and pivot:
+                and pivot or force:
             timestamp = Timestamp(time.time()).internal
             broker.update_metadata({
                 'X-Container-Sysmeta-Shard-Account': (root_account, timestamp),
@@ -295,6 +300,10 @@ class ContainerSharder(ContainerReplicator):
                     (root_container, timestamp),
                 'X-Container-Sysmeta-Shard-Lower': (pivot.lower, timestamp),
                 'X-Container-Sysmeta-Shard-Upper': (pivot.upper, timestamp),
+                'X-Container-Sysmeta-Shard-Timestamp':
+                    (pivot.timestamp, timestamp),
+                'X-Container-Sysmeta-Shard-Meta-Timestamp':
+                    (pivot.meta_timestamp, timestamp),
                 'X-Container-Sysmeta-Sharding': (None, timestamp)})
 
     def _misplaced_objects(self, broker, root_account, root_container, pivot):
@@ -419,15 +428,16 @@ class ContainerSharder(ContainerReplicator):
         self.logger.info('Finished misplaced shard replication')
 
     @staticmethod
-    def get_pivot_range(broker, timestamp=None):
-        _timestamp = None
-        lower = broker.metadata.get('X-Container-Sysmeta-Shard-Lower')
-        if lower:
-            lower, _timestamp = lower
-        upper = broker.metadata.get('X-Container-Sysmeta-Shard-Upper')
-        if upper:
-            upper, _timestamp = upper
+    def get_pivot_range(broker):
+        timestamp = ContainerSharder.get_metadata_item(
+            broker, 'X-Container-Sysmeta-Shard-Timestamp')
+        meta_timestamp = ContainerSharder.get_metadata_item(
+            broker, 'X-Container-Sysmeta-Shard-Meta-Timestamp')
+        lower = ContainerSharder.get_metadata_item(
+            broker, 'X-Container-Sysmeta-Shard-Lower')
 
+        upper = ContainerSharder.get_metadata_item(
+            broker, 'X-Container-Sysmeta-Shard-Upper')
         if not lower and not upper:
             return None
 
@@ -436,9 +446,8 @@ class ContainerSharder(ContainerReplicator):
         if not upper:
             upper = None
 
-        if not timestamp:
-            timestamp = _timestamp
-        return PivotRange(broker.container, timestamp, lower, upper)
+        return PivotRange(broker.container, timestamp, lower, upper,
+                          meta_timestamp=meta_timestamp)
 
     @staticmethod
     def get_shard_root_path(broker):
@@ -574,17 +583,17 @@ class ContainerSharder(ContainerReplicator):
     def _update_pivot_counts(self, root_account, root_container, broker):
         if broker.container == root_container:
             return
-        timestamp = Timestamp(time.time()).internal
-        pivot = self.get_pivot_range(broker, timestamp)
+        pivot = self.get_pivot_range(broker)
         if not pivot:
             return
         tmp_info = broker.get_info()
-        pivot = (pivot.name, pivot.timestamp, pivot.lower, pivot.upper,
-                 tmp_info['object_count'], tmp_info['bytes_used'])
+        pivot.obj_count = tmp_info['object_count']
+        pivot.bytes_used = tmp_info['bytes_used']
         self._update_pivot_ranges(root_account, root_container, 'PUT',
-                                  [pivot])
+                                  [tuple(pivot)])
 
-    def get_metadata_item(self, broker, header):
+    @staticmethod
+    def get_metadata_item(broker, header):
         item = broker.metadata.get(header)
         return None if item is None else item[0]
 
@@ -972,8 +981,8 @@ class ContainerSharder(ContainerReplicator):
                          broker.account, broker.container)
 
         # get the last pivot point found to continue from
-        pivot_ranges = broker.get_pivot_ranges()
-        old_piv = marker = pivot_ranges[-1][PR_UPPER] if pivot_ranges else None
+        pivot_ranges = broker.build_pivot_ranges()
+        old_piv = marker = pivot_ranges[-1].upper if pivot_ranges else None
         progress = len(pivot_ranges) * self.split_size
         obj_count = broker.get_info().get('object_count', 0)
 
@@ -1044,7 +1053,9 @@ class ContainerSharder(ContainerReplicator):
             try:
                 headers.update({
                     'X-Container-Sysmeta-Shard-Lower': lower,
-                    'X-Container-Sysmeta-Shard-Upper': pivot})
+                    'X-Container-Sysmeta-Shard-Upper': pivot,
+                    'X-Container-Sysmeta-Shard-Timestamp': timestamp,
+                    'X-Container-Sysmeta-Shard-Meta-Timestamp': timestamp})
                 self.swift.create_container(piv_account, piv_name,
                                             headers=headers)
             except internal_client.UnexpectedResponse as ex:
@@ -1054,7 +1065,9 @@ class ContainerSharder(ContainerReplicator):
                                     'Will try again next pass'),
                                   broker.account, broker.container)
                 break
-            pivot_ranges.append((piv_name, timestamp, lower, pivot, 0, 0))
+            new_pivot = PivotRange(piv_name, timestamp, lower, pivot, 0, 0,
+                                   timestamp)
+            pivot_ranges.append(new_pivot)
             lower = pivot
 
         if i + 1 < len(found_pivots):
@@ -1066,13 +1079,17 @@ class ContainerSharder(ContainerReplicator):
             timestamp = Timestamp(time.time()).internal
             piv_name = self.generate_pivot_name(root_container, self.node_idx,
                                                 '', timestamp)
-            pivot_ranges.append((piv_name, timestamp, lower, None, 0, 0))
+            new_pivot = PivotRange(piv_name, timestamp, lower, None, 0, 0,
+                                   timestamp)
+            pivot_ranges.append(new_pivot)
             # add something the found_pivots so the stats will be correct.
             found_pivots.append('last one')
             try:
                 headers.update({
                     'X-Container-Sysmeta-Shard-Lower': lower,
-                    'X-Container-Sysmeta-Shard-Upper': None})
+                    'X-Container-Sysmeta-Shard-Upper': None,
+                    'X-Container-Sysmeta-Shard-Timestamp': timestamp,
+                    'X-Container-Sysmeta-Shard-Meta-Timestamp': timestamp})
                 self.swift.create_container(piv_account, piv_name,
                                             headers=headers)
             except internal_client.UnexpectedResponse as ex:
@@ -1199,11 +1216,9 @@ class ContainerSharder(ContainerReplicator):
             lower_n = find_pivot_range(pivot.lower, self.ranges)
 
             obj_count = [0]
-            acct, cont = pivot_to_pivot_container(root_account, root_container,
-                                                  pivot_range=lower_n)
 
             if self._get_quorum(None, post_success=on_success,
-                                account=broker.account, container=cont):
+                                account=broker.account, container=lower_n.name):
                 lower_c = obj_count[0]
 
         if pivot.upper:
@@ -1211,11 +1226,9 @@ class ContainerSharder(ContainerReplicator):
             upper_n = find_pivot_range(upper, self.ranges)
 
             obj_count = [0]
-            acct, cont = pivot_to_pivot_container(root_account, root_container,
-                                                  pivot_range=upper_n)
 
             if self._get_quorum(None, post_success=on_success,
-                                account=broker.account, container=cont):
+                                account=broker.account, container=upper_n.name):
                 upper_c = obj_count[0]
 
         # got counts. now need to compare.
@@ -1223,12 +1236,11 @@ class ContainerSharder(ContainerReplicator):
         smallest = min(neighbours.keys())
         if smallest + curr_obj_count > SHARD_CONTAINER_SIZE * \
                 self.shrink_merge_point:
-            _acct, cont = pivot_to_pivot_container(
-                root_account, root_container, pivot_range=neighbours[smallest])
             self.logger.info(
                 _('If this container merges with it\'s smallest neighbour (%s) '
                   'there will be too many objects. %d (merged) > %d '
-                  '(shard_merge_point)'), cont, smallest + curr_obj_count,
+                  '(shard_merge_point)'), neighbours[smallest].name,
+                smallest + curr_obj_count,
                 SHARD_CONTAINER_SIZE * self.shrink_merge_point)
             return
 
@@ -1240,12 +1252,11 @@ class ContainerSharder(ContainerReplicator):
         shrink_meta = {
             'X-Container-Sysmeta-Shard-Merge': n_pivot.name,
             'X-Container-Sysmeta-Shard-Shrink': broker.container}
-        a, c = pivot_to_pivot_container(root_account, root_container,
-                                        pivot=n_pivot)
 
         # TODO This exception handling needs to be cleaned up.
         try:
-            for acct, cont in ((broker.account, broker.container), (a, c)):
+            for acct, cont in ((broker.account, broker.container),
+                               (broker.account, n_pivot.name)):
                 self.swift.set_container_metadata(acct, cont, shrink_meta)
         except Exception as ex:
             self.logger.error('There was a problem adding the metadata %s' % ex)
@@ -1263,6 +1274,7 @@ class ContainerSharder(ContainerReplicator):
 
         lower = resp.headers.get('X-Container-Sysmeta-Shard-Lower')
         upper = resp.headers.get('X-Container-Sysmeta-Shard-Upper')
+        timestamp = resp.headers.get('X-Container-Sysmeta-Shard-Timestamp')
 
         if not lower and not upper:
             return None
@@ -1272,8 +1284,8 @@ class ContainerSharder(ContainerReplicator):
         if not upper:
             upper = None
 
-        return PivotRange(container, Timestamp(time.time()).internal, lower,
-                          upper)
+        return PivotRange(container, timestamp, lower, upper,
+                          meta_timestamp=Timestamp(time.time()).internal)
 
     def _shrink_phase_2(self, broker, root_account, root_container):
         # We've set metadata last phase. lets make sure it's still the case.
@@ -1320,14 +1332,12 @@ class ContainerSharder(ContainerReplicator):
                      storage_policy_index=policy_index)
 
         try:
-            acct, cont = pivot_to_pivot_container(root_account, root_container,
-                                                  pivot_range=merge_range)
-
             new_part, new_broker, node_id = \
-                self._get_shard_broker(acct, cont, policy_index)
+                self._get_shard_broker(broker.account, merge_range.name,
+                                       policy_index)
 
             self._add_shard_metadata(new_broker, root_account, root_container,
-                                     merge_range)
+                                     merge_range, force=True)
 
             with new_broker.sharding_lock():
                 self._add_items(broker, new_broker, query)
@@ -1338,9 +1348,9 @@ class ContainerSharder(ContainerReplicator):
 
         timestamp = Timestamp(time.time()).internal
         info = new_broker.get_info()
-        merge_piv = (merge_range.name, merge_range.lower, timestamp,
+        merge_piv = (merge_range.name, timestamp, merge_range.lower,
                      merge_range.upper, "+%d" % info['object_count'],
-                     "+%d" % info['bytes_used'])
+                     "+%d" % info['bytes_used'], timestamp)
         # Push the new pivot range to the root container,
         # we do this so we can short circuit PUTs.
         self._update_pivot_ranges(root_account, root_container, 'PUT',
@@ -1348,7 +1358,7 @@ class ContainerSharder(ContainerReplicator):
 
         # We also need to remove the shrink pivot from the root container
         empty_piv = (shrink_range.name, timestamp, shrink_range.lower,
-                     shrink_range.upper, 0, 0)
+                     shrink_range.upper, 0, 0, timestamp)
         self._update_pivot_ranges(root_account, root_container, 'DELETE',
                                   (empty_piv,))
 
