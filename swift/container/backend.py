@@ -1398,16 +1398,28 @@ class ContainerBroker(DatabaseBroker):
         result = list()
         for item in nodes:
             try:
-                obj = {
-                    'name': item[0],
-                    'created_at': item[1],
-                    'lower': item[2],
-                    'upper': item[3],
-                    'object_count': item[4],
-                    'bytes_used': item[5],
-                    'deleted': item[6] if len(item) > 6 else 0,
+                if isinstance(item, PivotRange):
+                    obj = {
+                        'name': item.name,
+                        'created_at': item.timestamp,
+                        'lower': item.lower,
+                        'upper': item.upper,
+                        'object_count': item.obj_count,
+                        'bytes_used': item.bytes_used,
+                        'deleted': 0}
+                else:
+                    obj = {
+                        'name': item[0],
+                        'created_at': item[1],
+                        'lower': item[2],
+                        'upper': item[3],
+                        'object_count': item[4],
+                        'bytes_used': item[5],
+                        'deleted': item[6] if len(item) > 6 else 0}
+
+                obj.update({
                     'storage_policy_index': 0,
-                    'record_type': RECORD_TYPE_PIVOT_NODE}
+                    'record_type': RECORD_TYPE_PIVOT_NODE})
                 result.append(obj)
             except Exception:
                 continue
@@ -1417,7 +1429,7 @@ class ContainerBroker(DatabaseBroker):
         ranges = list()
 
         for node in self.get_pivot_ranges():
-            ranges.append(PivotRange(node[0], node[2], node[3], node[1]))
+            ranges.append(PivotRange(*node))
         return ranges
 
     def _get_next_pivot_point(self, last_upper, conn):

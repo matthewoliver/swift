@@ -3875,12 +3875,16 @@ def get_md5_socket():
 
     return md5_sockfd
 
+
 class PivotRange(object):
-    def __init__(self, name=None, lower=None, upper=None, timestamp=None):
+    def __init__(self, name=None, timestamp=None, lower=None, upper=None,
+                 obj_count=0, bytes_used=0):
         self._name = name
         self._lower = lower
         self._upper = upper
         self._timestamp = timestamp
+        self._count = obj_count
+        self._bytes = bytes_used
 
     @property
     def name(self):
@@ -3909,6 +3913,22 @@ class PivotRange(object):
     @property
     def timestamp(self):
         return self._timestamp
+
+    @property
+    def obj_count(self):
+        return self._count
+
+    @obj_count.setter
+    def obj_count(self, count):
+        self._count = count
+
+    @property
+    def bytes_used(self):
+        return self._bytes
+
+    @bytes_used.setter
+    def bytes_used(self, bytes_used):
+        self._bytes = bytes_used
 
     def __contains__(self, item):
         if not self._lower and not self._upper:
@@ -3943,7 +3963,11 @@ class PivotRange(object):
         return self._lower == other.lower and self._upper == other.upper
 
     def __repr__(self):
-        return '(%s to %s as of %s)' % (self.lower, self.upper, self.timestamp)
+        if isinstance(self.timestamp, Timestamp):
+            ts = self.timestamp.internal
+        else:
+            ts = self.timestamp
+        return '(%s to %s as of %s)' % (self.lower, self.upper, ts)
 
     def entire_namespace(self):
         return self._lower is None and self._upper is None
@@ -3973,6 +3997,11 @@ class PivotRange(object):
             return self._timestamp > other.timestamp
         else:
             return False
+
+    def __iter__(self):
+        for x in (self.name, self.timestamp, self.lower, self.upper,
+                  self.obj_count, self.bytes_used):
+            yield x
 
 
 def find_pivot_range(item, ranges):

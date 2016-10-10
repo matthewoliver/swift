@@ -183,8 +183,10 @@ class ContainerSharder(ContainerReplicator):
                 lower = pivot.get('lower') or None
                 upper = pivot.get('upper') or None
                 created_at = pivot.get('created_at') or None
-                ranges.append(PivotRange(pivot['name'], lower, upper,
-                                         created_at))
+                object_count = pivot.get('object_count') or 0
+                bytes_used = pivot.get('bytes_used') or 0
+                ranges.append(PivotRange(pivot['name'], created_at, lower,
+                                         `upper, object_count, bytes_used))
         except ValueError:
             # Failed to decode the json response
             return None
@@ -436,7 +438,7 @@ class ContainerSharder(ContainerReplicator):
 
         if not timestamp:
             timestamp = _timestamp
-        return PivotRange(broker.container, lower, upper, timestamp)
+        return PivotRange(broker.container, timestamp, lower, upper)
 
     @staticmethod
     def get_shard_root_path(broker):
@@ -508,8 +510,7 @@ class ContainerSharder(ContainerReplicator):
         if root_container == broker.container:
             # This is the root container, and therefore the tome of knowledge,
             # all we can do is check there is nothing screwy with the range
-            ranges = broker.get_pivot_ranges()
-            ranges = [PivotRange(r[0], r[2], r[3], r[1]) for r in ranges]
+            ranges = broker.build_pivot_ranges()
             overlaps = ContainerSharder.find_overlapping_ranges(ranges)
             for overlap in overlaps:
                 self.logger.error(_('Range overlaps found, attempting to '
@@ -1271,7 +1272,8 @@ class ContainerSharder(ContainerReplicator):
         if not upper:
             upper = None
 
-        return PivotRange(container, lower, upper)
+        return PivotRange(container, Timestamp(time.time()).internal, lower,
+                          upper)
 
     def _shrink_phase_2(self, broker, root_account, root_container):
         # We've set metadata last phase. lets make sure it's still the case.
@@ -1421,7 +1423,7 @@ class ContainerSharder(ContainerReplicator):
         scan_complete = self.get_metadata_item(
             broker, 'X-Container-Sysmeta-Sharding-Scan-Done')
 
-        pivot_ranges = broker.get_pivot_ranges()
+        pivot_ranges = broker.build_pivot_ranges()
         if not pivot_ranges:
             # No pivot points yet defined.
             return
@@ -1430,9 +1432,8 @@ class ContainerSharder(ContainerReplicator):
             broker.set_sharding_state()
 
         pivots_todo = [
-            PivotRange(p[PR_NAME], p[PR_LOWER], p[PR_UPPER], p[PR_CREATED_AT])
-            for p in pivot_ranges
-            if p[PR_UPPER] > last_pivot or p[PR_LOWER] > last_pivot]
+            p for p in pivot_ranges
+            if p.upper > last_pivot or p.lower > last_pivot]
         if not pivots_todo:
             # This means no new pivot_ranges have been added since last pass.
             # If the scanner is complete, then we have finished sharding.
@@ -1452,6 +1453,7 @@ class ContainerSharder(ContainerReplicator):
             self.logger.info(_('Starting to shard %s/%s'),
                              broker.account, broker.container)
 
+        pivots_done = []
         for i in range(self.shard_batch_size):
             if pivot_ranges:
                 pivot = pivots_todo.pop(0)
@@ -1481,6 +1483,11 @@ class ContainerSharder(ContainerReplicator):
                 with new_broker.sharding_lock():
                     self._add_items(broker, new_broker, q)
 
+                info = new_broker.get_info()
+                pivot.obj_count = info['object_count']
+                pivot.bytes_used = info['bytes_used']
+                pivots_done.append(pivot)
+
             except DeviceUnavailable as duex:
                 self.logger.warning(_(str(duex)))
                 return
@@ -1493,6 +1500,8 @@ class ContainerSharder(ContainerReplicator):
             self.logger.info(_('Node %d sharded %s/%s at pivot %s.'),
                              self.node_id, broker.account, broker.container,
                              pivot.upper)
+        if pivots_done:
+            broker.merge_items(broker.pivot_nodes_to_items(pivots_done))
         any(self.cpool)
 
         if scan_complete and not pivots_todo:
