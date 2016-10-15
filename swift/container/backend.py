@@ -504,8 +504,8 @@ class ContainerBroker(DatabaseBroker):
         data = pickle.loads(entry.decode('base64'))
         record_type = data[9] if len(data) > 9 else RECORD_TYPE_OBJECT
         if record_type and record_type == RECORD_TYPE_PIVOT_NODE:
-            (name, timestamp, lower, upper, object_count, bytes_used, deleted) \
-                = data[:7]
+            (name, timestamp, lower, upper, object_count, bytes_used,
+             meta_timestamp, deleted) = data[:8]
             item = {
                 'name': name,
                 'created_at': timestamp,
@@ -513,6 +513,7 @@ class ContainerBroker(DatabaseBroker):
                 'upper': upper,
                 'object_count': object_count,
                 'bytes_used': bytes_used,
+                'meta_timestamp': meta_timestamp,
                 'deleted': deleted,
                 'storage_policy_index': 0,
                 'record_type': record_type}
@@ -610,7 +611,7 @@ class ContainerBroker(DatabaseBroker):
         """
         if record_type == RECORD_TYPE_PIVOT_NODE:
             if lower == 'None':
-                name = None
+                lower = None
             if upper == 'None':
                 upper = None
             record = {'name': name, 'created_at': timestamp, 'lower': lower,
@@ -1427,7 +1428,8 @@ class ContainerBroker(DatabaseBroker):
                         'upper': item[3],
                         'object_count': item[4],
                         'bytes_used': item[5],
-                        'deleted': item[6] if len(item) > 6 else 0}
+                        'meta_timestamp': item[6],
+                        'deleted': item[7] if len(item) > 7 else 0}
 
                 obj.update({
                     'storage_policy_index': 0,
@@ -1575,6 +1577,10 @@ class ContainerBroker(DatabaseBroker):
                                     'database for %s/%s: %s'), self.account,
                                   self.container, err)
 
+        # Now we need to reset the connection so next time the correct database
+        # will be in use.
+        self.conn = None
+
         return True
 
     def set_sharded_state(self):
@@ -1587,6 +1593,9 @@ class ContainerBroker(DatabaseBroker):
 
         # TODO add some checks to see if we are ready to unlink the old db
         os.unlink(self._db_file)
+
+        # now reset the connection so next time the coeect database will be used
+        self.conn = None
 
     def get_brokers(self):
         brokers = []

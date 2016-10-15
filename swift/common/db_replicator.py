@@ -99,8 +99,11 @@ def roundrobin_datadirs(datadirs):
                     if not os.path.isdir(hash_dir):
                         continue
                     object_file = os.path.join(hash_dir, hsh + '.db')
+                    piv_object_file = os.path.join(hash_dir, hsh + '_pivot.db')
                     if os.path.exists(object_file):
                         yield (partition, object_file, node_id)
+                    elif os.path.exists(piv_object_file):
+                        yield (partition, piv_object_file, node_id)
 
     its = [walk_datadir(datadir, node_id) for datadir, node_id in datadirs]
     while its:

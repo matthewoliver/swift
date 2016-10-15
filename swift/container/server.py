@@ -578,11 +578,10 @@ class ContainerController(BaseStorageServer):
                     upper=req.headers.get('x-backend-pivot-upper')))
 
                 obj_timestamp = req.headers.get('x-backend-timestamp')
-                req_timestamp = obj_timestamp or req_timestamp
+                req_timestamp = obj_timestamp or req_timestamp.internal
 
                 args = [obj, req_timestamp,
                         int(req.headers['x-size']), '', '', 0]
-
             elif len(broker.get_pivot_ranges()) > 0:
                 # cannot put to a root shard container, find actual container
                 res = self._find_shard_location(req, broker, obj,
@@ -716,7 +715,7 @@ class ContainerController(BaseStorageServer):
         objects = list()
         used_ranges = list()
         params = req.params.copy()
-        params.update({'format': 'json', 'limit': limit[0]})
+        params.update({'format': 'json', 'limit': limit})
         db_state = broker.get_db_state()
         if broker.is_root_container():
             sharded_account = account_to_pivot_account(broker.account)
@@ -878,8 +877,8 @@ class ContainerController(BaseStorageServer):
 
             if end:
                 break
-        headers['X-Container-Object-Count'] = object_count[0]
-        headers['X-Container-Bytes-Used'] = object_bytes[0]
+        headers['X-Container-Object-Count'] = object_count
+        headers['X-Container-Bytes-Used'] = object_bytes
 
         return self.create_listing(req, out_content_type, {}, headers,
                                    broker.metadata, objects, broker.container)
