@@ -26,7 +26,8 @@ from random import shuffle, randint
 import swift.common.db
 from swift.container.sync_store import ContainerSyncStore
 from swift.container.backend import ContainerBroker, DATADIR, \
-    RECORD_TYPE_PIVOT_NODE, DB_STATE_SHARDING
+    RECORD_TYPE_PIVOT_NODE, DB_STATE_SHARDING, DB_STATE_UNSHARDED, \
+    DB_STATE_SHARDED
 from swift.container.replicator import ContainerReplicatorRpc
 from swift.common import ring
 from swift.common.db import DatabaseAlreadyExists
@@ -39,7 +40,7 @@ from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, validate_sync_to, \
     config_true_value, timing_stats, replication, \
     override_bytes_from_content_type, get_log_line, pivot_to_pivot_container, \
-    find_pivot_range, account_to_pivot_account
+    find_pivot_range, account_to_pivot_account, whataremyips
 from swift.common.constraints import check_mount, valid_timestamp, check_utf8
 from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
@@ -77,7 +78,6 @@ def gen_resp_headers(info, is_deleted=False):
             'X-Timestamp': Timestamp(info.get('created_at', 0)).normal,
             'X-PUT-Timestamp': Timestamp(
                 info.get('put_timestamp', 0)).normal,
-            'X-Backend-Pivot-Point': info.get('pivot_point', ''),
         })
     return headers
 
@@ -104,6 +104,8 @@ class ContainerController(BaseStorageServer):
         self.realms_conf = ContainerSyncRealms(
             os.path.join(swift_dir, 'container-sync-realms.conf'),
             self.logger)
+        self.ips = whataremyips()
+        self.port = int(conf.get('bind_port', 6201))
         #: The list of hosts we're allowed to send syncs to. This can be
         #: overridden by data in self.realms_conf
         self.allowed_sync_hosts = [
@@ -268,10 +270,9 @@ class ContainerController(BaseStorageServer):
         _, nodes = self.ring.get_nodes(account, container)
         if random:
             return randint(0, len(nodes) - 1)
-        ip, port = req.host.split(':')
         indices = [node['index'] for node in nodes
-                    if node['ip'] == ip and
-                       node['port'] == int(port) and
+                    if node['ip'] in self.ips and
+                       node['port'] == self.port and
                        node['device'] == drive]
 
         if indices:
@@ -660,13 +661,20 @@ class ContainerController(BaseStorageServer):
         headers = gen_resp_headers(info, is_deleted=is_deleted)
         if is_deleted:
             return HTTPNotFound(request=req, headers=headers)
-        if broker.is_root_container() and len(broker.get_pivot_ranges()) > 0:
+        db_state = broker.get_db_state()
+        if broker.is_root_container() and db_state == DB_STATE_SHARDED:
             # Sharded, so lets ask the ranges table how many objects and bytes
             # are used.
             usage = broker.get_pivot_usage()
             headers.update(
                     {'X-Container-Object-Count': usage.get('object_count', 0),
                      'X-Container-Bytes-Used': usage.get('bytes_used', 0)})
+        elif db_state == DB_STATE_SHARDING:
+            info, is_deleted = broker.get_brokers()[0].get_info_is_deleted()
+            headers.update(
+                    {'X-Container-Object-Count': info.get('object_count', 0),
+                     'X-Container-Bytes-Used': info.get('bytes_used', 0)})
+
         self._add_metadata(headers, broker.metadata)
         headers['Content-Type'] = out_content_type
         return HTTPNoContent(request=req, headers=headers, charset='utf-8')
@@ -723,9 +731,9 @@ class ContainerController(BaseStorageServer):
             sharded_account = broker.account
         sharded_upto = None
         if db_state == DB_STATE_SHARDING:
-            node_id = self._get_node_index(req)
+            node_idx = self._get_node_index(req)
             sharded_upto = broker.metadata.get(
-                'X-Container-Sysmeta-Shard-Last-%d' % node_id)
+                'X-Container-Sysmeta-Shard-Last-%d' % node_idx)
             sharded_upto = None if not sharded_upto else sharded_upto[0]
 
         # Firstly we need the requested container's, the root container, pivot
@@ -738,10 +746,10 @@ class ContainerController(BaseStorageServer):
         out_content_type = get_listing_content_type(req)
 
         def merge_items(old_items, new_items):
-            if isinstance(old_items[0], dict):
+            if old_items and isinstance(old_items[0], dict):
                 name, deleted = 'name', 'deleted'
             else:
-                name, deleted = 0, -1.
+                name, deleted = 0, -1
 
             items = dict([(r[name], r) for r in old_items])
             for item in new_items:
@@ -754,6 +762,10 @@ class ContainerController(BaseStorageServer):
             return sorted([item for item in items.values()],
                           key=lambda i: i[name])
 
+        def update_stats(count1=0, count2=0, bytes1=0, bytes2=0):
+            return str(int(count1) + int(count2)), \
+                str(int(bytes1) + int(bytes2))
+
         def check_local_then_nodes(pivot):
             hdrs = HeaderKeyDict()
             _marker = marker
@@ -761,6 +773,17 @@ class ContainerController(BaseStorageServer):
             path = get_param(req, 'path')
             delimiter = get_param(req, 'delimiter')
             old_b, pivot_b = broker.get_brokers()
+            info, is_deleted = old_b.get_info_is_deleted()
+            resp_headers = gen_resp_headers(info, is_deleted=is_deleted)
+            info, is_deleted = pivot_b.get_info_is_deleted()
+            obj_count, bytes_used = update_stats(
+                resp_headers.get('X-Container-Object-Count' ,0),
+                info.get('object_count', 0),
+                resp_headers.get('X-Container-Bytes-Used' ,0),
+                info.get('bytes_used', 0))
+            resp_headers.update({'X-Container-Object-Count': obj_count,
+                                 'X-Container-Bytes-Used': bytes_used})
+
             old_items = old_b.list_objects_iter(
                 _limit, marker, end_marker, prefix, delimiter, path,
                 broker.storage_policy_index, reverse)
@@ -770,7 +793,6 @@ class ContainerController(BaseStorageServer):
                 pivot_items = pivot_b.list_objects_iter(
                     limit, _marker, end_marker, prefix, delimiter, path,
                     broker.storage_policy_index, reverse)
-
                 old_items = merge_items(old_items, pivot_items)
                 if len(old_items) >= limit:
                     break
@@ -781,16 +803,14 @@ class ContainerController(BaseStorageServer):
                     possibly_more = False
 
             # now we need to run these objects through create_listing
-            info, is_deleted = broker.get_info_is_deleted()
-            resp_headers = gen_resp_headers(info, is_deleted=is_deleted)
-            resp = self.create_listing(req, out_content_type, info,
+            resp = self.create_listing(req, 'application/json', info,
                                        resp_headers, broker.metadata,
-                                       broker.container)
+                                       old_items, broker.container)
 
-            for header, value in resp.getheaders():
+            for header, value in resp.headers.items():
                 hdrs[header] = value
             try:
-                objs = json.loads(resp.read())
+                objs = json.loads(resp.body)
             except:
                 objs = list()
 
@@ -803,10 +823,13 @@ class ContainerController(BaseStorageServer):
             while possibly_more:
                 h, o = talk_to_nodes(pivot)
                 objs = merge_items(objs, o)
-                hdrs['X-Container-Object-Count'] += \
-                    h.get('X-Container-Object-Count', 0)
-                hdrs['X-Container-Bytes-Used'] += \
-                    h.get('X-Container-Bytes-Used', 0)
+                obj_count, bytes_used = update_stats(
+                    hdrs.get('X-Container-Object-Count', 0),
+                    h.get('X-Container-Object-Count', 0),
+                    hdrs.get('X-Container-Bytes-Used', 0),
+                    h.get('X-Container-Bytes-Used', 0))
+                hdrs.update({'X-Container-Object-Count': obj_count,
+                             'X-Container-Bytes-Used': bytes_used})
                 if objs >= limit:
                     break
                 if len(o) == _limit:
@@ -858,7 +881,7 @@ class ContainerController(BaseStorageServer):
             if piv_range in used_ranges:
                 continue
 
-            if sharded_upto and piv_range > sharded_upto:
+            if db_state == DB_STATE_SHARDING and piv_range > sharded_upto:
                 resp_hdrs, resp_objs = check_local_then_nodes(piv_range)
             else:
                 resp_hdrs, resp_objs = talk_to_nodes(piv_range)
@@ -924,7 +947,8 @@ class ContainerController(BaseStorageServer):
         if items and items.lower() == "pivot":
             container_list = broker.get_pivot_ranges()
             kargs.update(dict(pivot=True))
-        elif not skip_sharding and len(broker.get_pivot_ranges()) > 0:
+        elif not skip_sharding and len(broker.get_pivot_ranges()) > 0 and \
+                broker.get_db_state() != DB_STATE_UNSHARDED:
             # Sharded container so we need to pass to GET_sharded
             return self.GET_sharded(req, broker, resp_headers, marker,
                                     end_marker, prefix, limit)

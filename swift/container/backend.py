@@ -722,9 +722,6 @@ class ContainerBroker(DatabaseBroker):
             self.account = data['account']
             self.container = data['container']
 
-            data['pivot_point'] = \
-                self.get_next_pivot_point(connection=conn)
-
             return data
 
     def set_x_container_sync_points(self, sync_point1, sync_point2):

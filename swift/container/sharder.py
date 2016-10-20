@@ -982,6 +982,8 @@ class ContainerSharder(ContainerReplicator):
         # get the last pivot point found to continue from
         pivot_ranges = broker.build_pivot_ranges()
         old_piv = marker = pivot_ranges[-1].upper if pivot_ranges else None
+        if old_piv and broker.get_db_state() == DB_STATE_UNSHARDED:
+            broker.set_sharding_state()
         progress = len(pivot_ranges) * self.split_size
         obj_count = broker.get_info().get('object_count', 0)
 
