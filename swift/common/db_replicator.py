@@ -292,7 +292,7 @@ class Replicator(Daemon):
         rsync_path = '%s/tmp/%s' % (device['device'], local_id)
         remote_file = '%s/%s' % (rsync_module, rsync_path)
         db_files = [b.db_file for b in broker.get_brokers()]
-        mtime = os.path.getmtime(broker.db_file)
+        mtime = max(map(os.path.getmtime, db_files))
         if not self._rsync_file(db_files, remote_file,
                                 different_region=different_region):
             return False
@@ -425,9 +425,9 @@ class Replicator(Daemon):
 
         :returns: ReplConnection object
         """
-        return ReplConnection(node, partition,
-                              os.path.basename(db_file).split('.', 1)[0],
-                              self.logger)
+        hsh = os.path.basename(db_file).split('.', 1)[0]
+        hsh = hsh.split('_', 1)[0]
+        return ReplConnection(node, partition, hsh, self.logger)
 
     def _gather_sync_args(self, info):
         """
@@ -740,6 +740,7 @@ class ReplicatorRpc(object):
         drive, partition, hsh = replicate_args
         if self.mount_check and not ismount(os.path.join(self.root, drive)):
             return Response(status='507 %s is not mounted' % drive)
+
         db_file = os.path.join(self.root, drive,
                                storage_directory(self.datadir, partition, hsh),
                                hsh + '.db')
@@ -867,12 +868,12 @@ class ReplicatorRpc(object):
                 return HTTPNotFound()
             broker = self.broker_class(old_filename)
             broker.newid(local_id)
-            if len(filenames) > 1:
-                basename = os.path.basename(old_filename)
-                basename = basename[len(local_id):]
-                db_filename = os.path.join(os.path.dirname(db_file), basename)
+            if filenames:
+                db_filename = os.path.join(os.path.dirname(db_file),
+                                           filenames[completed])
                 renamer(old_filename, db_filename)
-            renamer(old_filename, db_file)
+            else:
+                renamer(old_filename, db_file)
             completed += 1
         return HTTPNoContent()
 

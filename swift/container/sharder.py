@@ -38,7 +38,7 @@ from swift.common.constraints import CONTAINER_LISTING_LIMIT, \
 from swift.common.ring.utils import is_local_device
 from swift.common.utils import get_logger, config_true_value, \
     dump_recon_cache, whataremyips, hash_path, \
-    storage_directory, Timestamp, PivotRange, pivot_to_pivot_container, \
+    storage_directory, Timestamp, PivotRange, \
     find_pivot_range, ismount, majority_size, GreenAsyncPile, \
     account_to_pivot_account
 from swift.common.wsgi import ConfigString
@@ -325,7 +325,6 @@ class ContainerSharder(ContainerReplicator):
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
         state = broker.get_db_state()
-        ranges = broker.get_pivot_ranges()
 
         if state == DB_STATE_SHARDED or broker.is_deleted():
             # It's a sharded node or deleted, so anything in the object table
@@ -719,15 +718,15 @@ class ContainerSharder(ContainerReplicator):
                 scan_complete = config_true_value(self.get_metadata_item(
                     broker, 'X-Container-Sysmeta-Sharding-Scan-Done'))
 
-                if not scan_idx and not scan_complete:
+                if scan_idx is None and not scan_complete:
                     try:
                         scan_idx = self._find_scanner_node(broker)
                     except Exception:
                         # todo log and continue
                         continue
 
-                if scan_idx and scan_idx == self.node_idx and \
-                        not scan_complete:
+                if scan_idx is not None and int(scan_idx) == self.node_idx \
+                        and not scan_complete:
                     self._find_pivot_points(broker)
                 else:
                     self._shard_on_pivot(broker, root_account,
@@ -1009,7 +1008,7 @@ class ContainerSharder(ContainerReplicator):
             if found_last():
                 break
 
-        if not i:
+        if not found_pivots:
             # we didn't find anything
             self.logger.warning(_("No pivots found, something went wrong. We "
                                   "will try again next pass."))

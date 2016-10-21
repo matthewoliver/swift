@@ -669,11 +669,6 @@ class ContainerController(BaseStorageServer):
             headers.update(
                     {'X-Container-Object-Count': usage.get('object_count', 0),
                      'X-Container-Bytes-Used': usage.get('bytes_used', 0)})
-        elif db_state == DB_STATE_SHARDING:
-            info, is_deleted = broker.get_brokers()[0].get_info_is_deleted()
-            headers.update(
-                    {'X-Container-Object-Count': info.get('object_count', 0),
-                     'X-Container-Bytes-Used': info.get('bytes_used', 0)})
 
         self._add_metadata(headers, broker.metadata)
         headers['Content-Type'] = out_content_type

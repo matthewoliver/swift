@@ -722,6 +722,13 @@ class ContainerBroker(DatabaseBroker):
             self.account = data['account']
             self.container = data['container']
 
+            if self.get_db_state() == DB_STATE_SHARDING:
+                # grab the obj_count, bytes used from locked DB. We need
+                # obj_count for sharding.
+                other_info = self.get_brokers()[0].get_info()
+                data.update({'object_count': other_info.get('object_count',0),
+                             'bytes_used': other_info.get('bytes_used', 0)})
+
             return data
 
     def set_x_container_sync_points(self, sync_point1, sync_point2):
@@ -1475,8 +1482,13 @@ class ContainerBroker(DatabaseBroker):
         if connection:
             return self._get_next_pivot_point(last_upper, connection)
         else:
-            with self.get() as conn:
-                return self._get_next_pivot_point(last_upper, conn)
+            try:
+                if self.get_db_state() == DB_STATE_SHARDING:
+                    self._create_connection(self._db_file)
+                with self.get() as conn:
+                    return self._get_next_pivot_point(last_upper, conn)
+            finally:
+                self._create_connection()
 
     def is_shrinking(self):
         return self.metadata.get('X-Container-Sysmeta-Shard-Merge') or \
