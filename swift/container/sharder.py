@@ -112,9 +112,9 @@ class ContainerSharder(ContainerReplicator):
         self.vm_test_mode = config_true_value(conf.get('vm_test_mode', 'no'))
 
         self.shard_shrink_point = \
-            float(conf.get('shard_shrink_point', 25) / 100.0)
+            float(conf.get('shard_shrink_point', 25)) / 100.0
         self.shrink_merge_point = \
-            float(conf.get('shard_shrink_merge_point', 75) / 100.0)
+            float(conf.get('shard_shrink_merge_point', 75)) / 100.0
         self.split_size = SHARD_CONTAINER_SIZE // 2
         self.cpool = GreenAsyncPile(self.cpool)
         self.scanner_batch_size = int(conf.get('shard_scanner_batch_size', 10))
