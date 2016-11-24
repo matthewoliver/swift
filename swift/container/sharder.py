@@ -146,7 +146,13 @@ class ContainerSharder(ContainerReplicator):
     def _zero_stats(self):
         """Zero out the stats."""
         super(ContainerSharder, self)._zero_stats()
-        # TODO add actual sharding stats to track, and zero them out here.
+        self.containers_scanned = 0
+        self.containers_sharded = 0
+        self.containers_shrunk = 0
+        self.container_pivots = 0
+        self.containers_misplaced = 0
+        self.containers_audit_failed = 0
+        self.containers_failed = 0
 
     def _get_local_devices(self):
         self._local_device_ids = set()
@@ -321,6 +327,7 @@ class ContainerSharder(ContainerReplicator):
         self.logger.info(_('Scanning %s/%s for misplaced objects'),
                          broker.account, broker.container)
         queries = []
+        misplaced_items = [False]
         policy_index = broker.storage_policy_index
         query = dict(marker='', end_marker='', prefix='', delimiter='',
                      storage_policy_index=policy_index)
@@ -368,6 +375,8 @@ class ContainerSharder(ContainerReplicator):
             if not objs:
                 return
 
+            misplaced_items[0] = True
+
             # We have a list of misplaced objects, so we better find a home
             # for them
             if not self.ranges:
@@ -412,6 +421,10 @@ class ContainerSharder(ContainerReplicator):
 
         for query in queries:
             run_query(query)
+
+        if misplaced_items[0]:
+            self.logger.increment('misplaced_items_found')
+            self.containers_misplaced += 1
 
         # wipe out the cache do disable bypass in delete_db
         cleanups = self.shard_cleanups or {}
@@ -543,6 +556,10 @@ class ContainerSharder(ContainerReplicator):
                                   '-'.join(missing_ranges))
                 continue_with_container = False
 
+            if not continue_with_container:
+                self.logger.increment('audit_failed')
+                self.containers_failed += 1
+                self.containers_audit_failed += 1
             return continue_with_container
 
         # Get the root view of the world.
@@ -554,6 +571,9 @@ class ContainerSharder(ContainerReplicator):
             self.logger.warning(_("Failed to get a pivot tree from root "
                                   "container %s/%s, it may not exist."),
                                 root_account, root_container)
+            self.logger.increment('audit_failed')
+            self.containers_failed += 1
+            self.containers_audit_failed += 1
             return False
         if pivot in self.ranges:
             return continue_with_container
@@ -568,6 +588,9 @@ class ContainerSharder(ContainerReplicator):
             if max(overlaps + [pivot], key=lambda x: x.timestamp) == pivot:
                 # pivot is newest so leave it alone for now  as the root might
                 # not be updated  yet.
+                self.logger.increment('audit_failed')
+                self.containers_failed += 1
+                self.containers_audit_failed += 1
                 return False
             else:
                 # There is a newer range that overlaps/covers this range.
@@ -577,6 +600,9 @@ class ContainerSharder(ContainerReplicator):
                                     'container (%s/%s) overlaps with another '
                                     'newer pivot'),
                                   broker.account, broker.container)
+                self.logger.increment('audit_failed')
+                self.containers_failed += 1
+                self.containers_audit_failed += 1
                 return False
         # pivot doesn't exist in the root containers ranges, but doesn't
         # overlap with anything
@@ -621,7 +647,6 @@ class ContainerSharder(ContainerReplicator):
             - Shrinking (check to see if we need to shrink this container).
         :param reported:
         """
-        self._zero_stats()
         self.logger.info(_('Starting container sharding pass'))
         dirs = []
         self.shard_brokers = dict()
@@ -723,6 +748,7 @@ class ContainerSharder(ContainerReplicator):
                         scan_idx = self._find_scanner_node(broker)
                     except Exception:
                         # todo log and continue
+                        self.containers_failed += 1
                         continue
 
                 if scan_idx is not None and int(scan_idx) == self.node_idx \
@@ -734,44 +760,57 @@ class ContainerSharder(ContainerReplicator):
             finally:
                 self._update_pivot_counts(root_account, root_container,
                                           broker)
+                self.logger.increment('scanned')
+                self.containers_scanned += 1
 
-                # wipe out the cache do disable bypass in delete_db
-                cleanups = self.shard_cleanups
-                self.shard_cleanups = None
-                self.logger.info('Cleaning up %d replicated shard containers',
-                                 len(cleanups))
+        # wipe out the cache do disable bypass in delete_db
+        cleanups = self.shard_cleanups
+        self.shard_cleanups = None
+        self.logger.info('Cleaning up %d replicated shard containers',
+                            len(cleanups))
 
-                for container in cleanups.values():
-                    self.cpool.spawn(self.delete_db, container)
+        for container in cleanups.values():
+            self.cpool.spawn(self.delete_db, container)
 
-                # Now we wait for all threads to finish.
-                all(self.cpool)
+        # Now we wait for all threads to finish.
+        all(self.cpool)
 
-                self.logger.info(_('Finished container sharding pass'))
+        self.logger.info(_('Finished container sharding pass'))
 
-        # all_locs = audit_location_generator(self.devices, DATADIR, '.db',
-        #                                    mount_check=self.mount_check,
-        #                                    logger=self.logger)
-        # for path, device, partition in all_locs:
-        #    self.container_audit(path)
-        #    if time.time() - reported >= 3600:  # once an hour
-        #        self.logger.info(
-        #            _('Since %(time)s: Container audits: %(pass)s passed '
-        #              'audit, %(fail)s failed audit'),
-        #            {'time': time.ctime(reported),
-        #             'pass': self.container_passes,
-        #             'fail': self.container_failures})
-        #        dump_recon_cache(
-        #            {'container_audits_since': reported,
-        #             'container_audits_passed': self.container_passes,
-        #             'container_audits_failed': self.container_failures},
-        #            self.rcache, self.logger)
-        #        reported = time.time()
-        #        self.container_passes = 0
-        #        self.container_failures = 0
-        #    self.containers_running_time = ratelimit_sleep(
-        #        self.containers_running_time, self.max_containers_per_second)
-        # return reported
+        if time.time() - reported >= 3600:  # once an hour
+            self.logger.info(
+                _('Since %(time)s Stats: %(scanned)s scanned, '
+                  '%(sharded)s sharded, %(shrunk)s shrunk, '
+                  '%(pivots)s pivots found, %(misplaced)s containeed '
+                  'misplaced items, %(failed)s failed audit, '
+                  '%(failures)s containers failed.'),
+                {'time': time.ctime(reported),
+                 'scanned': self.containers_scanned,
+                 'sharded': self.containers_sharded,
+                 'shrunk': self.containers_shrunk,
+                 'pivots': self.container_pivots,
+                 'misplaced': self.containers_misplaced,
+                 'failed': self.containers_audit_failed,
+                 'failures': self.containers_failed})
+            dump_recon_cache(
+                {'container_shards_since': reported,
+                 'container_shards_scanned': self.containers_scanned,
+                 'containers_sharded': self.containers_sharded,
+                 'containers_shrunk': self.containers_shrunk,
+                 'container_pivots': self.container_pivots,
+                 'containers_with_misplaced': self.containers_misplaced,
+                 'containers_failed_audit': self.containers_audit_failed,
+                 'containers_failed': self.containers_failed},
+                self.rcache, self.logger)
+            reported = time.time()
+            self.containers_scanned = 0
+            self.containers_sharded = 0
+            self.containers_shrunk = 0
+            self.container_pivots = 0
+            self.containers_misplaced = 0
+            self.containers_audit_failed = 0
+            self.containers_failed = 0
+        return reported
 
     def _send_request(self, ip, port, contdevice, partition, op, path,
                       headers_out={}, node_idx=None):
@@ -913,6 +952,7 @@ class ContainerSharder(ContainerReplicator):
 
         self.logger.info(_('Best pivot scanner for %s/%s is node %d'),
                          broker.account, broker.container, scanner_id[0])
+        self.logger.increment('scanner_searches')
 
         return scanner_id[0]
 
@@ -1069,6 +1109,8 @@ class ContainerSharder(ContainerReplicator):
                                    timestamp)
             pivot_ranges.append(new_pivot)
             lower = pivot
+            self.logger.increment('pivots_found')
+            self.container_pivots += 1
 
         if i + 1 < len(found_pivots):
             found_pivots = found_pivots[:i]
@@ -1098,6 +1140,9 @@ class ContainerSharder(ContainerReplicator):
                                     'cancelling split of %s/%s. '
                                     'Will try again next pass'),
                                   broker.account, broker.container)
+
+            self.logger.increment('pivots_found')
+            self.container_pivots += 1
 
         items = self._generate_object_list(pivot_ranges, 0)
         broker.merge_items(items)
@@ -1258,6 +1303,7 @@ class ContainerSharder(ContainerReplicator):
             for acct, cont in ((broker.account, broker.container),
                                (broker.account, n_pivot.name)):
                 self.swift.set_container_metadata(acct, cont, shrink_meta)
+            self.logger.increment('shrunk_phase_1')
         except Exception as ex:
             self.logger.error('There was a problem adding the metadata %s' % ex)
 
@@ -1384,6 +1430,8 @@ class ContainerSharder(ContainerReplicator):
         # replicate shrink
         self.cpool.spawn(
             self._replicate_object, part, broker.db_file, node_id)
+        self.logger.increment('shrunk_phase_2')
+        self.containers_shrunk += 1
         any(self.cpool)
 
     def _add_items(self, broker, broker_to_update, qry, ignore_state=False):
@@ -1518,6 +1566,8 @@ class ContainerSharder(ContainerReplicator):
 
             except DeviceUnavailable as duex:
                 self.logger.warning(_(str(duex)))
+                self.logger.increment('failure')
+                self.containers_failed += 1
                 return
 
             self.logger.info(_('Replicating new shard container %s/%s'),
@@ -1528,6 +1578,8 @@ class ContainerSharder(ContainerReplicator):
             self.logger.info(_('Node %d sharded %s/%s at pivot %s.'),
                              self.node_id, broker.account, broker.container,
                              pivot.upper)
+            self.logger.increment('sharded')
+            self.containers_sharded += 1
         if pivots_done:
             broker.merge_items(broker.pivot_nodes_to_items(pivots_done))
         any(self.cpool)
@@ -1538,6 +1590,7 @@ class ContainerSharder(ContainerReplicator):
                 'X-Container-Sysmeta-Shard-Last-%d' % self.node_idx:
                     ('', Timestamp(time.time()).internal)})
             self._sharding_complete(root_account, root_container, broker)
+            self.logger.increment('sharding_complete')
         else:
             broker.update_metadata({
                 'X-Container-Sysmeta-Shard-Last-%d' % self.node_idx:
@@ -1579,6 +1632,7 @@ class ContainerSharder(ContainerReplicator):
     def run_once(self, *args, **kwargs):
         """Run the container sharder once."""
         self.logger.info(_('Begin container sharder "once" mode'))
+        self._zero_stats()
         begin = reported = time.time()
         self._one_shard_pass(reported)
         elapsed = time.time() - begin
