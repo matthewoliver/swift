@@ -262,7 +262,10 @@ class Replicator(Daemon):
 
         for db_f in db_file:
             args = list(popen_args)
-            rfile = "%s%s" % (remote_file, os.path.basename(db_f))
+            if len(db_file) > 1:
+                rfile = "%s%s" % (remote_file, os.path.basename(db_f))
+            else:
+                rfile = remote_file
             args.extend([db_f, rfile])
             proc = subprocess.Popen(args)
             proc.communicate()
@@ -307,7 +310,11 @@ class Replicator(Daemon):
                     return False
         db_filenames = [os.path.basename(d) for d in db_files]
         with Timeout(replicate_timeout or self.node_timeout):
-            response = http.replicate(replicate_method, local_id, db_filenames)
+            if len(db_filenames) > 1:
+                response = http.replicate(replicate_method, local_id,
+                                          db_filenames)
+            else:
+                response = http.replicate(replicate_method, local_id)
         return response and 200 <= response.status < 300
 
     def _usync_db(self, point, broker, http, remote_id, local_id):
@@ -857,7 +864,7 @@ class ReplicatorRpc(object):
         num_files = max(len(filenames), 1)
         completed = 0
         while completed < num_files:
-            if not filenames:
+            if len(filenames) <= 1:
                 filename = local_id
             else:
                 filename = "%s%s" % (local_id, filenames[completed])
