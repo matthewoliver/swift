@@ -20,10 +20,10 @@ import json
 from six.moves.urllib.parse import unquote
 from swift.common.utils import public, csv_append, Timestamp, \
     config_true_value, PivotRange, account_to_pivot_account
-from swift.common.constraints import check_metadata
+from swift.common.constraints import check_metadata, CONTAINER_LISTING_LIMIT
 from swift.common import constraints
 from swift.common.http import HTTP_ACCEPTED, is_success
-from swift.common.request_helpers import get_sys_meta_prefix
+from swift.common.request_helpers import get_listing_content_type
 from swift.proxy.controllers.base import Controller, delay_denial, \
     cors_validation, set_info_cache, clear_info_cache
 from swift.common.storage_policy import POLICIES
@@ -112,9 +112,10 @@ class ContainerController(Controller):
             resp.headers.get('X-Backend-Sharding-State', DB_STATE_UNSHARDED)
         if req.method == "GET" and sharding_state in (DB_STATE_SHARDING,
                                                       DB_STATE_SHARDED):
-            new_resp = self._get_sharded(req, resp, sharding_state)
-            if new_resp:
-                resp = new_resp
+            if not req.environ.get('swift.skip_shard'):
+                new_resp = self._get_sharded(req, resp, sharding_state)
+                if new_resp:
+                    resp = new_resp
 
         # Cache this. We just made a request to a storage node and got
         # up-to-date information for the container.
@@ -180,11 +181,9 @@ class ContainerController(Controller):
             # Failed to decode the json response
             return ranges
 
-
     def _get_sharded(self, req, resp, sharding_state):
         # if sharding, we need to vist all the pivots before the upto and
         # merge with this response.
-
         upto = None
         if sharding_state == DB_STATE_SHARDING:
             def filter_key(x):
@@ -207,7 +206,29 @@ class ContainerController(Controller):
             # return what we have.
             return None
 
+        out_content_type = get_listing_content_type(req)
+        if sharding_state == DB_STATE_SHARDING and out_content_type != \
+                'application/json':
+            # We need the initial container response to be json format.
+            new_req = Request.blank(environ=req.environ.copy())
+            new_req.environ['swift.skip_shard'] = True
+            new_req.params = new_req.params['format'] = 'json'
+            resp = self.GET(new_req)
+            if not is_success(resp.status_int):
+                return resp
+
         piv_account = account_to_pivot_account(self.account_name)
+        object_count = 0
+        object_bytes = 0
+        limit = req.params.get('limit', CONTAINER_LISTING_LIMIT)
+        root_container_resp = None
+        for piv_range in ranges:
+            if sharding_state == DB_STATE_SHARDING and piv_account > upto:
+                if not root_container_resp:
+                    # get the response
+                    # TODO dont re-get the resp above, do it now. Also got
+                    #    the < piv range wrong above.
+                    pass
         
 
     @public
