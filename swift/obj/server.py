@@ -226,7 +226,9 @@ class ObjectController(BaseStorageServer):
         if logger_thread_locals:
             self.logger.thread_locals = logger_thread_locals
         headers_out['user-agent'] = 'object-server %s' % os.getpid()
-        full_path = '/%s/%s/%s' % (account, container, obj)
+        full_path = '/%s/%s/%s' % (
+            headers_out.get('X-Backend-Pivot-Account', account),
+            headers_out.get('X-Backend-Pivot-Container', container), obj)
         if all([host, partition, contdevice]):
             try:
                 with ConnectionTimeout(self.conn_timeout):
@@ -238,11 +240,6 @@ class ObjectController(BaseStorageServer):
                     response.read()
                     if is_success(response.status):
                         return
-                    elif response.status == HTTP_MOVED_PERMANENTLY and \
-                            response.getheader('X-Backend-Pivot-Container'):
-                        # We have received a Permanent Move on a sharded
-                        # container. Which means we need to redirect
-                        return response
                     else:
                         self.logger.error(_(
                             'ERROR Container update failed '
@@ -261,44 +258,6 @@ class ObjectController(BaseStorageServer):
                                     headers_out.get('x-timestamp'))
         self._diskfile_router[policy].pickle_async_update(
             objdevice, account, container, obj, data, timestamp, policy)
-
-    def _container_update(self, op, account, container, obj, headers_out,
-                          objdevice, updates, contpartition, policy):
-
-        try:
-            for conthost, contdevice in updates:
-                redirect = self.async_update(
-                    op, account, container, obj, conthost, contpartition,
-                    contdevice, headers_out, objdevice, policy,
-                    logger_thread_locals=self.logger.thread_locals)
-                if redirect:
-                    raise HTTPMovedPermanently(
-                        headers=dict(redirect.getheaders()))
-        except (HTTPMovedPermanently, HTTPException) as ex:
-            piv_acc = ex.headers.get('X-Backend-Pivot-Account')
-            piv_cont = ex.headers.get('X-Backend-Pivot-Container')
-            if not piv_acc or not piv_cont:
-                # there has been an error so log it and return
-                self.logger.error(_('ERROR Container update failed: %s/%s '
-                                    'possibly sharded but couldn\'t find '
-                                    'determine shard container location.')
-                                  % (account, container))
-                return
-
-            conthosts = [h.strip() for h in
-                         ex.headers.get('X-Container-Host', '').split(',')]
-            contdevices = [d.strip() for d in
-                           ex.headers.get('X-Container-Device', '').split(',')]
-            contpartition = ex.headers.get('X-Container-Partition', '')
-
-            if contpartition:
-                updates = zip(conthosts, contdevices)
-            else:
-                updates = []
-            self._container_update(op, piv_acc, piv_cont, obj, headers_out,
-                                   objdevice, updates, contpartition, policy)
-
-
 
     def container_update(self, op, account, container, obj, request,
                          headers_out, objdevice, policy):
@@ -342,8 +301,11 @@ class ObjectController(BaseStorageServer):
         headers_out['referer'] = request.as_referer()
         headers_out['X-Backend-Storage-Policy-Index'] = int(policy)
 
-        gt = spawn(self._container_update, op, account, container, obj,
-                   headers_out, objdevice, updates, contpartition, policy)
+        for conthost, contdevice in updates:
+            gt = spawn(self.async_update, op, account, container, obj,
+                       conthost, contpartition, contdevice, headers_out,
+                       objdevice, policy,
+                       logger_thread_locals=self.logger.thread_locals)
 
         # Wait a little bit to see if the container updates are successful.
         # If we immediately return after firing off the greenthread above, then

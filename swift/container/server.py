@@ -18,7 +18,6 @@ import os
 import time
 import traceback
 from swift import gettext_ as _
-from xml.etree.cElementTree import Element, SubElement, tostring
 
 from eventlet import Timeout
 from random import shuffle, randint
@@ -35,11 +34,12 @@ from swift.common.direct_client import direct_get_container, \
     DirectClientException, direct_delete_container
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.request_helpers import get_param, get_listing_content_type, \
-    split_and_validate_path, is_sys_or_user_meta, get_sys_meta_prefix
+    split_and_validate_path, is_sys_or_user_meta, get_sys_meta_prefix, \
+    create_container_listing
 from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, validate_sync_to, \
     config_true_value, timing_stats, replication, \
-    override_bytes_from_content_type, get_log_line, pivot_to_pivot_container, \
+    get_log_line, pivot_to_pivot_container, \
     find_pivot_range, account_to_pivot_account, whataremyips
 from swift.common.constraints import check_mount, valid_timestamp, check_utf8
 from swift.common import constraints
@@ -51,7 +51,7 @@ from swift.common.base_storage_server import BaseStorageServer
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPConflict, \
     HTTPCreated, HTTPInternalServerError, HTTPNoContent, HTTPNotFound, \
-    HTTPPreconditionFailed, HTTPMethodNotAllowed, Request, Response, \
+    HTTPPreconditionFailed, HTTPMethodNotAllowed, Request, \
     HTTPInsufficientStorage, HTTPException, HTTPMovedPermanently
 
 
@@ -279,7 +279,7 @@ class ContainerController(BaseStorageServer):
             return indices[0]
         return None
 
-    def _find_shard_location(self, req, broker, obj, redirect=False):
+    def _find_shard_location(self, req, broker, obj):
         try:
             # This is either a sharded root container or a container in the
             # middle of sharding, so we need figure out where the obj should
@@ -295,27 +295,11 @@ class ContainerController(BaseStorageServer):
             else:
                 acct = broker.account
 
-            node_index = self._get_node_index(req)
-            if not node_index:
-                # This node doesn't seem to be the primary for this container,
-                # so must be a handoff. Lets use a random index.. maybe
-                # node_index = self._get_node_index(req, random=True)
-                raise HTTPInternalServerError()
-
-            part, nodes = self.ring.get_nodes(acct, containing_range.name)
-            node = nodes[node_index]
-            headers = {
-                'X-Backend-Pivot-Account': acct,
-                'X-Backend-Pivot-Container': containing_range.name,
-                'X-Container-Host': "%(ip)s:%(port)d" % node,
-                'X-Container-Device': node['device'],
-                'X-Container-Partition': part}
-
-            if redirect:
-                location = "http://%(ip)s:%(port)d/%(device)s" % node
-                location += "/%s/%s/%s/%s" % \
-                            (part, acct, containing_range.name, obj)
-                headers['Location'] = location
+            location = "/%s/%s/%s" % \
+                (acct, containing_range.name, obj)
+            headers = {'Location': location,
+                       'X-Redirect-Timestamp':
+                           containing_range.timestamp.internal}
 
             return HTTPMovedPermanently(headers=headers)
 
@@ -366,8 +350,7 @@ class ContainerController(BaseStorageServer):
 
             elif len(broker.get_pivot_ranges()) > 0:
                 # cannot put to a root shard container, find actual container
-                return self._find_shard_location(req, broker, obj,
-                                                 redirect=True)
+                return self._find_shard_location(req, broker, obj)
             else:
                 broker.delete_object(obj, req.headers.get('x-timestamp'),
                                      obj_policy_index)
@@ -585,8 +568,7 @@ class ContainerController(BaseStorageServer):
                         int(req.headers['x-size']), '', '', 0]
             elif len(broker.get_pivot_ranges()) > 0:
                 # cannot put to a root shard container, find actual container
-                res = self._find_shard_location(req, broker, obj,
-                                                redirect=True)
+                res = self._find_shard_location(req, broker, obj)
                 if res:
                     return res
 
@@ -670,44 +652,10 @@ class ContainerController(BaseStorageServer):
                     {'X-Container-Object-Count': usage.get('object_count', 0),
                      'X-Container-Bytes-Used': usage.get('bytes_used', 0)})
 
+        headers['X-Backend-Sharding-State'] = db_state
         self._add_metadata(headers, broker.metadata)
         headers['Content-Type'] = out_content_type
         return HTTPNoContent(request=req, headers=headers, charset='utf-8')
-
-    def update_data_record(self, record, pivot=False):
-        """
-        Perform any mutations to container listing records that are common to
-        all serialization formats, and returns it as a dict.
-
-        Converts created time to iso timestamp.
-        Replaces size with 'swift_bytes' content type parameter.
-
-        :param record: object entry record
-        :param pivot: Is this a pivot node, if so it uses a different
-                      dictionary
-        :returns: modified record
-        """
-        if isinstance(record, dict):
-            # Conversion has already happened (e.g. from a sharded node)
-            return record
-        if pivot:
-            (name, created, lower, upper, object_count, bytes_used,
-             meta_timestamp) = record[:7]
-            response = {'name': name, 'lower': lower, 'upper': upper,
-                        'object_count': object_count,
-                        'bytes_used': bytes_used,
-                        'created_at': created,
-                        'meta_timestamp': meta_timestamp}
-        else:
-            (name, created, size, content_type, etag) = record[:5]
-            if content_type is None:
-                return {'subdir': name}
-            response = {'bytes': size, 'hash': etag, 'name': name,
-                        'content_type': content_type}
-        response['last_modified'] = Timestamp(created).isoformat
-        if not pivot:
-            override_bytes_from_content_type(response, logger=self.logger)
-        return response
 
     def GET_sharded(self, req, broker, headers, marker='', end_marker='',
                     prefix='', limit=constraints.CONTAINER_LISTING_LIMIT):
@@ -936,12 +884,26 @@ class ContainerController(BaseStorageServer):
         resp_headers = gen_resp_headers(info, is_deleted=is_deleted)
         if is_deleted:
             return HTTPNotFound(request=req, headers=resp_headers)
-        kargs = {}
         include_deleted = False
+        db_state = broker.get_db_state()
         skip_sharding = get_param(req, 'noshard')
         if items and items.lower() == "pivot":
-            container_list = broker.get_pivot_ranges()
-            kargs.update(dict(pivot=True))
+            container_list = broker.build_pivot_ranges()
+            if obj:
+                container_list = [find_pivot_range(obj, container_list)]
+            elif marker or end_marker:
+                if reverse:
+                    container_list.reverse()
+
+                def piv_filter(piv):
+                    end = start = True
+                    if end_marker:
+                        end = piv < end_marker or end_marker in piv
+                    if marker:
+                        start = piv > marker or marker in piv
+                    return start and end
+
+                container_list = list(filter(piv_filter, container_list))
         elif not skip_sharding and len(broker.get_pivot_ranges()) > 0 and \
                 broker.get_db_state() != DB_STATE_UNSHARDED:
             # Sharded container so we need to pass to GET_sharded
@@ -954,50 +916,11 @@ class ContainerController(BaseStorageServer):
                 limit, marker, end_marker, prefix, delimiter, path,
                 storage_policy_index=info['storage_policy_index'],
                 reverse=reverse, include_deleted=include_deleted)
-        return self.create_listing(req, out_content_type, info, resp_headers,
-                                   broker.metadata, container_list, container,
-                                   **kargs)
-
-    def create_listing(self, req, out_content_type, info, resp_headers,
-                       metadata, container_list, container, pivot=False):
-        self._add_metadata(resp_headers, metadata)
-        ret = Response(request=req, headers=resp_headers,
-                       content_type=out_content_type, charset='utf-8')
-        if out_content_type == 'application/json':
-            ret.body = json.dumps([self.update_data_record(record, pivot)
-                                   for record in container_list])
-        elif out_content_type.endswith('/xml'):
-            doc = Element('container', name=container.decode('utf-8'))
-            fields = ["name", "hash", "bytes", "content_type", "last_modified"]
-            if pivot:
-                fields = ["name", "lower", "upper", "object_count",
-                          "bytes_used", "last_modified", "meta_timestamp"]
-            for obj in container_list:
-                record = self.update_data_record(obj, pivot)
-                if 'subdir' in record:
-                    name = record['subdir'].decode('utf-8')
-                    sub = SubElement(doc, 'subdir', name=name)
-                    SubElement(sub, 'name').text = name
-                else:
-                    obj_element = SubElement(doc, 'object')
-                    for field in fields:
-                        SubElement(obj_element, field).text = str(
-                            record.pop(field)).decode('utf-8')
-                    for field in sorted(record):
-                        SubElement(obj_element, field).text = str(
-                            record[field]).decode('utf-8')
-            ret.body = tostring(doc, encoding='UTF-8').replace(
-                "<?xml version='1.0' encoding='UTF-8'?>",
-                '<?xml version="1.0" encoding="UTF-8"?>', 1)
-        else:
-            if not container_list:
-                return HTTPNoContent(request=req, headers=resp_headers)
-            if isinstance(container_list[0], dict):
-                index = 'name'
-            else:
-                index = 0
-            ret.body = '\n'.join(rec[index] for rec in container_list) + '\n'
-        return ret
+        resp_headers['X-Backend-Sharding-State'] = db_state
+        self._add_metadata(resp_headers, broker.metadata)
+        return create_container_listing(
+            req, out_content_type, resp_headers, container_list, container,
+            logger=self.logger)
 
     @public
     @replication

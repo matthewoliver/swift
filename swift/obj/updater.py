@@ -216,27 +216,55 @@ class ObjectUpdater(Daemon):
             renamer(update_path, target_path, fsync=False)
             return
         successes = update.get('successes', [])
-        part, nodes = self.get_container_ring().get_nodes(
-            update['account'], update['container'])
-        obj = '/%s/%s/%s' % \
-            (update['account'], update['container'], update['obj'])
-        headers_out = update['headers'].copy()
-        headers_out['user-agent'] = 'object-updater %s' % os.getpid()
-        headers_out.setdefault('X-Backend-Storage-Policy-Index',
-                               str(int(policy)))
-        events = [spawn(self.object_update,
-                        node, part, update['op'], update['account'],
-                        update['container'], update['obj'], headers_out)
-                  for node in nodes if node['id'] not in successes]
         success = True
         new_successes = False
-        for event in events:
-            event_success, node_id = event.wait()
-            if event_success is True:
-                successes.append(node_id)
-                new_successes = True
+        num_redirects = 2
+        for i in range(num_redirects):
+            redirects = set()
+            headers_out = update['headers'].copy()
+            if headers_out.get('X-Backend-Pivot-Account') and \
+                    headers_out.get('X-Backend-Pivot-Container'):
+                acct = headers_out['X-Backend-Pivot-Account']
+                cont = headers_out['X-Backend-Pivot-Container']
             else:
-                success = False
+                acct, cont = update['account'], update['container']
+            part, nodes = self.get_container_ring().get_nodes(
+                acct, cont)
+            obj = '/%s/%s/%s' % (acct, cont, update['obj'])
+            headers_out['user-agent'] = 'object-updater %s' % os.getpid()
+            headers_out.setdefault('X-Backend-Storage-Policy-Index',
+                                   str(int(policy)))
+            events = [spawn(self.object_update,
+                            node, part, update['op'], acct, cont,
+                            update['obj'], headers_out)
+                      for node in nodes if node['id'] not in successes]
+            for event in events:
+                event_success, node_id, redirect = event.wait()
+                if event_success is True:
+                    successes.append(node_id)
+                    new_successes = True
+                elif redirect:
+                    redirects.add(redirect)
+                else:
+                    success = False
+            if redirects:
+                if len(redirects) > 1:
+                    redirect = map(max(lambda x: x[-1], redirects))
+                else:
+                    redirect = redirects.pop()
+                update['headers']['X-Backend-Pivot-Account'] = redirect[0]
+                update['headers']['X-Backend-Pivot-Account'] = redirect[1]
+                if num_redirects == i + 1:
+                    success = False
+                else:
+                    self.logger.increment("redirects")
+                    self.logger.debug('Update sent for %(obj)s %(path)s '
+                                      'triggered a redirect to '
+                                      '%(redir_acct)s/%(redir_cont)s',
+                                      {'obj': obj, 'path': update_path,
+                                       'redir_acct': redirect[0],
+                                       'redir_cont': redirect[1]})
+
         if success:
             self.successes += 1
             self.logger.increment('successes')
@@ -267,6 +295,7 @@ class ObjectUpdater(Daemon):
         :param headers_out: headers to send with the update
         """
         try:
+            redirect = []
             obj_path = '/%s/%s/%s' % (acct, cont, obj)
             with ConnectionTimeout(self.conn_timeout):
                 conn = http_connect(node['ip'], node['port'], node['device'],
@@ -279,26 +308,25 @@ class ObjectUpdater(Daemon):
 
             if resp.status == HTTP_MOVED_PERMANENTLY:
                 rheaders = HeaderKeyDict(resp.getheaders())
-                piv_acc = rheaders.get('X-Backend-Pivot-Account')
-                piv_cont = rheaders.get('X-Backend-Pivot-Container')
+                location = rheaders.get('Location')
+                if not location:
+                    # treat as a normal failure.
+                    return success, node['id'], redirect
+
+                if location.startswith('/'):
+                    location = location[1:]
+                piv_acc, piv_cont, obj_ = location.split('/', 2)
                 if not piv_acc or not piv_cont:
                     # there has been an error so log it and return
                     self.logger.error(_('ERROR Container update failed: %s '
                                         'possibly sharded but couldn\'t '
                                         'find determine shard container '
                                         'location.') % obj)
-                    return False, node['id']
-                piv_host = rheaders.get('X-Container-Host')
-                piv_node = {
-                    'ip': piv_host.split(':')[0],
-                    'port': int(piv_host.split(':')[1]),
-                    'device': rheaders.get('X-Container-Device'),
-                    'id': node['id']}
-                piv_part = rheaders.get('X-Container-Partition')
-                return self.object_update(piv_node, piv_part, op, piv_acc,
-                                          piv_cont, obj, headers_out)
+                    return False, node['id'], redirect
+                redirect = (piv_acc, piv_cont,
+                            rheaders.get('X-Redirect-Timestamp'))
 
-            return success, node['id']
+            return success, node['id'], redirect
         except (Exception, Timeout):
             self.logger.exception(_('ERROR with remote server '
                                     '%(ip)s:%(port)s/%(device)s'), node)

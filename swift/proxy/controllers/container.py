@@ -15,9 +15,11 @@
 
 from swift import gettext_ as _
 import time
+import json
 
 from six.moves.urllib.parse import unquote
-from swift.common.utils import public, csv_append, Timestamp, config_true_value
+from swift.common.utils import public, csv_append, Timestamp, \
+    config_true_value, PivotRange, account_to_pivot_account
 from swift.common.constraints import check_metadata
 from swift.common import constraints
 from swift.common.http import HTTP_ACCEPTED, is_success
@@ -26,7 +28,9 @@ from swift.proxy.controllers.base import Controller, delay_denial, \
     cors_validation, set_info_cache, clear_info_cache
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, \
-    HTTPNotFound
+    HTTPNotFound, Request
+from swift.container.backend import  DB_STATE_SHARDING, DB_STATE_UNSHARDED, \
+    DB_STATE_SHARDED
 
 class ContainerController(Controller):
     """WSGI controller for container requests"""
@@ -104,6 +108,14 @@ class ContainerController(Controller):
         resp = self.GETorHEAD_base(
             req, _('Container'), node_iter, part,
             req.swift_entity_path, concurrency)
+        sharding_state = \
+            resp.headers.get('X-Backend-Sharding-State', DB_STATE_UNSHARDED)
+        if req.method == "GET" and sharding_state in (DB_STATE_SHARDING,
+                                                      DB_STATE_SHARDED):
+            new_resp = self._get_sharded(req, resp, sharding_state)
+            if new_resp:
+                resp = new_resp
+
         # Cache this. We just made a request to a storage node and got
         # up-to-date information for the container.
         resp.headers['X-Backend-Recheck-Container-Existence'] = str(
@@ -122,6 +134,81 @@ class ContainerController(Controller):
                 if key in resp.headers:
                     del resp.headers[key]
         return resp
+
+    def _get_pivot_ranges(self, req, sharding_state=DB_STATE_SHARDED,
+                          upto=None, account=None, container=None):
+
+        ranges = []
+        account = account if account else self.account_name
+        container = container if container else self.container_name
+        part, nodes = self.app.container_ring.get_nodes(account, container)
+
+        path = "/v1/%s/%s" % (self.account_name, self.container_name)
+        piv_request = Request.blank(path)
+        params = req.params
+        params.update({
+            'items': 'pivot',
+            'format': 'json'})
+
+        if params.get('marker') and sharding_state == DB_STATE_SHARDING and \
+                        params.get('marker') > upto:
+            return ranges
+
+        if params.get('end_marker') and sharding_state == DB_STATE_SHARDING:
+            params.update({'end_marker': min(params['end_marker', upto])})
+
+        piv_request.params = params.items()
+        headers = {'X-Timestamp': Timestamp(time.time()).internal,
+                   'X-Trans-Id': self.trans_id}
+        piv_resp = self.make_requests(piv_request, self.app.container_ring,
+                                      part, "GET", path, headers)
+        if not is_success(piv_resp.status_int):
+            return ranges
+
+        try:
+            for pivot in json.loads(piv_resp.body):
+                lower = pivot.get('lower') or None
+                upper = pivot.get('upper') or None
+                created_at = pivot.get('created_at') or None
+                object_count = pivot.get('object_count') or 0
+                bytes_used = pivot.get('bytes_used') or 0
+                meta_timestamp = pivot.get('meta_timestamp') or None
+                ranges.append(PivotRange(pivot['name'], created_at, lower,
+                                         upper, object_count, bytes_used,
+                                         meta_timestamp))
+        except ValueError:
+            # Failed to decode the json response
+            return ranges
+
+
+    def _get_sharded(self, req, resp, sharding_state):
+        # if sharding, we need to vist all the pivots before the upto and
+        # merge with this response.
+
+        upto = None
+        if sharding_state == DB_STATE_SHARDING:
+            def filter_key(x):
+                x[0].startswith('X-Container-Sysmeta-Shard-Last-')
+
+            uptos = filter(filter_key, req.headers.items())
+            if uptos:
+                upto = max(uptos, key=lambda x: x[-1])[0]
+
+            if not upto:
+                # nothing has been sharded yet, so lets short circuit and
+                # return the current response.
+                return None
+
+        # In whatever case we need the list of PivotRanges that contain this
+        # range
+        ranges = self._get_pivot_ranges(req, sharding_state, upto)
+        if not ranges:
+            # can't find ranges or there was a problem getting the ranges. So
+            # return what we have.
+            return None
+
+        piv_account = account_to_pivot_account(self.account_name)
+        
 
     @public
     @delay_denial
