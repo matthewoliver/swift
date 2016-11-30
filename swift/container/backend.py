@@ -544,8 +544,13 @@ class ContainerBroker(DatabaseBroker):
         self._commit_puts_stale_ok()
         with self.get() as conn:
             try:
-                row = conn.execute(
-                    'SELECT max(object_count) from policy_stat').fetchone()
+                if self.get_db_state() == DB_STATE_SHARDED:
+                    row = conn.execute(
+                        'SELECT max(object_count) from pivot_ranges where '
+                        'deleted = 0').fetchone()
+                else:
+                    row = conn.execute(
+                        'SELECT max(object_count) from policy_stat').fetchone()
             except sqlite3.OperationalError as err:
                 if not any(msg in str(err) for msg in (
                         "no such column: storage_policy_index",

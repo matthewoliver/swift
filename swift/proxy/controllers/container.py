@@ -17,13 +17,15 @@ from swift import gettext_ as _
 import time
 import json
 
-from six.moves.urllib.parse import unquote
+from six.moves.urllib.parse import unquote, urlencode
 from swift.common.utils import public, csv_append, Timestamp, \
     config_true_value, PivotRange, account_to_pivot_account
 from swift.common.constraints import check_metadata, CONTAINER_LISTING_LIMIT
 from swift.common import constraints
-from swift.common.http import HTTP_ACCEPTED, is_success
-from swift.common.request_helpers import get_listing_content_type
+from swift.common.http import HTTP_ACCEPTED, is_success, \
+    HTTP_PRECONDITION_FAILED
+from swift.common.request_helpers import get_listing_content_type, \
+    create_container_listing
 from swift.proxy.controllers.base import Controller, delay_denial, \
     cors_validation, set_info_cache, clear_info_cache
 from swift.common.storage_policy import POLICIES
@@ -145,8 +147,7 @@ class ContainerController(Controller):
         part, nodes = self.app.container_ring.get_nodes(account, container)
 
         path = "/v1/%s/%s" % (self.account_name, self.container_name)
-        piv_request = Request.blank(path)
-        params = req.params
+        params = req.params.copy()
         params.update({
             'items': 'pivot',
             'format': 'json'})
@@ -158,11 +159,11 @@ class ContainerController(Controller):
         if params.get('end_marker') and sharding_state == DB_STATE_SHARDING:
             params.update({'end_marker': min(params['end_marker', upto])})
 
-        piv_request.params = params.items()
         headers = {'X-Timestamp': Timestamp(time.time()).internal,
                    'X-Trans-Id': self.trans_id}
-        piv_resp = self.make_requests(piv_request, self.app.container_ring,
-                                      part, "GET", path, headers)
+        piv_resp = self.make_requests(req, self.app.container_ring,
+                                      part, "GET", path, headers,
+                                      urlencode(params))
         if not is_success(piv_resp.status_int):
             return ranges
 
@@ -193,11 +194,6 @@ class ContainerController(Controller):
             if uptos:
                 upto = max(uptos, key=lambda x: x[-1])[0]
 
-            if not upto:
-                # nothing has been sharded yet, so lets short circuit and
-                # return the current response.
-                return None
-
         # In whatever case we need the list of PivotRanges that contain this
         # range
         ranges = self._get_pivot_ranges(req, sharding_state, upto)
@@ -217,11 +213,68 @@ class ContainerController(Controller):
             if not is_success(resp.status_int):
                 return resp
 
+        def get_objects(account, container, parameters):
+            path = '/v1/%s/%s' % (account, container)
+            part, nodes = self.app.container_ring.get_nodes(account, container)
+            headers = {'X-Timestamp': Timestamp(time.time()).internal,
+                   'X-Trans-Id': self.trans_id}
+            piv_resp = self.make_requests(req, self.app.container_ring,
+                                          part, "GET", path, headers,
+                                          urlencode(parameters))
+
+            if is_success(piv_resp.status_int):
+                try:
+                    return piv_resp.headers, json.loads(piv_resp.body), piv_resp
+                except ValueError:
+                    pass
+            return None, None, piv_resp
+
+        def merge_old_new(new_headers, new_objs, params):
+            old_headers, old_objs, old_resp = \
+                get_objects(self.account_name, self.container_name, params)
+
+            if not is_success(old_resp):
+                # just use the new response
+                result_objs = [r for r in new_objs if r['deleted'] == 0]
+                result_headers = new_headers
+            else:
+                items = dict([(r['name'], r) for r in old_objs])
+                for item in new_objs:
+                    if item['deleted'] == 1:
+                        if item['name'] in items:
+                            del items[item['name']]
+                            continue
+                    items[item['name']] = item
+                result_objs = sorted([r for r in items.values()],
+                                     key=lambda i: i['name'])
+                if params.get('reverse'):
+                    result_objs.reverse()
+
+                result_headers = old_headers
+
+                oc = 'X-Container-Object-Count'
+                bu = 'X-Container-Bytes-Used'
+                stats_headers = {
+                    oc: int(result_headers.get(oc, 0)),
+                    bu: int(result_headers.get(bu, 0))}
+                stats_headers[oc] += int(new_headers.get(oc, 1))
+                stats_headers[bu] += int(new_headers.get(bu, 1))
+                result_headers.update(stats_headers)
+
+            if len(result_objs) > params['limit']:
+                result_objs = result_objs[:params['limit']]
+
+            return result_headers, result_objs
+
+        headers = resp.headers.copy()
         piv_account = account_to_pivot_account(self.account_name)
         object_count = 0
         object_bytes = 0
+        objects = []
         limit = req.params.get('limit', CONTAINER_LISTING_LIMIT)
         root_container_resp = None
+        params = req.params.copy()
+        merge_with_response = False
         for piv_range in ranges:
             if sharding_state == DB_STATE_SHARDING and piv_account > upto:
                 if not root_container_resp:
@@ -229,7 +282,48 @@ class ContainerController(Controller):
                     # TODO dont re-get the resp above, do it now. Also got
                     #    the < piv range wrong above.
                     pass
-        
+                merge_with_response = True
+            elif sharding_state == DB_STATE_SHARDING and piv_account < upto:
+                merge_with_response = False
+
+            if params.get('reverse'):
+                params['marker'] = piv_range.upper
+            else:
+                params['marker'] = piv_range.lower
+            params['limit'] = limit
+            if merge_with_response:
+                params['items'] = 'all'
+                # need some extra limit because we are getting deleted objects
+                params['limit'] = min(limit * 2, CONTAINER_LISTING_LIMIT)
+
+            res_headers, res_objs, res_resp = \
+                get_objects(piv_account, piv_range.name, params)
+            if res_headers is None:
+                return res_resp
+
+            if merge_with_response:
+                params.pop('items', None)
+                params['limit'] = limit
+                res_headers, res_objs = \
+                    merge_old_new(res_headers, res_objs, params)
+
+            object_count += \
+                int(res_headers.get('X-Container-Object-Count', 0))
+            object_bytes += \
+                int(res_headers.get('X-Container-Bytes-Used', 0))
+            if res_objs:
+                objects.extend(res_objs)
+                limit -= len(res_objs)
+                params['limit'] = limit
+                if limit <= 0 or (params.get('end_marker') and
+                                  objects[-1] > params.get('end_marker')):
+                    break
+
+        headers['X-Container-Object-Count'] = object_count
+        headers['X-Container-Bytes-Used'] = object_bytes
+
+        return create_container_listing(req, out_content_type, headers, objects,
+                                        self.container_name)
 
     @public
     @delay_denial
@@ -318,6 +412,14 @@ class ContainerController(Controller):
             req.swift_entity_path, [headers] * len(containers))
         return resp
 
+    def _delete_sharded(self, req, sharding_state):
+        # TODO propergate the DELETE to all shards. If one returns a 409 then
+        # we back off (what do we do with the containers that were deleted).
+        # Also we need some kind of force delete when sending to the root
+        # container while in the sharding state, as there will be a readonly
+        # (non-empty) container.
+        return HTTPBadRequest(req)
+
     @public
     @cors_validation
     def DELETE(self, req):
@@ -338,6 +440,13 @@ class ContainerController(Controller):
         # Indicates no server had the container
         if resp.status_int == HTTP_ACCEPTED:
             return HTTPNotFound(request=req)
+
+        sharding_state = resp.headers.get('X-Backend-Sharding-State')
+        if resp.status_int == HTTP_PRECONDITION_FAILED and sharding_state:
+            if sharding_state in (DB_STATE_SHARDING, DB_STATE_SHARDED):
+                # We need to first attempt to delete the container shards then
+                # the container
+                resp = self._delete_sharded(req, )
         return resp
 
     def _backend_requests(self, req, n_outgoing, account_partition, accounts,

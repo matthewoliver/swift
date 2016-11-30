@@ -20,18 +20,13 @@ import traceback
 from swift import gettext_ as _
 
 from eventlet import Timeout
-from random import shuffle, randint
 
 import swift.common.db
 from swift.container.sync_store import ContainerSyncStore
 from swift.container.backend import ContainerBroker, DATADIR, \
-    RECORD_TYPE_PIVOT_NODE, DB_STATE_SHARDING, DB_STATE_UNSHARDED, \
-    DB_STATE_SHARDED
+    RECORD_TYPE_PIVOT_NODE, DB_STATE_SHARDING, DB_STATE_SHARDED
 from swift.container.replicator import ContainerReplicatorRpc
-from swift.common import ring
 from swift.common.db import DatabaseAlreadyExists
-from swift.common.direct_client import direct_get_container, \
-    DirectClientException, direct_delete_container
 from swift.common.container_sync_realms import ContainerSyncRealms
 from swift.common.request_helpers import get_param, get_listing_content_type, \
     split_and_validate_path, is_sys_or_user_meta, get_sys_meta_prefix, \
@@ -39,8 +34,7 @@ from swift.common.request_helpers import get_param, get_listing_content_type, \
 from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, validate_sync_to, \
     config_true_value, timing_stats, replication, \
-    get_log_line, pivot_to_pivot_container, \
-    find_pivot_range, account_to_pivot_account, whataremyips
+    get_log_line, find_pivot_range, account_to_pivot_account, whataremyips
 from swift.common.constraints import check_mount, valid_timestamp, check_utf8
 from swift.common import constraints
 from swift.common.bufferedhttp import http_connect
@@ -99,7 +93,6 @@ class ContainerController(BaseStorageServer):
         self.node_timeout = float(conf.get('node_timeout', 3))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         swift_dir = conf.get('swift_dir', '/etc/swift')
-        self.ring = ring.Ring(swift_dir, ring_name='container')
         #: ContainerSyncCluster instance for validating sync-to values.
         self.realms_conf = ContainerSyncRealms(
             os.path.join(swift_dir, 'container-sync-realms.conf'),
@@ -264,21 +257,6 @@ class ContainerController(BaseStorageServer):
             self.logger.exception('Failed to update sync_store %s during %s' %
                                   (broker.db_file, method))
 
-    def _get_node_index(self, req, random=False):
-        drive, part, account, container = split_and_validate_path(
-            req, 4, 4, True)
-        _, nodes = self.ring.get_nodes(account, container)
-        if random:
-            return randint(0, len(nodes) - 1)
-        indices = [node['index'] for node in nodes
-                    if node['ip'] in self.ips and
-                       node['port'] == self.port and
-                       node['device'] == drive]
-
-        if indices:
-            return indices[0]
-        return None
-
     def _find_shard_location(self, req, broker, obj):
         try:
             # This is either a sharded root container or a container in the
@@ -359,11 +337,12 @@ class ContainerController(BaseStorageServer):
             # delete container
             if not broker.empty():
                 return HTTPConflict(request=req)
-            if broker.is_root_container() and \
-                    len(broker.get_pivot_ranges()) > 0:
-                resp = self.DELETE_sharded(req, broker)
-                if resp:
-                    return resp
+            db_state = broker.get_db_state()
+            if db_state in (DB_STATE_SHARDED, DB_STATE_SHARDING):
+                resp = HTTPPreconditionFailed(request=req)
+                resp.headers['X-Backend-Sharding-State'] = db_state
+                self._add_metadata(resp.headers, broker.metadata)
+                return resp
             existed = Timestamp(broker.get_info()['put_timestamp']) and \
                 not broker.is_deleted()
             broker.delete_db(req_timestamp.internal)
@@ -376,99 +355,6 @@ class ContainerController(BaseStorageServer):
             if existed:
                 return HTTPNoContent(request=req)
             return HTTPNotFound()
-
-    def DELETE_sharded(self, req, broker):
-        """
-        Check to see if there are anything in the sharded containers, then
-        delete them first.
-
-        :param req: The request object
-        :param broker: The broker for this container
-        :return: Returns None on success or a response to send back to the
-                 client on an error, eg. 409.
-        """
-        # First lets get some usages.
-        usages = broker.get_pivot_usage()
-        obj_count = None
-        if usages:
-            obj_count = usages.get('object_count')
-
-        if not usages or not obj_count:
-            # this is suppose to be a sharded root container, yet we can't
-            # get information about counts from it. There must be an issue.
-            self.logger.error(_('Failed to get required counts from sharded '
-                                'container %s/%s'), broker.account,
-                              broker.container)
-            return HTTPInternalServerError(request=req)
-
-        if obj_count > 0:
-            return HTTPConflict(request=req)
-
-        node_index = self._get_node_index(req)
-        if not node_index:
-            # Looks like this isn't the primary node for this contaienr.
-            # so randomly pick and index (that's better then nothing)... maybe
-            # node_index = self._get_node_index(req, random=True)
-            return HTTPInternalServerError(request=req)
-
-        successful_ranges = list()
-
-        def _make_requests(account, container, node_index=None, nodelist=None):
-            part, nodes = self.ring.get_nodes(account, container)
-            if nodelist:
-                shuffle(nodelist)
-                node = nodelist.pop()
-            elif node_index:
-                node = nodes.pop(node_index)
-            else:
-                shuffle(nodes)
-                node = nodes.pop()
-
-            try:
-                headers = HeaderKeyDict({
-                    'x-timestamp':
-                        req.timestamp or Timestamp(time.time()).internal})
-                direct_delete_container(node, part, acct, cont, headers=headers)
-                successful_ranges.append(pivot_range)
-            except DirectClientException as ex:
-                if ex.http_status == HTTPNotFound().status:
-                    # a 404 is considered a success but we wont recreate
-                    return
-                elif ex.http_status == HTTPConflict().status:
-                    # There was still an object in the container.. we need to
-                    # recreate any deleted containers, then return a
-                    # HTTPConflict.
-                    return HTTPConflict(req)
-                else:
-                    # Try a different node.. because we want to do our best
-                    # at deleting.
-                    if nodelist is not None and not nodelist:
-                        return HTTPInternalServerError(req)
-                    return _make_requests(account, container, nodelist=nodes)
-
-        ranges = broker.build_pivot_ranges()
-        for pivot_range in ranges:
-            acct, cont = pivot_to_pivot_container(
-                broker.account, broker.container, pivot_range=pivot_range)
-            resp = _make_requests(acct, cont, node_index)
-            if resp:
-                # roll back
-                for piv_range in successful_ranges:
-                    # TODO Still need to complete cascaded deletes.
-                    pass
-            else:
-                successful_ranges.append(pivot_range)
-
-
-            # TODO Still need to finish this, deciding on how much I should
-            # reimplement that happens in the proxy. Ways forward:
-            #  1. Reimplement a basic make requests/getting quorum.
-            #  2. Refactor out some of the quroum/best_response methods from
-            #     proxy.controller.base and use them.
-            #  3. Use an internal client, in side the container server
-            #  4. Do sharded deletes from inside the proxy.
-
-        return None
 
     def _update_or_create(self, req, broker, timestamp, new_container_policy,
                           requested_policy_index):
@@ -657,36 +543,9 @@ class ContainerController(BaseStorageServer):
         headers['Content-Type'] = out_content_type
         return HTTPNoContent(request=req, headers=headers, charset='utf-8')
 
-    def GET_sharded(self, req, broker, headers, marker='', end_marker='',
-                    prefix='', limit=constraints.CONTAINER_LISTING_LIMIT):
-
-        object_count = 0
-        object_bytes = 0
-        end = False
-        objects = list()
-        used_ranges = list()
-        params = req.params.copy()
-        params.update({'format': 'json', 'limit': limit})
-        db_state = broker.get_db_state()
-        if broker.is_root_container():
-            sharded_account = account_to_pivot_account(broker.account)
-        else:
-            sharded_account = broker.account
-        sharded_upto = None
-        if db_state == DB_STATE_SHARDING:
-            node_idx = self._get_node_index(req)
-            sharded_upto = broker.metadata.get(
-                'X-Container-Sysmeta-Shard-Last-%d' % node_idx)
-            sharded_upto = None if not sharded_upto else sharded_upto[0]
-
-        # Firstly we need the requested container's, the root container, pivot
-        # tree.
-        ranges = broker.build_pivot_ranges()
-        reverse = get_param(req, 'reverse')
-        if reverse:
-            ranges.reverse()
-
-        out_content_type = get_listing_content_type(req)
+    def _check_local_brokers(self, req, broker, headers, marker='',
+                             end_marker='', prefix='',
+                             limit=constraints.CONTAINER_LISTING_LIMIT ):
 
         def merge_items(old_items, new_items):
             if old_items and isinstance(old_items[0], dict):
@@ -709,145 +568,38 @@ class ContainerController(BaseStorageServer):
             return str(int(count1) + int(count2)), \
                 str(int(bytes1) + int(bytes2))
 
-        def check_local_then_nodes(pivot):
-            hdrs = HeaderKeyDict()
-            _marker = marker
-            _limit = limit
-            path = get_param(req, 'path')
-            delimiter = get_param(req, 'delimiter')
-            old_b, pivot_b = broker.get_brokers()
-            info, is_deleted = old_b.get_info_is_deleted()
-            resp_headers = gen_resp_headers(info, is_deleted=is_deleted)
-            info, is_deleted = pivot_b.get_info_is_deleted()
-            obj_count, bytes_used = update_stats(
-                resp_headers.get('X-Container-Object-Count' ,0),
-                info.get('object_count', 0),
-                resp_headers.get('X-Container-Bytes-Used' ,0),
-                info.get('bytes_used', 0))
-            resp_headers.update({'X-Container-Object-Count': obj_count,
-                                 'X-Container-Bytes-Used': bytes_used})
+        path = get_param(req, 'path')
+        delimiter = get_param(req, 'delimiter')
+        reverse = config_true_value(get_param(req, 'reverse'))
+        old_b, pivot_b = broker.get_brokers()
+        info, is_deleted = pivot_b.get_info_is_deleted()
+        obj_count, bytes_used = update_stats(
+            headers.get('X-Container-Object-Count', 0),
+            info.get('object_count', 0),
+            headers.get('X-Container-Bytes-Used', 0),
+            info.get('bytes_used', 0))
+        headers.update({'X-Container-Object-Count': obj_count,
+                        'X-Container-Bytes-Used': bytes_used})
 
-            old_items = old_b.list_objects_iter(
-                _limit, marker, end_marker, prefix, delimiter, path,
-                broker.storage_policy_index, reverse)
+        old_items = old_b.list_objects_iter(
+            limit, marker, end_marker, prefix, delimiter, path,
+            broker.storage_policy_index, reverse)
 
-            possibly_more = True
-            while possibly_more:
-                pivot_items = pivot_b.list_objects_iter(
-                    limit, _marker, end_marker, prefix, delimiter, path,
-                    broker.storage_policy_index, reverse)
-                old_items = merge_items(old_items, pivot_items)
-                if len(old_items) >= limit:
-                    break
-                if len(pivot_items) == _limit:
-                    _limit = limit - len(old_items)
-                    _marker = pivot_items[-1][0]
-                else:
-                    possibly_more = False
-
-            # now we need to run these objects through create_listing
-            resp = self.create_listing(req, 'application/json', info,
-                                       resp_headers, broker.metadata,
-                                       old_items, broker.container)
-
-            for header, value in resp.headers.items():
-                hdrs[header] = value
-            try:
-                objs = json.loads(resp.body)
-            except:
-                objs = list()
-
-            # finally we can go grab the if updated objects from the pivoted
-            # container if it exists.
-            possibly_more = True
-            _limit = limit
-            params['limit'] = limit
-            params['items'] = 'all'
-            while possibly_more:
-                h, o = talk_to_nodes(pivot)
-                objs = merge_items(objs, o)
-                obj_count, bytes_used = update_stats(
-                    hdrs.get('X-Container-Object-Count', 0),
-                    h.get('X-Container-Object-Count', 0),
-                    hdrs.get('X-Container-Bytes-Used', 0),
-                    h.get('X-Container-Bytes-Used', 0))
-                hdrs.update({'X-Container-Object-Count': obj_count,
-                             'X-Container-Bytes-Used': bytes_used})
-                if objs >= limit:
-                    break
-                if len(o) == _limit:
-                    params['limit'] = _limit
-                    params['marker'] = o[-1]['name']
-                else:
-                    possibly_more = False
-
-            if len(objs) > limit:
-                objs = objs[:limit]
-
-            return hdrs, objs
-
-        def talk_to_nodes(pivot):
-
-            part, nodes = self.ring.get_nodes(sharded_account, pivot.name)
-            shuffle(nodes)
-            for node in nodes:
-                try:
-                    hdrs, objs = direct_get_container(
-                        node, part, sharded_account, pivot.name, **params)
-                except DirectClientException:
-                    # The exception will be thrown if not is_success so just
-                    # move onto the next node.
-                    continue
-
-                return headers, objs
-
-        # Now we need to find out where to start from.
-        start = True
-        spiv = epiv = None
-        if marker or prefix:
-            spiv = find_pivot_range(max(marker, prefix), ranges)
-            start = False
-
-        if end_marker:
-            epiv = find_pivot_range(end_marker, ranges)
-
-        for piv_range in ranges:
-            if not start and spiv:
-                if piv_range == spiv:
-                    start = True
-                else:
-                    continue
-
-            if epiv and piv_range == epiv:
-                end = True
-
-            if piv_range in used_ranges:
-                continue
-
-            if db_state == DB_STATE_SHARDING and piv_range > sharded_upto:
-                resp_hdrs, resp_objs = check_local_then_nodes(piv_range)
-            else:
-                resp_hdrs, resp_objs = talk_to_nodes(piv_range)
-
-            object_count += \
-                int(resp_hdrs.get('X-Container-Object-Count', 0))
-            object_bytes += \
-                int(resp_hdrs.get('X-Container-Bytes-Used', 0))
-            if resp_objs:
-                objects.extend(resp_objs)
-                limit -= len(resp_objs)
-                params['limit'] = limit
-                params['marker'] = resp_objs[-1]['name']
-            else:
-                end = True
-
-            if end:
+        possibly_more = True
+        while possibly_more:
+            pivot_items = pivot_b.list_objects_iter(
+                limit, marker, end_marker, prefix, delimiter, path,
+                broker.storage_policy_index, reverse, include_deleted=True)
+            old_items = merge_items(old_items, pivot_items)
+            if len(old_items) >= limit:
                 break
-        headers['X-Container-Object-Count'] = object_count
-        headers['X-Container-Bytes-Used'] = object_bytes
+            if len(pivot_items) == limit:
+                limit -= len(old_items)
+                marker = pivot_items[-1][0]
+            else:
+                possibly_more = False
 
-        return self.create_listing(req, out_content_type, {}, headers,
-                                   broker.metadata, objects, broker.container)
+        return headers, old_items
 
     @public
     @timing_stats()
@@ -886,7 +638,6 @@ class ContainerController(BaseStorageServer):
             return HTTPNotFound(request=req, headers=resp_headers)
         include_deleted = False
         db_state = broker.get_db_state()
-        skip_sharding = get_param(req, 'noshard')
         if items and items.lower() == "pivot":
             container_list = broker.build_pivot_ranges()
             if obj:
@@ -904,11 +655,11 @@ class ContainerController(BaseStorageServer):
                     return start and end
 
                 container_list = list(filter(piv_filter, container_list))
-        elif not skip_sharding and len(broker.get_pivot_ranges()) > 0 and \
-                broker.get_db_state() != DB_STATE_UNSHARDED:
-            # Sharded container so we need to pass to GET_sharded
-            return self.GET_sharded(req, broker, resp_headers, marker,
-                                    end_marker, prefix, limit)
+        elif broker.get_db_state() == DB_STATE_SHARDING:
+            # Container is sharding, so we need to look at both brokers
+            resp_headers, container_list = self._check_local_brokers(
+                req, broker, resp_headers, marker, end_marker, prefix, limit)
+
         else:
             if items and items.lower() == 'all':
                 include_deleted = True
