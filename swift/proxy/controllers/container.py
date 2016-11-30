@@ -111,7 +111,8 @@ class ContainerController(Controller):
             req, _('Container'), node_iter, part,
             req.swift_entity_path, concurrency)
         sharding_state = \
-            resp.headers.get('X-Backend-Sharding-State', DB_STATE_UNSHARDED)
+            int(resp.headers.get('X-Backend-Sharding-State',
+                                 DB_STATE_UNSHARDED))
         if req.method == "GET" and sharding_state in (DB_STATE_SHARDING,
                                                       DB_STATE_SHARDED):
             if not req.environ.get('swift.skip_shard'):
@@ -140,7 +141,7 @@ class ContainerController(Controller):
 
     def _get_pivot_ranges(self, req, sharding_state=DB_STATE_SHARDED,
                           upto=None, account=None, container=None):
-
+        import q
         ranges = []
         account = account if account else self.account_name
         container = container if container else self.container_name
@@ -152,22 +153,24 @@ class ContainerController(Controller):
             'items': 'pivot',
             'format': 'json'})
 
-        if params.get('marker') and sharding_state == DB_STATE_SHARDING and \
-                        params.get('marker') > upto:
-            return ranges
+        #if params.get('marker') and sharding_state == DB_STATE_SHARDING and \
+        #                params.get('marker') > upto:
+        #    return ranges
 
-        if params.get('end_marker') and sharding_state == DB_STATE_SHARDING:
-            params.update({'end_marker': min(params['end_marker', upto])})
+        #if params.get('end_marker') and sharding_state == DB_STATE_SHARDING:
+        #    params.update({'end_marker': min(params['end_marker', upto])})
 
         headers = {'X-Timestamp': Timestamp(time.time()).internal,
                    'X-Trans-Id': self.trans_id}
         piv_resp = self.make_requests(req, self.app.container_ring,
                                       part, "GET", path, headers,
                                       urlencode(params))
+        q(piv_resp.status)
         if not is_success(piv_resp.status_int):
             return ranges
 
         try:
+            q(piv_resp.body)
             for pivot in json.loads(piv_resp.body):
                 lower = pivot.get('lower') or None
                 upper = pivot.get('upper') or None
@@ -180,11 +183,14 @@ class ContainerController(Controller):
                                          meta_timestamp))
         except ValueError:
             # Failed to decode the json response
-            return ranges
+            pass
+
+        return ranges
 
     def _get_sharded(self, req, resp, sharding_state):
         # if sharding, we need to vist all the pivots before the upto and
         # merge with this response.
+        import q
         upto = None
         if sharding_state == DB_STATE_SHARDING:
             def filter_key(x):
@@ -193,10 +199,12 @@ class ContainerController(Controller):
             uptos = filter(filter_key, req.headers.items())
             if uptos:
                 upto = max(uptos, key=lambda x: x[-1])[0]
+            q(upto)
 
         # In whatever case we need the list of PivotRanges that contain this
         # range
         ranges = self._get_pivot_ranges(req, sharding_state, upto)
+        q(ranges)
         if not ranges:
             # can't find ranges or there was a problem getting the ranges. So
             # return what we have.

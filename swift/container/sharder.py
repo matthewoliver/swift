@@ -246,7 +246,9 @@ class ContainerSharder(ContainerReplicator):
         for item in items:
             try:
                 if isinstance(item, PivotRange):
-                    item = tuple(item)
+                    item = (
+                        item.name, item.timestamp, item.lower, item.upper,
+                        item.obj_count, item.bytes_used, item.meta_timestamp)
                 if delete:
                     # Generate a new delete timestamp based off the existing
                     # created_at, this way we don't clobber other objects that
@@ -1530,7 +1532,7 @@ class ContainerSharder(ContainerReplicator):
 
         pivots_done = []
         for i in range(self.shard_batch_size):
-            if pivot_ranges:
+            if pivots_todo:
                 pivot = pivots_todo.pop(0)
             else:
                 break
