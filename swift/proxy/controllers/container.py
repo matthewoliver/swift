@@ -115,10 +115,9 @@ class ContainerController(Controller):
                                  DB_STATE_UNSHARDED))
         if req.method == "GET" and sharding_state in (DB_STATE_SHARDING,
                                                       DB_STATE_SHARDED):
-            if not req.environ.get('swift.skip_shard'):
-                new_resp = self._get_sharded(req, resp, sharding_state)
-                if new_resp:
-                    resp = new_resp
+            new_resp = self._get_sharded(req, resp, sharding_state)
+            if new_resp:
+                resp = new_resp
 
         # Cache this. We just made a request to a storage node and got
         # up-to-date information for the container.
@@ -139,38 +138,27 @@ class ContainerController(Controller):
                     del resp.headers[key]
         return resp
 
-    def _get_pivot_ranges(self, req, sharding_state=DB_STATE_SHARDED,
-                          upto=None, account=None, container=None):
-        import q
+    def _get_pivot_ranges(self, req, account=None, container=None):
         ranges = []
         account = account if account else self.account_name
         container = container if container else self.container_name
         part, nodes = self.app.container_ring.get_nodes(account, container)
 
-        path = "/v1/%s/%s" % (self.account_name, self.container_name)
+        path = "/%s/%s" % (self.account_name, self.container_name)
         params = req.params.copy()
         params.update({
             'items': 'pivot',
             'format': 'json'})
 
-        #if params.get('marker') and sharding_state == DB_STATE_SHARDING and \
-        #                params.get('marker') > upto:
-        #    return ranges
-
-        #if params.get('end_marker') and sharding_state == DB_STATE_SHARDING:
-        #    params.update({'end_marker': min(params['end_marker', upto])})
-
-        headers = {'X-Timestamp': Timestamp(time.time()).internal,
-                   'X-Trans-Id': self.trans_id}
+        headers = [self.generate_request_headers(req, transfer=True)
+                   for _junk in range(len(nodes))]
         piv_resp = self.make_requests(req, self.app.container_ring,
                                       part, "GET", path, headers,
                                       urlencode(params))
-        q(piv_resp.status)
         if not is_success(piv_resp.status_int):
             return ranges
 
         try:
-            q(piv_resp.body)
             for pivot in json.loads(piv_resp.body):
                 lower = pivot.get('lower') or None
                 upper = pivot.get('upper') or None
@@ -190,7 +178,6 @@ class ContainerController(Controller):
     def _get_sharded(self, req, resp, sharding_state):
         # if sharding, we need to vist all the pivots before the upto and
         # merge with this response.
-        import q
         upto = None
         if sharding_state == DB_STATE_SHARDING:
             def filter_key(x):
@@ -199,35 +186,24 @@ class ContainerController(Controller):
             uptos = filter(filter_key, req.headers.items())
             if uptos:
                 upto = max(uptos, key=lambda x: x[-1])[0]
-            q(upto)
 
+        limit = req.params.get('limit', CONTAINER_LISTING_LIMIT)
+        piv_account = account_to_pivot_account(self.account_name)
         # In whatever case we need the list of PivotRanges that contain this
         # range
-        ranges = self._get_pivot_ranges(req, sharding_state, upto)
-        q(ranges)
+        ranges = self._get_pivot_ranges(req)
         if not ranges:
             # can't find ranges or there was a problem getting the ranges. So
             # return what we have.
             return None
 
-        out_content_type = get_listing_content_type(req)
-        if sharding_state == DB_STATE_SHARDING and out_content_type != \
-                'application/json':
-            # We need the initial container response to be json format.
-            new_req = Request.blank(environ=req.environ.copy())
-            new_req.environ['swift.skip_shard'] = True
-            new_req.params = new_req.params['format'] = 'json'
-            resp = self.GET(new_req)
-            if not is_success(resp.status_int):
-                return resp
-
         def get_objects(account, container, parameters):
-            path = '/v1/%s/%s' % (account, container)
+            path = '/%s/%s' % (account, container)
             part, nodes = self.app.container_ring.get_nodes(account, container)
-            headers = {'X-Timestamp': Timestamp(time.time()).internal,
-                   'X-Trans-Id': self.trans_id}
+            req_headers = [self.generate_request_headers(req, transfer=True)
+                           for _junk in range(len(nodes))]
             piv_resp = self.make_requests(req, self.app.container_ring,
-                                          part, "GET", path, headers,
+                                          part, "GET", path, req_headers,
                                           urlencode(parameters))
 
             if is_success(piv_resp.status_int):
@@ -237,99 +213,118 @@ class ContainerController(Controller):
                     pass
             return None, None, piv_resp
 
-        def merge_old_new(new_headers, new_objs, params):
-            old_headers, old_objs, old_resp = \
+        def merge_old_new(pivot, params):
+            if pivot is None:
+                return get_objects(self.account_name, self.container_name,
+                                   params)
+            try:
+                params['items'] = 'all'
+                # need some extra limit because we are getting deleted objects
+                params['limit'] = min(limit * 2, CONTAINER_LISTING_LIMIT)
+
+                hdrs, objs, tmp_resp = get_objects(piv_account, pivot.name,
+                                                   params)
+                if hdrs is None and tmp_resp:
+                    return tmp_resp
+            finally:
+                params.pop('items', None)
+                params['limit'] = limit
+
+            # now get the headers from the old db + holding (pivot) db.
+            old_hdrs, old_objs, old_resp = \
                 get_objects(self.account_name, self.container_name, params)
 
-            if not is_success(old_resp):
+            if not is_success(old_resp.status_int):
                 # just use the new response
-                result_objs = [r for r in new_objs if r['deleted'] == 0]
-                result_headers = new_headers
+                result_objs = [r for r in objs if r['deleted'] == 0]
+                result_hdrs = hdrs
             else:
                 items = dict([(r['name'], r) for r in old_objs])
-                for item in new_objs:
-                    if item['deleted'] == 1:
+                for item in objs:
+                    if item.get('deleted', 0) == 1:
                         if item['name'] in items:
                             del items[item['name']]
                             continue
                     items[item['name']] = item
                 result_objs = sorted([r for r in items.values()],
                                      key=lambda i: i['name'])
-                if params.get('reverse'):
+                if config_true_value(params.get('reverse')):
                     result_objs.reverse()
 
-                result_headers = old_headers
-
-                oc = 'X-Container-Object-Count'
-                bu = 'X-Container-Bytes-Used'
-                stats_headers = {
-                    oc: int(result_headers.get(oc, 0)),
-                    bu: int(result_headers.get(bu, 0))}
-                stats_headers[oc] += int(new_headers.get(oc, 1))
-                stats_headers[bu] += int(new_headers.get(bu, 1))
-                result_headers.update(stats_headers)
-
+                result_hdrs = old_hdrs
             if len(result_objs) > params['limit']:
                 result_objs = result_objs[:params['limit']]
 
-            return result_headers, result_objs
+            return result_hdrs, result_objs, old_resp
 
         headers = resp.headers.copy()
-        piv_account = account_to_pivot_account(self.account_name)
-        object_count = 0
-        object_bytes = 0
         objects = []
-        limit = req.params.get('limit', CONTAINER_LISTING_LIMIT)
-        root_container_resp = None
         params = req.params.copy()
-        merge_with_response = False
-        for piv_range in ranges:
-            if sharding_state == DB_STATE_SHARDING and piv_account > upto:
-                if not root_container_resp:
-                    # get the response
-                    # TODO dont re-get the resp above, do it now. Also got
-                    #    the < piv range wrong above.
-                    pass
-                merge_with_response = True
-            elif sharding_state == DB_STATE_SHARDING and piv_account < upto:
-                merge_with_response = False
-
-            if params.get('reverse'):
-                params['marker'] = piv_range.upper
+        reverse = config_true_value(params.get('reverse'))
+        marker = params.get('marker')
+        end_marker = params.get('end_marker')
+        sharding = sharding_state == DB_STATE_SHARDING
+        params['format'] = 'json'
+        num_pivs = len(ranges)
+        pivot = None
+        for i in range(num_pivs + 1):
+            if sharding and reverse and i == 0:
+                # special case if we are still sharding as data may exist in
+                # the old DB after where we're up to (because reverse).
+                if marker and (marker < ranges[0] or marker in ranges[0]):
+                    continue
+                if end_marker > ranges[0]:
+                    params['end_marker'] = end_marker
+                else:
+                    params['end_marker'] = ranges[0].upper
+            elif sharding and not reverse and i == num_pivs:
+                # we are in another edge case where the we need to check more
+                # in the old DB
+                if end_marker and pivot and (end_marker < pivot.upper or
+                                             end_marker in pivot):
+                    continue
+                params['end_marker'] = end_marker
+                params['marker'] = pivot.upper
+                pivot = None
             else:
-                params['marker'] = piv_range.lower
-            params['limit'] = limit
-            if merge_with_response:
-                params['items'] = 'all'
-                # need some extra limit because we are getting deleted objects
-                params['limit'] = min(limit * 2, CONTAINER_LISTING_LIMIT)
-
-            res_headers, res_objs, res_resp = \
-                get_objects(piv_account, piv_range.name, params)
-            if res_headers is None:
-                return res_resp
-
-            if merge_with_response:
-                params.pop('items', None)
-                params['limit'] = limit
-                res_headers, res_objs = \
-                    merge_old_new(res_headers, res_objs, params)
-
-            object_count += \
-                int(res_headers.get('X-Container-Object-Count', 0))
-            object_bytes += \
-                int(res_headers.get('X-Container-Bytes-Used', 0))
-            if res_objs:
-                objects.extend(res_objs)
-                limit -= len(res_objs)
-                params['limit'] = limit
-                if limit <= 0 or (params.get('end_marker') and
-                                  objects[-1] > params.get('end_marker')):
+                try:
+                    pivot = ranges.pop(0)
+                except IndexError:
                     break
+                if marker and marker in pivot:
+                    params['marker'] = marker
+                else:
+                    params['marker'] = pivot.upper if reverse else pivot.lower
+                if end_marker and end_marker in pivot:
+                    params['end_marker'] = end_marker
+                else:
+                    params['end_marker'] = pivot.lower if reverse else \
+                        pivot.upper
 
-        headers['X-Container-Object-Count'] = object_count
-        headers['X-Container-Bytes-Used'] = object_bytes
+            # now we have all those params set up. Let's get some objects
+            if sharding:
+                hdrs, objs, tmp_resp = merge_old_new(pivot, params)
+            else:
+                hdrs, objs, tmp_resp = get_objects(piv_account, pivot.name,
+                                                   params)
 
+            if hdrs is None and tmp_resp:
+                return tmp_resp
+
+            if objs:
+                objects.extend(objs)
+                limit -= len(objs)
+                params['limit'] = limit
+
+            if limit <= 0:
+                break
+            elif end_marker and reverse and end_marker >= objects[-1]['name']:
+                break
+            elif end_marker and not reverse and end_marker <= \
+                    objects[-1]['name']:
+                break
+
+        out_content_type = get_listing_content_type(req)
         return create_container_listing(req, out_content_type, headers, objects,
                                         self.container_name)
 

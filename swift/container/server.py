@@ -529,16 +529,7 @@ class ContainerController(BaseStorageServer):
         headers = gen_resp_headers(info, is_deleted=is_deleted)
         if is_deleted:
             return HTTPNotFound(request=req, headers=headers)
-        db_state = broker.get_db_state()
-        if broker.is_root_container() and db_state == DB_STATE_SHARDED:
-            # Sharded, so lets ask the ranges table how many objects and bytes
-            # are used.
-            usage = broker.get_pivot_usage()
-            headers.update(
-                    {'X-Container-Object-Count': usage.get('object_count', 0),
-                     'X-Container-Bytes-Used': usage.get('bytes_used', 0)})
-
-        headers['X-Backend-Sharding-State'] = db_state
+        headers['X-Backend-Sharding-State'] = broker.get_db_state()
         self._add_metadata(headers, broker.metadata)
         headers['Content-Type'] = out_content_type
         return HTTPNoContent(request=req, headers=headers, charset='utf-8')
@@ -547,7 +538,7 @@ class ContainerController(BaseStorageServer):
                              end_marker='', prefix='',
                              limit=constraints.CONTAINER_LISTING_LIMIT ):
 
-        def merge_items(old_items, new_items):
+        def merge_items(old_items, new_items, reverse=False):
             if old_items and isinstance(old_items[0], dict):
                 name, deleted = 'name', 'deleted'
             else:
@@ -561,25 +552,19 @@ class ContainerController(BaseStorageServer):
                         continue
                 items[item[name]] = item
 
-            return sorted([item for item in items.values()],
-                          key=lambda i: i[name])
-
-        def update_stats(count1=0, count2=0, bytes1=0, bytes2=0):
-            return str(int(count1) + int(count2)), \
-                str(int(bytes1) + int(bytes2))
+            result = sorted([item for item in items.values()],
+                            key=lambda i: i[name])
+            if reverse:
+                result.reverse()
+            return result
 
         path = get_param(req, 'path')
         delimiter = get_param(req, 'delimiter')
         reverse = config_true_value(get_param(req, 'reverse'))
         old_b, pivot_b = broker.get_brokers()
-        info, is_deleted = pivot_b.get_info_is_deleted()
-        obj_count, bytes_used = update_stats(
-            headers.get('X-Container-Object-Count', 0),
-            info.get('object_count', 0),
-            headers.get('X-Container-Bytes-Used', 0),
-            info.get('bytes_used', 0))
-        headers.update({'X-Container-Object-Count': obj_count,
-                        'X-Container-Bytes-Used': bytes_used})
+        info, is_deleted = old_b.get_info_is_deleted()
+        headers.update({'X-Container-Object-Count': info['object_count'],
+                        'X-Container-Bytes-Used': info['bytes_used']})
 
         old_items = old_b.list_objects_iter(
             limit, marker, end_marker, prefix, delimiter, path,
@@ -590,7 +575,7 @@ class ContainerController(BaseStorageServer):
             pivot_items = pivot_b.list_objects_iter(
                 limit, marker, end_marker, prefix, delimiter, path,
                 broker.storage_policy_index, reverse, include_deleted=True)
-            old_items = merge_items(old_items, pivot_items)
+            old_items = merge_items(old_items, pivot_items, reverse)
             if len(old_items) >= limit:
                 break
             if len(pivot_items) == limit:
@@ -644,7 +629,7 @@ class ContainerController(BaseStorageServer):
                 container_list = [find_pivot_range(obj, container_list)]
             elif marker or end_marker:
                 if reverse:
-                    container_list.reverse()
+                    marker, end_marker = end_marker, marker
 
                 def piv_filter(piv):
                     end = start = True
@@ -655,11 +640,13 @@ class ContainerController(BaseStorageServer):
                     return start and end
 
                 container_list = list(filter(piv_filter, container_list))
+                if reverse:
+                    container_list.reverse()
+                    marker, end_marker = end_marker, marker
         elif broker.get_db_state() == DB_STATE_SHARDING:
             # Container is sharding, so we need to look at both brokers
             resp_headers, container_list = self._check_local_brokers(
                 req, broker, resp_headers, marker, end_marker, prefix, limit)
-
         else:
             if items and items.lower() == 'all':
                 include_deleted = True
@@ -671,7 +658,7 @@ class ContainerController(BaseStorageServer):
         self._add_metadata(resp_headers, broker.metadata)
         return create_container_listing(
             req, out_content_type, resp_headers, container_list, container,
-            logger=self.logger)
+            logger=self.logger, include_deleted=include_deleted)
 
     @public
     @replication

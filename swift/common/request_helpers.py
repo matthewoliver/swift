@@ -654,7 +654,7 @@ def resolve_etag_is_at_header(req, metadata):
     return alternate_etag
 
 
-def update_container_data_record(record, logger=None):
+def update_container_data_record(record, logger=None, include_deleted=False):
     """
     Perform any mutations to container listing records that are common to
     all serialization formats, and returns it as a dict.
@@ -677,21 +677,28 @@ def update_container_data_record(record, logger=None):
             return {'subdir': name}
         response = {'bytes': size, 'hash': etag, 'name': name,
                     'content_type': content_type}
+        if include_deleted and len(record) > 5:
+            response['deleted'] = record[5]
+
         override_bytes_from_content_type(response, logger=logger)
     response['last_modified'] = Timestamp(created).isoformat
     return response
 
 
 def create_container_listing(req, out_content_type, resp_headers,
-                             container_list, container, logger=None):
+                             container_list, container, logger=None,
+                             include_deleted=False):
         ret = Response(request=req, headers=resp_headers,
                        content_type=out_content_type, charset='utf-8')
         if out_content_type == 'application/json':
-            ret.body = json.dumps([update_container_data_record(record, logger)
+            ret.body = json.dumps([update_container_data_record(record, logger,
+                                                                include_deleted)
                                    for record in container_list])
         elif out_content_type.endswith('/xml'):
             doc = Element('container', name=container.decode('utf-8'))
             fields = ["name", "hash", "bytes", "content_type", "last_modified"]
+            if include_deleted:
+                fields.append('deleted')
             if container_list and isinstance(container_list[0], PivotRange):
                 fields = ["name", "lower", "upper", "object_count",
                           "bytes_used", "last_modified", "meta_timestamp"]

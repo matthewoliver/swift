@@ -3961,6 +3961,8 @@ class PivotRange(object):
             return False
         if isinstance(other, PivotRange):
             return self._upper < other.lower or self._lower < other.lower
+        elif other is None:
+            return True
         else:
             return self._upper < other
 
@@ -3969,6 +3971,8 @@ class PivotRange(object):
             return False
         if isinstance(other, PivotRange):
             return self._lower >= other.upper or self._upper > other.upper
+        elif other is None:
+            return True
         else:
             return self._lower >= other
 

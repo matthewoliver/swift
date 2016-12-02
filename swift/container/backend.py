@@ -727,12 +727,15 @@ class ContainerBroker(DatabaseBroker):
             self.account = data['account']
             self.container = data['container']
 
-            if self.get_db_state() == DB_STATE_SHARDING:
+            db_state = self.get_db_state()
+            if db_state == DB_STATE_SHARDING:
                 # grab the obj_count, bytes used from locked DB. We need
                 # obj_count for sharding.
                 other_info = self.get_brokers()[0].get_info()
                 data.update({'object_count': other_info.get('object_count',0),
                              'bytes_used': other_info.get('bytes_used', 0)})
+            elif db_state == DB_STATE_SHARDED:
+                data.update(self.get_pivot_usage())
 
             return data
 
