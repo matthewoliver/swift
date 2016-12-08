@@ -262,10 +262,7 @@ class Replicator(Daemon):
 
         for db_f in db_file:
             args = list(popen_args)
-            if len(db_file) > 1:
-                rfile = "%s%s" % (remote_file, os.path.basename(db_f))
-            else:
-                rfile = remote_file
+            rfile = "%s%s" % (remote_file, os.path.basename(db_f))
             args.extend([db_f, rfile])
             proc = subprocess.Popen(args)
             proc.communicate()
