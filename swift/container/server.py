@@ -24,7 +24,8 @@ from eventlet import Timeout
 import swift.common.db
 from swift.container.sync_store import ContainerSyncStore
 from swift.container.backend import ContainerBroker, DATADIR, \
-    RECORD_TYPE_PIVOT_NODE, DB_STATE_SHARDING, DB_STATE_SHARDED
+    RECORD_TYPE_PIVOT_NODE, DB_STATE_SHARDING, DB_STATE_SHARDED, \
+    DB_STATE_UNSHARDED
 from swift.container.replicator import ContainerReplicatorRpc
 from swift.common.db import DatabaseAlreadyExists
 from swift.common.container_sync_realms import ContainerSyncRealms
@@ -72,6 +73,8 @@ def gen_resp_headers(info, is_deleted=False):
             'X-Timestamp': Timestamp(info.get('created_at', 0)).normal,
             'X-PUT-Timestamp': Timestamp(
                 info.get('put_timestamp', 0)).normal,
+            'X-Backend-Sharding-State': info.get('db_state',
+                                                 DB_STATE_UNSHARDED),
         })
     return headers
 
@@ -529,7 +532,6 @@ class ContainerController(BaseStorageServer):
         headers = gen_resp_headers(info, is_deleted=is_deleted)
         if is_deleted:
             return HTTPNotFound(request=req, headers=headers)
-        headers['X-Backend-Sharding-State'] = broker.get_db_state()
         self._add_metadata(headers, broker.metadata)
         headers['Content-Type'] = out_content_type
         return HTTPNoContent(request=req, headers=headers, charset='utf-8')
@@ -622,7 +624,6 @@ class ContainerController(BaseStorageServer):
         if is_deleted:
             return HTTPNotFound(request=req, headers=resp_headers)
         include_deleted = False
-        db_state = broker.get_db_state()
         if items and items.lower() == "pivot":
             container_list = broker.build_pivot_ranges()
             if obj:
@@ -643,7 +644,7 @@ class ContainerController(BaseStorageServer):
                 if reverse:
                     container_list.reverse()
                     marker, end_marker = end_marker, marker
-        elif broker.get_db_state() == DB_STATE_SHARDING:
+        elif info.get('db_state') == DB_STATE_SHARDING:
             # Container is sharding, so we need to look at both brokers
             resp_headers, container_list = self._check_local_brokers(
                 req, broker, resp_headers, marker, end_marker, prefix, limit)
@@ -654,7 +655,6 @@ class ContainerController(BaseStorageServer):
                 limit, marker, end_marker, prefix, delimiter, path,
                 storage_policy_index=info['storage_policy_index'],
                 reverse=reverse, include_deleted=include_deleted)
-        resp_headers['X-Backend-Sharding-State'] = db_state
         self._add_metadata(resp_headers, broker.metadata)
         return create_container_listing(
             req, out_content_type, resp_headers, container_list, container,

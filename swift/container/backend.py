@@ -728,6 +728,7 @@ class ContainerBroker(DatabaseBroker):
             self.container = data['container']
 
             db_state = self.get_db_state()
+            data['db_state'] = db_state
             if db_state == DB_STATE_SHARDING:
                 # grab the obj_count, bytes used from locked DB. We need
                 # obj_count for sharding.

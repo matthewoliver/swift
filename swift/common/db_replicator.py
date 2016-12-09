@@ -466,6 +466,9 @@ class Replicator(Daemon):
         return self._handle_sync_response(node, response, info, broker, http,
                                           different_region=different_region)
 
+    def _can_push(self, info, rinfo):
+        return True
+
     def _handle_sync_response(self, node, response, info, broker, http,
                               different_region=False):
         if response.status == HTTP_NOT_FOUND:  # completely missing, rsync
@@ -487,7 +490,7 @@ class Replicator(Daemon):
             # on smaller containers, who have only a few rows to sync.
             if rinfo['max_row'] / float(info['max_row']) < 0.55 and \
                     info['max_row'] - rinfo['max_row'] > self.per_diff and \
-                    len(broker.get_brokers()) == 1:
+                    self._can_push(info, rinfo):
                 self.stats['remote_merge'] += 1
                 self.logger.increment('remote_merges')
                 return self._rsync_db(broker, node, http, info['id'],
