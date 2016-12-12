@@ -1030,9 +1030,9 @@ class ContainerBroker(DatabaseBroker):
             else:
                 keys = ('name', 'created_at', 'lower', 'upper', 'object_count',
                         'bytes_used', 'meta_timestamp', 'deleted')
-                result = dict(zip(keys, rec))
-                result.update({'record_type': record_type})
-                return result
+            result = dict(zip(keys, rec))
+            result.update({'record_type': record_type})
+            return result
         return None
 
     def merge_items(self, item_list, source=None):

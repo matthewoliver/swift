@@ -307,11 +307,7 @@ class Replicator(Daemon):
                     return False
         db_filenames = [os.path.basename(d) for d in db_files]
         with Timeout(replicate_timeout or self.node_timeout):
-            if len(db_filenames) > 1:
-                response = http.replicate(replicate_method, local_id,
-                                          db_filenames)
-            else:
-                response = http.replicate(replicate_method, local_id)
+            response = http.replicate(replicate_method, local_id, db_filenames)
         return response and 200 <= response.status < 300
 
     def _usync_db(self, point, broker, http, remote_id, local_id):
@@ -488,7 +484,7 @@ class Replicator(Daemon):
             # rsync then do a remote merge.
             # NOTE: difference > per_diff stops us from dropping to rsync
             # on smaller containers, who have only a few rows to sync.
-            if rinfo['max_row'] / float(info['max_row']) < 0.55 and \
+            if rinfo['max_row'] / float(info['max_row']) < 0.5 and \
                     info['max_row'] - rinfo['max_row'] > self.per_diff and \
                     self._can_push(info, rinfo):
                 self.stats['remote_merge'] += 1
@@ -857,17 +853,16 @@ class ReplicatorRpc(object):
         return HTTPAccepted()
 
     def complete_rsync(self, drive, db_file, args):
-        local_id = args.pop(0)
+        local_id = filename = args.pop(0)
         filenames = []
         if args:
             filenames = args.pop(0)
         num_files = max(len(filenames), 1)
         completed = 0
         while completed < num_files:
-            if len(filenames) <= 1:
-                filename = local_id
-            else:
+            if filenames:
                 filename = "%s%s" % (local_id, filenames[completed])
+
             old_filename = os.path.join(self.root, drive, 'tmp', filename)
             if os.path.exists(db_file):
                 return HTTPNotFound()
@@ -885,7 +880,12 @@ class ReplicatorRpc(object):
         return HTTPNoContent()
 
     def rsync_then_merge(self, drive, db_file, args):
-        old_filename = os.path.join(self.root, drive, 'tmp', args[0])
+        local_id = filename = args.pop(0)
+        filenames = []
+        if args:
+            filenames = args.pop(0)
+            filename = '%s%s' % (local_id, filenames[0])
+        old_filename = os.path.join(self.root, drive, 'tmp', filename)
         if not os.path.exists(db_file) or not os.path.exists(old_filename):
             return HTTPNotFound()
         new_broker = self.broker_class(old_filename)
@@ -902,8 +902,17 @@ class ReplicatorRpc(object):
         other_items = self._other_items_hook(existing_broker)
         if other_items:
             new_broker.merge_items(other_items)
-        new_broker.newid(args[0])
-        renamer(old_filename, db_file)
+        new_broker.newid(local_id)
+        if filenames and not db_file.endswith(filenames[0]):
+            # we have a different filename (ie pivoted container to
+            # container) so we need to rename correctly.
+            db_file_dir = os.path.dirname(db_file)
+            db_file_new = os.path.join(db_file_dir, filenames[0])
+            renamer(old_filename, db_file_new)
+            os.unlink(db_file)
+        else:
+            renamer(old_filename, db_file)
+
         return HTTPNoContent()
 
     def _other_items_hook(self, broker):
