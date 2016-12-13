@@ -679,18 +679,7 @@ class ContainerBroker(DatabaseBroker):
         info['pivot_max_row'] = self.get_max_row('pivot_points')
         return info
 
-    def get_info(self):
-        """
-        Get global data for the container.
-
-        :returns: dict with keys: account, container, created_at,
-                  put_timestamp, delete_timestamp, status_changed_at,
-                  object_count, bytes_used, reported_put_timestamp,
-                  reported_delete_timestamp, reported_object_count,
-                  reported_bytes_used, hash, id, x_container_sync_point1,
-                  x_container_sync_point2, and storage_policy_index,
-                  pivot_point.
-        """
+    def _get_info(self):
         self._commit_puts_stale_ok()
         with self.get() as conn:
             data = None
@@ -700,14 +689,14 @@ class ContainerBroker(DatabaseBroker):
             while not data:
                 try:
                     data = conn.execute(('''
-                        SELECT account, container, created_at, put_timestamp,
-                            delete_timestamp, status_changed_at,
-                            object_count, bytes_used,
-                            reported_put_timestamp, reported_delete_timestamp,
-                            reported_object_count, reported_bytes_used, hash,
-                            id, %s, %s
-                            FROM container_stat
-                    ''') % (trailing_sync, trailing_pol)).fetchone()
+                                SELECT account, container, created_at, put_timestamp,
+                                    delete_timestamp, status_changed_at,
+                                    object_count, bytes_used,
+                                    reported_put_timestamp, reported_delete_timestamp,
+                                    reported_object_count, reported_bytes_used, hash,
+                                    id, %s, %s
+                                    FROM container_stat
+                            ''') % (trailing_sync, trailing_pol)).fetchone()
                 except sqlite3.OperationalError as err:
                     err_msg = str(err)
                     if err_msg in errors:
@@ -729,16 +718,34 @@ class ContainerBroker(DatabaseBroker):
 
             db_state = self.get_db_state()
             data['db_state'] = db_state
-            if db_state == DB_STATE_SHARDING:
-                # grab the obj_count, bytes used from locked DB. We need
-                # obj_count for sharding.
-                other_info = self.get_brokers()[0].get_info()
-                data.update({'object_count': other_info.get('object_count',0),
-                             'bytes_used': other_info.get('bytes_used', 0)})
-            elif db_state == DB_STATE_SHARDED:
-                data.update(self.get_pivot_usage())
 
             return data
+
+    def get_info(self):
+        """
+        Get global data for the container.
+
+        :returns: dict with keys: account, container, created_at,
+                  put_timestamp, delete_timestamp, status_changed_at,
+                  object_count, bytes_used, reported_put_timestamp,
+                  reported_delete_timestamp, reported_object_count,
+                  reported_bytes_used, hash, id, x_container_sync_point1,
+                  x_container_sync_point2, and storage_policy_index,
+                  pivot_point.
+        """
+        data = self._get_info()
+
+        db_state = self.get_db_state()
+        if db_state == DB_STATE_SHARDING:
+            # grab the obj_count, bytes used from locked DB. We need
+            # obj_count for sharding.
+            other_info = self.get_brokers()[0]._get_info()
+            data.update({'object_count': other_info.get('object_count', 0),
+                         'bytes_used': other_info.get('bytes_used', 0)})
+        elif db_state == DB_STATE_SHARDED:
+            data.update(self.get_pivot_usage())
+
+        return data
 
     def set_x_container_sync_points(self, sync_point1, sync_point2):
         with self.get() as conn:
