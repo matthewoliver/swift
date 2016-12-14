@@ -1,6 +1,6 @@
 #!/bin/bash
 
-swift-init all stop
+swift-init all stop --kill-after-timeout --kill-wait=0
 # Remove the following line if you did not set up rsyslog for individual logging:
 sudo find /var/log/swift -type f -exec rm -f {} \;
 sudo umount /mnt/sdb1

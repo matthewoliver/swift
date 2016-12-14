@@ -209,33 +209,25 @@ class BaseObjectController(Controller):
         """Handler for HTTP HEAD requests."""
         return self.GETorHEAD(req)
 
-    def _get_container_meta(self, container_info):
+    def _get_container_meta(self, req, container_info):
         db_state = container_info.get('sharding_state', DB_STATE_UNSHARDED)
-        if db_state == DB_STATE_SHARDED:
+        if db_state in (DB_STATE_SHARDED, DB_STATE_SHARDING):
             # find the sharded container to send the update too.
-            part, nodes = self.app.container_ring.get_nodes(
-                self.account_name, self.container_name)
-            path = "/v1/%s/%s/%s?items=pivot&format=json" % (
-                self.account_name, self.container_name, self.object_name)
-            headers = {'X-Timestamp': Timestamp(time.time()).internal,
-                       'X-Trans-Id': self.trans_id}
-            resp = self.make_requests(Request.blank(path),
-                                      self.app.container_ring, part, "GET",
-                                      path, headers)
-            if is_success(resp.status_int):
-                results = json.loads(resp.body)
-                if results and results[0].get('name'):
-                    piv_acct = account_to_pivot_account(self.account_name)
-                    partition, containers = self.app.container_ring.get_nodes(
-                        piv_acct, results[0]['name'])
-                    overide_prefix = 'X-Backend-Container-Update-Override'
-                    shard = results[0]['name']
-                    container_meta = {
-                        '%s-Backend-Pivot-Account' % overide_prefix: piv_acct,
-                        '%s-Backend- Pivot-Container' % overide_prefix: shard
-                    }
+            ranges = self._get_pivot_ranges(
+                req, self.account_name, self.container_name, self.object_name)
 
-                    return partition, containers, container_meta
+            if ranges:
+                piv_acct = account_to_pivot_account(self.account_name)
+                partition, containers = self.app.container_ring.get_nodes(
+                    piv_acct, ranges[0].name)
+                overide_prefix = 'X-Backend-Container-Update-Override'
+                shard = ranges[0].name
+                container_meta = {
+                    '%s-Backend-Pivot-Account' % overide_prefix: piv_acct,
+                    '%s-Backend-Pivot-Container' % overide_prefix: shard
+                }
+
+                return partition, containers, container_meta
 
         return container_info['partition'], container_info['nodes'], []
 
@@ -251,7 +243,7 @@ class BaseObjectController(Controller):
         container_info = self.container_info(
             self.account_name, self.container_name, req)
         container_partition, containers, container_meta = \
-            self._get_container_meta(container_info)
+            self._get_container_meta(req, container_info)
         req.acl = container_info['write_acl']
         if 'swift.authorize' in req.environ:
             aresp = req.environ['swift.authorize'](req)
@@ -672,7 +664,7 @@ class BaseObjectController(Controller):
                                        container_info['storage_policy'])
         obj_ring = self.app.get_object_ring(policy_index)
         container_partition, container_nodes, container_meta = \
-            self._get_container_meta(container_info)
+            self._get_container_meta(req, container_info)
         partition, nodes = obj_ring.get_nodes(
             self.account_name, self.container_name, self.object_name)
 

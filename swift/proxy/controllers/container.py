@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from six.moves.urllib.parse import unquote, urlencode
 from swift import gettext_ as _
 import time
 import json
 
-from six.moves.urllib.parse import unquote, urlencode
 from swift.common.utils import public, csv_append, Timestamp, \
-    config_true_value, PivotRange, account_to_pivot_account
+    config_true_value, account_to_pivot_account
 from swift.common.constraints import check_metadata, CONTAINER_LISTING_LIMIT
 from swift.common import constraints
 from swift.common.http import HTTP_ACCEPTED, is_success, \
@@ -138,43 +138,6 @@ class ContainerController(Controller):
                     del resp.headers[key]
         return resp
 
-    def _get_pivot_ranges(self, req, account=None, container=None):
-        ranges = []
-        account = account if account else self.account_name
-        container = container if container else self.container_name
-        part, nodes = self.app.container_ring.get_nodes(account, container)
-
-        path = "/%s/%s" % (self.account_name, self.container_name)
-        params = req.params.copy()
-        params.update({
-            'items': 'pivot',
-            'format': 'json'})
-
-        headers = [self.generate_request_headers(req, transfer=True)
-                   for _junk in range(len(nodes))]
-        piv_resp = self.make_requests(req, self.app.container_ring,
-                                      part, "GET", path, headers,
-                                      urlencode(params))
-        if not is_success(piv_resp.status_int):
-            return ranges
-
-        try:
-            for pivot in json.loads(piv_resp.body):
-                lower = pivot.get('lower') or None
-                upper = pivot.get('upper') or None
-                created_at = pivot.get('created_at') or None
-                object_count = pivot.get('object_count') or 0
-                bytes_used = pivot.get('bytes_used') or 0
-                meta_timestamp = pivot.get('meta_timestamp') or None
-                ranges.append(PivotRange(pivot['name'], created_at, lower,
-                                         upper, object_count, bytes_used,
-                                         meta_timestamp))
-        except ValueError:
-            # Failed to decode the json response
-            pass
-
-        return ranges
-
     def _get_sharded(self, req, resp, sharding_state):
         # if sharding, we need to vist all the pivots before the upto and
         # merge with this response.
@@ -191,7 +154,8 @@ class ContainerController(Controller):
         piv_account = account_to_pivot_account(self.account_name)
         # In whatever case we need the list of PivotRanges that contain this
         # range
-        ranges = self._get_pivot_ranges(req)
+        ranges = self._get_pivot_ranges(req, self.account_name,
+                                        self.container_name)
         if not ranges:
             # can't find ranges or there was a problem getting the ranges. So
             # return what we have.
@@ -294,12 +258,13 @@ class ContainerController(Controller):
                 if marker and marker in pivot:
                     params['marker'] = marker
                 else:
-                    params['marker'] = pivot.upper if reverse else pivot.lower
+                    params['marker'] = pivot.upper or '' if reverse else \
+                        pivot.lower or ''
                 if end_marker and end_marker in pivot:
                     params['end_marker'] = end_marker
                 else:
-                    params['end_marker'] = pivot.lower if reverse else \
-                        pivot.upper
+                    params['end_marker'] = pivot.lower or '' if reverse else \
+                        pivot.upper or ''
 
             # now we have all those params set up. Let's get some objects
             if sharding:
