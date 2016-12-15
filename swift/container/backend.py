@@ -562,7 +562,7 @@ class ContainerBroker(DatabaseBroker):
 
     def delete_object(self, name, timestamp, storage_policy_index=0,
                       lower=None, upper=None, object_count=0, bytes_used=0,
-                      record_type=RECORD_TYPE_OBJECT):
+                      meta_timestamp=None, record_type=RECORD_TYPE_OBJECT):
         """
         Mark an object deleted.
 
@@ -575,7 +575,8 @@ class ContainerBroker(DatabaseBroker):
         if record_type != RECORD_TYPE_OBJECT:
             kargs.update(dict(
                 lower=lower, upper=upper, object_count=object_count,
-                bytes_used=bytes_used, record_type=record_type))
+                bytes_used=bytes_used, meta_timestamp=meta_timestamp,
+                record_type=record_type))
         self.put_object(name, timestamp, 0, 'application/deleted', 'noetag',
                         deleted=1, storage_policy_index=storage_policy_index,
                         **kargs)
@@ -1473,10 +1474,12 @@ class ContainerBroker(DatabaseBroker):
             sql = 'SELECT name FROM object WHERE deleted=0 '
             if last_upper:
                 sql += "AND name > '%s' " % last_upper
-            sql += "ORDER BY name LIMIT 1 OFFSET %d;" % offset
+            sql += "ORDER BY name LIMIT 1 OFFSET %d" % offset
             data = conn.execute(sql)
             if data:
                 data = data.fetchone()
+                if not data:
+                    return None
                 return data['name']
             else:
                 return ''

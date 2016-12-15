@@ -755,7 +755,10 @@ class ContainerSharder(ContainerReplicator):
 
                 if scan_idx is not None and int(scan_idx) == self.node_idx \
                         and not scan_complete:
-                    self._find_pivot_points(broker)
+                    scan_complete = self._find_pivot_points(broker)
+                    if scan_complete:
+                        self._shard_on_pivot(broker, root_account,
+                                             root_container)
                 else:
                     self._shard_on_pivot(broker, root_account,
                                          root_container)
@@ -768,11 +771,12 @@ class ContainerSharder(ContainerReplicator):
         # wipe out the cache do disable bypass in delete_db
         cleanups = self.shard_cleanups
         self.shard_cleanups = None
-        self.logger.info('Cleaning up %d replicated shard containers',
-                            len(cleanups))
+        if cleanups:
+            self.logger.info('Cleaning up %d replicated shard containers',
+                             len(cleanups))
 
-        for container in cleanups.values():
-            self.cpool.spawn(self.delete_db, container)
+            for container in cleanups.values():
+                self.cpool.spawn(self.delete_db, container)
 
         # Now we wait for all threads to finish.
         all(self.cpool)
@@ -1021,15 +1025,20 @@ class ContainerSharder(ContainerReplicator):
                          broker.account, broker.container)
 
         # get the last pivot point found to continue from
+        cont_pivot = self.get_pivot_range(broker)
+        cont_lower = cont_pivot.lower if cont_pivot else None
+        cont_upper = cont_pivot.upper if cont_pivot else None
+
         pivot_ranges = broker.build_pivot_ranges()
         old_piv = marker = pivot_ranges[-1].upper if pivot_ranges else None
         if old_piv and broker.get_db_state() == DB_STATE_UNSHARDED:
             broker.set_sharding_state()
         progress = len(pivot_ranges) * self.split_size
         obj_count = broker.get_info().get('object_count', 0)
+        last_found = False
 
         def found_last():
-            return progress + self.split_size >= obj_count
+            return progress + self.split_size >= obj_count or last_found
 
         if found_last():
             self.logger.info(_("Already found all pivots"))
@@ -1039,7 +1048,12 @@ class ContainerSharder(ContainerReplicator):
 
         for i in range(self.scanner_batch_size):
             next_pivot = broker.get_next_pivot_point(marker)
-            if not next_pivot:
+            if next_pivot is None:
+                # We have hit passed the end of the container, make
+                # the last container.
+                last_found = True
+                next_pivot = cont_upper
+            elif not next_pivot:
                 # something happened and we couldn't find pivot. Stop where we
                 # are but don't mark complete.
                 break
@@ -1081,7 +1095,7 @@ class ContainerSharder(ContainerReplicator):
         root_account, root_container = \
                 ContainerSharder.get_shard_root_path(broker)
         piv_account = account_to_pivot_account(root_account)
-        lower = old_piv if old_piv else None
+        lower = old_piv if old_piv else cont_lower
         policy = POLICIES.get_by_index(broker.storage_policy_index)
         headers = {
             'X-Storage-Policy': policy.name,
@@ -1091,7 +1105,7 @@ class ContainerSharder(ContainerReplicator):
         for i, pivot in enumerate(found_pivots):
             timestamp = Timestamp(time.time()).internal
             piv_name = self.generate_pivot_name(root_container, self.node_idx,
-                                                pivot, timestamp)
+                                                pivot or '', timestamp)
             try:
                 headers.update({
                     'X-Container-Sysmeta-Shard-Lower': lower,
@@ -1118,12 +1132,12 @@ class ContainerSharder(ContainerReplicator):
             found_pivots = found_pivots[:i]
             progress = (len(pivot_ranges) + len(found_pivots)) * self.split_size
 
-        if found_last():
+        if found_last() and not last_found:
             # We need to add the final pivot range as well.
             timestamp = Timestamp(time.time()).internal
             piv_name = self.generate_pivot_name(root_container, self.node_idx,
                                                 '', timestamp)
-            new_pivot = PivotRange(piv_name, timestamp, lower, None, 0, 0,
+            new_pivot = PivotRange(piv_name, timestamp, lower, cont_upper, 0, 0,
                                    timestamp)
             pivot_ranges.append(new_pivot)
             # add something the found_pivots so the stats will be correct.
@@ -1131,7 +1145,7 @@ class ContainerSharder(ContainerReplicator):
             try:
                 headers.update({
                     'X-Container-Sysmeta-Shard-Lower': lower,
-                    'X-Container-Sysmeta-Shard-Upper': None,
+                    'X-Container-Sysmeta-Shard-Upper': cont_upper,
                     'X-Container-Sysmeta-Shard-Timestamp': timestamp,
                     'X-Container-Sysmeta-Shard-Meta-Timestamp': timestamp})
                 self.swift.create_container(piv_account, piv_name,
@@ -1163,6 +1177,7 @@ class ContainerSharder(ContainerReplicator):
             broker.update_metadata({
                 'X-Container-Sysmeta-Sharding-Scan-Done': (True, timestamp)})
             self.logger.info(_(" Final pivot reached."))
+            return True
 
     def generate_pivot_name(self, container, node_id, pivot, timestamp=None):
         if not timestamp:
@@ -1472,12 +1487,17 @@ class ContainerSharder(ContainerReplicator):
                 break
 
     def _sharding_complete(self, root_account, root_container, broker):
+        broker.set_sharded_state()
         if root_container != broker.container:
             # We aren't in the root container.
             self._update_pivot_ranges(root_account, root_container, 'PUT',
                                       broker.build_pivot_ranges())
-            # TODO question when do we delete? wait until all are done?
-        broker.set_sharded_state()
+            timestamp = Timestamp(time.time()).internal
+            piv = self.get_pivot_range(broker)
+            piv.timestamp = timestamp
+            self._update_pivot_ranges(root_account, root_container, 'DELETE',
+                                      [piv])
+            broker.delete_db(timestamp)
 
     def _shard_on_pivot(self, broker, root_account, root_container):
         last_pivot = self.get_metadata_item(

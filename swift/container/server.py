@@ -316,6 +316,7 @@ class ContainerController(BaseStorageServer):
                 obj_count = req.headers.get('x-backend-pivot-objects')
                 bytes_used = req.headers.get('x-backend-pivot-bytes')
                 obj_timestamp = req.headers.get('x-backend-timestamp')
+                meta_timestamp = req.headers.get('x-meta-timestamp')
                 req_timestamp = obj_timestamp or req.headers.get('x-timestamp')
 
                 # Level is required when putting a pivot point.
@@ -327,6 +328,7 @@ class ContainerController(BaseStorageServer):
                     obj, req_timestamp,
                     obj_policy_index, lower=lower, upper=upper,
                     object_count=obj_count, bytes_used=bytes_used,
+                    meta_timestamp=meta_timestamp,
                     record_type=int(record_type))
 
             elif len(broker.get_pivot_ranges()) > 0:
