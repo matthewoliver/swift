@@ -241,6 +241,7 @@ class ContainerController(Controller):
                     params['end_marker'] = end_marker
                 else:
                     params['end_marker'] = ranges[0].upper
+                    params['include_end_marker'] = True
             elif sharding and not reverse and i == num_pivs:
                 # we are in another edge case where the we need to check more
                 # in the old DB
@@ -265,6 +266,8 @@ class ContainerController(Controller):
                 else:
                     params['end_marker'] = pivot.lower or '' if reverse else \
                         pivot.upper or ''
+                    if params['end_marker']:
+                        params['include_end_marker'] = True
 
             # now we have all those params set up. Let's get some objects
             if sharding:

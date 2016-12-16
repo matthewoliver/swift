@@ -316,8 +316,8 @@ class ContainerController(BaseStorageServer):
                 obj_count = req.headers.get('x-backend-pivot-objects')
                 bytes_used = req.headers.get('x-backend-pivot-bytes')
                 obj_timestamp = req.headers.get('x-backend-timestamp')
-                meta_timestamp = req.headers.get('x-meta-timestamp')
-                req_timestamp = obj_timestamp or req.headers.get('x-timestamp')
+                meta_timestamp = req.headers.get('x-meta-timestamp',
+                                                 req_timestamp.internal)
 
                 # Level is required when putting a pivot point.
                 lower = req.headers.get('x-backend-pivot-lower')
@@ -325,7 +325,7 @@ class ContainerController(BaseStorageServer):
                 if not upper:
                     raise HTTPBadRequest()
                 broker.delete_object(
-                    obj, req_timestamp,
+                    obj, obj_timestamp,
                     obj_policy_index, lower=lower, upper=upper,
                     object_count=obj_count, bytes_used=bytes_used,
                     meta_timestamp=meta_timestamp,
@@ -453,9 +453,9 @@ class ContainerController(BaseStorageServer):
                     upper=req.headers.get('x-backend-pivot-upper')))
 
                 obj_timestamp = req.headers.get('x-backend-timestamp')
-                req_timestamp = obj_timestamp or req_timestamp.internal
+                #req_timestamp = obj_timestamp or req_timestamp.internal
 
-                args = [obj, req_timestamp,
+                args = [obj, obj_timestamp,
                         int(req.headers['x-size']), '', '', 0]
             elif len(broker.get_pivot_ranges()) > 0:
                 # cannot put to a root shard container, find actual container
@@ -605,6 +605,8 @@ class ContainerController(BaseStorageServer):
             return HTTPPreconditionFailed(body='Bad delimiter')
         marker = get_param(req, 'marker', '')
         end_marker = get_param(req, 'end_marker')
+        include_end_marker = config_true_value(
+            get_param(req, 'include_end_marker'))
         limit = constraints.CONTAINER_LISTING_LIMIT
         given_limit = get_param(req, 'limit')
         reverse = config_true_value(get_param(req, 'reverse'))
@@ -656,7 +658,8 @@ class ContainerController(BaseStorageServer):
             container_list = broker.list_objects_iter(
                 limit, marker, end_marker, prefix, delimiter, path,
                 storage_policy_index=info['storage_policy_index'],
-                reverse=reverse, include_deleted=include_deleted)
+                reverse=reverse, include_deleted=include_deleted,
+                include_end_marker=include_end_marker)
         self._add_metadata(resp_headers, broker.metadata)
         return create_container_listing(
             req, out_content_type, resp_headers, container_list, container,

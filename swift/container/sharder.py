@@ -457,12 +457,13 @@ class ContainerSharder(ContainerReplicator):
         if not upper:
             upper = None
 
+        pivot = PivotRange(broker.container, timestamp, lower, upper, 0,
+                           0, meta_timestamp)
         tmp_info = broker.get_info()
-        obj_count = tmp_info.get('object_count', 0)
-        bytes_used = tmp_info.get('bytes_used', 0)
+        pivot.obj_count = tmp_info.get('object_count', 0)
+        pivot.bytes_used = tmp_info.get('bytes_used', 0)
 
-        return PivotRange(broker.container, timestamp, lower, upper, obj_count,
-                          bytes_used, meta_timestamp)
+        return pivot
 
     @staticmethod
     def get_shard_root_path(broker):
@@ -960,7 +961,9 @@ class ContainerSharder(ContainerReplicator):
                          broker.account, broker.container, scanner_id[0])
         self.logger.increment('scanner_searches')
 
-        return scanner_id[0]
+        #return scanner_id[0]
+        return self.get_metadata_item(broker,
+                                      'X-Container-Sysmeta-Shard-Scanner')
 
     def _get_quorum(self, broker, success=None, quorum=None, op='HEAD',
                     headers=None, post_success=None, post_fail=None,
@@ -989,7 +992,6 @@ class ContainerSharder(ContainerReplicator):
                      if d['ip'] not in self.ips or
                      d['port'] != self.port]
 
-        # Send out requests to get suggested pivots and object counts.
         for node in nodes:
             self.cpool.spawn(
                 self._send_request, node['ip'], node['port'], node['device'],
@@ -1081,6 +1083,8 @@ class ContainerSharder(ContainerReplicator):
             if found_scan_id:
                 if found_scan_id != str(self.node_idx):
                     return False
+            else:
+                return False
 
             return True
 
@@ -1521,7 +1525,7 @@ class ContainerSharder(ContainerReplicator):
 
         pivots_todo = [
             p for p in pivot_ranges
-            if p.upper > last_pivot or p.lower > last_pivot]
+            if p.upper > last_pivot or p.lower >= last_pivot]
         if not pivots_todo:
             # This means no new pivot_ranges have been added since last pass.
             # If the scanner is complete, then we have finished sharding.
@@ -1568,7 +1572,7 @@ class ContainerSharder(ContainerReplicator):
             q.update({'marker': pivot.lower or '',
                       'end_marker': pivot.upper or ''})
             if pivot.upper:
-                      q.update({'include_end_marker': True})
+                q.update({'include_end_marker': True})
             try:
                 acct = account_to_pivot_account(root_account)
                 new_part, new_broker, node_id = \
