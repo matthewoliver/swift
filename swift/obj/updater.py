@@ -27,7 +27,7 @@ from swift.common.bufferedhttp import http_connect
 from swift.common.exceptions import ConnectionTimeout
 from swift.common.ring import Ring
 from swift.common.utils import get_logger, renamer, write_pickle, \
-    dump_recon_cache, config_true_value, ismount
+    dump_recon_cache, config_true_value, ismount, urlparse
 from swift.common.swob import HeaderKeyDict
 from swift.common.daemon import Daemon
 from swift.common.storage_policy import split_policy_string, PolicyError
@@ -253,7 +253,7 @@ class ObjectUpdater(Daemon):
                 else:
                     redirect = redirects.pop()
                 update['headers']['X-Backend-Pivot-Account'] = redirect[0]
-                update['headers']['X-Backend-Pivot-Account'] = redirect[1]
+                update['headers']['X-Backend-Pivot-Container'] = redirect[1]
                 if num_redirects == i + 1:
                     success = False
                 else:
@@ -264,6 +264,8 @@ class ObjectUpdater(Daemon):
                                       {'obj': obj, 'path': update_path,
                                        'redir_acct': redirect[0],
                                        'redir_cont': redirect[1]})
+            else:
+                break
 
         if success:
             self.successes += 1
@@ -313,6 +315,7 @@ class ObjectUpdater(Daemon):
                     # treat as a normal failure.
                     return success, node['id'], redirect
 
+                location = urlparse(location).path
                 if location.startswith('/'):
                     location = location[1:]
                 piv_acc, piv_cont, obj_ = location.split('/', 2)
@@ -330,4 +333,4 @@ class ObjectUpdater(Daemon):
         except (Exception, Timeout):
             self.logger.exception(_('ERROR with remote server '
                                     '%(ip)s:%(port)s/%(device)s'), node)
-        return HTTP_INTERNAL_SERVER_ERROR, node['id']
+        return HTTP_INTERNAL_SERVER_ERROR, node['id'], None
