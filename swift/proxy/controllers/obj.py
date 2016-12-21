@@ -730,7 +730,7 @@ class BaseObjectController(Controller):
         # pass the policy index to storage nodes via req header
         req.headers['X-Backend-Storage-Policy-Index'] = policy_index
         container_partition, containers, container_meta = \
-            self._get_container_meta(container_info)
+            self._get_container_meta(req, container_info)
         req.acl = container_info['write_acl']
         req.environ['swift_sync_key'] = container_info['sync_key']
         if 'swift.authorize' in req.environ:
