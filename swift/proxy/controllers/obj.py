@@ -229,7 +229,7 @@ class BaseObjectController(Controller):
 
                 return partition, containers, container_meta
 
-        return container_info['partition'], container_info['nodes'], []
+        return container_info['partition'], container_info['nodes'], {}
 
 
     @public
