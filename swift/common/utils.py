@@ -38,9 +38,11 @@ import email.parser
 from distutils.version import LooseVersion
 from hashlib import md5, sha1
 from random import random, shuffle
+from collections import defaultdict
 from contextlib import contextmanager, closing
 import ctypes
 import ctypes.util
+from itertools import chain
 from optparse import OptionParser
 
 from tempfile import mkstemp, NamedTemporaryFile
@@ -1529,50 +1531,57 @@ class LoggerFileObject(object):
 
 class StatsdClient(object):
     def __init__(self, host, port, base_prefix='', tail_prefix='',
-                 default_sample_rate=1, sample_rate_factor=1, logger=None):
+                 default_sample_rate=1, sample_rate_factor=1, logger=None,
+                 recon_cache='/var/cache/swift', log_stats=False):
         self._host = host
         self._port = port
         self._base_prefix = base_prefix
         self.set_prefix(tail_prefix)
+        self._tail_prefix = tail_prefix
         self._default_sample_rate = default_sample_rate
         self._sample_rate_factor = sample_rate_factor
         self.random = random
         self.logger = logger
+        self.stats = [defaultdict(int)]
+        self._last_report = time.time()
+        self._recon_cache = recon_cache
+        self._log_stats = log_stats
 
-        # Determine if host is IPv4 or IPv6
-        addr_info = None
-        try:
-            addr_info = socket.getaddrinfo(host, port, socket.AF_INET)
-            self._sock_family = socket.AF_INET
-        except socket.gaierror:
+        if host:
+            # Determine if host is IPv4 or IPv6
+            addr_info = None
             try:
-                addr_info = socket.getaddrinfo(host, port, socket.AF_INET6)
-                self._sock_family = socket.AF_INET6
-            except socket.gaierror:
-                # Don't keep the server from starting from what could be a
-                # transient DNS failure.  Any hostname will get re-resolved as
-                # necessary in the .sendto() calls.
-                # However, we don't know if we're IPv4 or IPv6 in this case, so
-                # we assume legacy IPv4.
+                addr_info = socket.getaddrinfo(host, port, socket.AF_INET)
                 self._sock_family = socket.AF_INET
+            except socket.gaierror:
+                try:
+                    addr_info = socket.getaddrinfo(host, port, socket.AF_INET6)
+                    self._sock_family = socket.AF_INET6
+                except socket.gaierror:
+                    # Don't keep the server from starting from what could be a
+                    # transient DNS failure.  Any hostname will get re-resolved
+                    # as necessary in the .sendto() calls.
+                    # However, we don't know if we're IPv4 or IPv6 in this
+                    # case so we assume legacy IPv4.
+                    self._sock_family = socket.AF_INET
 
-        # NOTE: we use the original host value, not the DNS-resolved one
-        # because if host is a hostname, we don't want to cache the DNS
-        # resolution for the entire lifetime of this process.  Let standard
-        # name resolution caching take effect.  This should help operators use
-        # DNS trickery if they want.
-        if addr_info is not None:
-            # addr_info is a list of 5-tuples with the following structure:
-            #     (family, socktype, proto, canonname, sockaddr)
-            # where sockaddr is the only thing of interest to us, and we only
-            # use the first result.  We want to use the originally supplied
-            # host (see note above) and the remainder of the variable-length
-            # sockaddr: IPv4 has (address, port) while IPv6 has (address,
-            # port, flow info, scope id).
-            sockaddr = addr_info[0][-1]
-            self._target = (host,) + (sockaddr[1:])
-        else:
-            self._target = (host, port)
+            # NOTE: we use the original host value, not the DNS-resolved one
+            # because if host is a hostname, we don't want to cache the DNS
+            # resolution for the entire lifetime of this process.  Let standard
+            # name resolution caching take effect.  This should help operators
+            # use DNS trickery if they want.
+            if addr_info is not None:
+                # addr_info is a list of 5-tuples with the following structure:
+                #     (family, socktype, proto, canonname, sockaddr)
+                # where sockaddr is the only thing of interest to us, and we
+                # only use the first result.  We want to use the originally
+                # supplied host (see note above) and the remainder of the
+                # variable-length sockaddr: IPv4 has (address, port) while
+                # IPv6 has (address, port, flow info, scope id).
+                sockaddr = addr_info[0][-1]
+                self._target = (host,) + (sockaddr[1:])
+            else:
+                self._target = (host, port)
 
     def set_prefix(self, new_prefix):
         if new_prefix and self._base_prefix:
@@ -1585,6 +1594,9 @@ class StatsdClient(object):
             self._prefix = ''
 
     def _send(self, m_name, m_value, m_type, sample_rate):
+        if not self._host:
+            # just generating local stats
+            return
         if sample_rate is None:
             sample_rate = self._default_sample_rate
         sample_rate = sample_rate * self._sample_rate_factor
@@ -1610,7 +1622,38 @@ class StatsdClient(object):
     def _open_socket(self):
         return socket.socket(self._sock_family, socket.SOCK_DGRAM)
 
+    def _generate_report(self):
+        all_keys = set(chain.from_iterable(map(lambda x: x.keys(), self.stats)))
+        all_keys = list(all_keys)
+        report = {1: self.stats[-1]}
+        for num in 5, 15:
+            sub_report = dict([(k, 0) for k in all_keys])
+            for item in self.stats[0 - num:]:
+                for k in all_keys:
+                    sub_report[k] += item[k]
+            report[num] = sub_report
+
+        return report
+
+    def _update_stats(self, m_name, m_value, m_type='c'):
+        now = time.time()
+        stats_file = os.path.join(self._recon_cache,
+                                  "%s.stats" % self._tail_prefix)
+        m_name = "%s|%s" % (m_name, m_type)
+        if now - self._last_report >= 60:
+            report = self._generate_report()
+            report['time'] = now
+            dump_recon_cache(report, stats_file, self.logger, replace=True)
+            self._last_report = now
+            self.stats.append(defaultdict(int))
+            if len(self.stats) > 15:
+                self.stats.pop(0)
+
+        self.stats[-1][m_name] += m_value
+
     def update_stats(self, m_name, m_value, sample_rate=None):
+        if self._log_stats:
+            self._update_stats(m_name, m_value)
         return self._send(m_name, m_value, 'c', sample_rate)
 
     def increment(self, metric, sample_rate=None):
@@ -1620,6 +1663,8 @@ class StatsdClient(object):
         return self.update_stats(metric, -1, sample_rate)
 
     def timing(self, metric, timing_ms, sample_rate=None):
+        if self._log_stats:
+            self._update_stats(metric, timing_ms, 'ms')
         return self._send(metric, timing_ms, 'ms', sample_rate)
 
     def timing_since(self, metric, orig_time, sample_rate=None):
@@ -1871,6 +1916,7 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
         log_statsd_default_sample_rate = 1.0
         log_statsd_sample_rate_factor = 1.0
         log_statsd_metric_prefix = (empty-string)
+        log_stats = (disabled)
 
     :param conf: Configuration dict to read settings from
     :param name: Name of the logger
@@ -1939,7 +1985,9 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
 
     # Setup logger with a StatsD client if so configured
     statsd_host = conf.get('log_statsd_host')
-    if statsd_host:
+    log_stats = config_true_value(conf.get('log_stats', 'no'))
+    recon_cache_path = conf.get('recon_cache_path', '/var/cache/swift')
+    if statsd_host or log_stats:
         statsd_port = int(conf.get('log_statsd_port', 8125))
         base_prefix = conf.get('log_statsd_metric_prefix', '')
         default_sample_rate = float(conf.get(
@@ -1948,7 +1996,9 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
             'log_statsd_sample_rate_factor', 1))
         statsd_client = StatsdClient(statsd_host, statsd_port, base_prefix,
                                      name, default_sample_rate,
-                                     sample_rate_factor, logger=logger)
+                                     sample_rate_factor, logger=logger,
+                                     recon_cache=recon_cache_path,
+                                     log_stats=log_stats)
         logger.statsd_client = statsd_client
     else:
         logger.statsd_client = None
@@ -3192,7 +3242,7 @@ def put_recon_cache_entry(cache_entry, key, item):
 
 
 def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2,
-                     set_owner=None):
+                     set_owner=None, replace=False):
     """Update recon cache values
 
     :param cache_dict: Dictionary of cache key/value pairs to write out
@@ -3200,19 +3250,23 @@ def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2,
     :param logger: the logger to use to log an encountered error
     :param lock_timeout: timeout (in seconds)
     :param set_owner: Set owner of recon cache file
+    :param replace: Just replace the existing cache_file with the new dict
     """
     try:
         with lock_file(cache_file, lock_timeout, unlink=False) as cf:
             cache_entry = {}
-            try:
-                existing_entry = cf.readline()
-                if existing_entry:
-                    cache_entry = json.loads(existing_entry)
-            except ValueError:
-                # file doesn't have a valid entry, we'll recreate it
-                pass
-            for cache_key, cache_value in cache_dict.items():
-                put_recon_cache_entry(cache_entry, cache_key, cache_value)
+            if replace:
+                cache_entry = cache_dict
+            else:
+                try:
+                    existing_entry = cf.readline()
+                    if existing_entry:
+                        cache_entry = json.loads(existing_entry)
+                except ValueError:
+                    # file doesn't have a valid entry, we'll recreate it
+                    pass
+                for cache_key, cache_value in cache_dict.items():
+                    put_recon_cache_entry(cache_entry, cache_key, cache_value)
             tf = None
             try:
                 with NamedTemporaryFile(dir=os.path.dirname(cache_file),
