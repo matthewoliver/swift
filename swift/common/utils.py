@@ -1622,16 +1622,40 @@ class StatsdClient(object):
     def _open_socket(self):
         return socket.socket(self._sock_family, socket.SOCK_DGRAM)
 
+    def _process_timing(self, stat_dict):
+        stat_dict = dict(stat_dict)
+        for key, value in stat_dict.items():
+            if not isinstance(value, list):
+                continue
+            metric, m_type = key.split('|')
+            sum_key = "%s.sum|%s" % (metric, m_type)
+            stat_dict[sum_key] = sum(value)
+            stat_dict["%s.mean|%s" % (metric, m_type)] = \
+                stat_dict[sum_key] / float(len(value))
+            if metric.endswith('timing'):
+                metric = metric[:-6] + 'count'
+            else:
+                metric += '.count'
+            stat_dict["%s|%s" % (metric, 'c')] = len(value)
+            stat_dict.pop(key)
+        return stat_dict
+
     def _generate_report(self):
         all_keys = set(chain.from_iterable(map(lambda x: x.keys(), self.stats)))
         all_keys = list(all_keys)
-        report = {1: self.stats[-1]}
+        report = {1: self._process_timing(self.stats[-1])}
         for num in 5, 15:
             sub_report = dict([(k, 0) for k in all_keys])
             for item in self.stats[0 - num:]:
                 for k in all_keys:
-                    sub_report[k] += item[k]
-            report[num] = sub_report
+                    try:
+                        if isinstance(item[k], list) and sub_report[k] == 0:
+                            sub_report[k] = list(item[k])
+                        else:
+                            sub_report[k] += item[k]
+                    except ValueError:
+                        continue
+            report[num] = self._process_timing(sub_report)
 
         return report
 
@@ -1649,7 +1673,13 @@ class StatsdClient(object):
             if len(self.stats) > 15:
                 self.stats.pop(0)
 
-        self.stats[-1][m_name] += m_value
+        if m_type == 'ms':
+            if self.stats[-1].get(m_name):
+                self.stats[-1][m_name].append(m_value)
+            else:
+                self.stats[-1][m_name] = [m_value]
+        else:
+            self.stats[-1][m_name] += m_value
 
     def update_stats(self, m_name, m_value, sample_rate=None):
         if self._log_stats:

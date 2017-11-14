@@ -75,6 +75,8 @@ class SwiftStats(object):
                     # don't report stale data.
                     continue
                 for key in sorted(data['1'].keys()):
+                    if isinstance(data['1'][key], list):
+                        continue
                     self._print_line(indent + 2, key, data['1'][key],
                                      data['5'][key], data['15'][key])
             except ValueError:
@@ -112,8 +114,6 @@ class SwiftStats(object):
         """
         usage = '''
         usage: %prog [<config> | <path/to/recon_cache>]
-        [-v] [--suppress] [-a] [-r] [-u] [-d]
-        [-l] [-T] [--md5] [--auditor] [--updater] [--expirer] [--sockstat]
         [--human-readable]
 
 
