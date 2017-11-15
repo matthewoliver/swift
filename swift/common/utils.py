@@ -1532,7 +1532,8 @@ class LoggerFileObject(object):
 class StatsdClient(object):
     def __init__(self, host, port, base_prefix='', tail_prefix='',
                  default_sample_rate=1, sample_rate_factor=1, logger=None,
-                 recon_cache='/var/cache/swift', log_stats=False):
+                 recon_cache='/var/cache/swift', log_stats=False,
+                 delay_logging=True):
         self._host = host
         self._port = port
         self._base_prefix = base_prefix
@@ -1546,6 +1547,7 @@ class StatsdClient(object):
         self._last_report = time.time()
         self._recon_cache = recon_cache
         self._log_stats = log_stats
+        self._delay_logging = delay_logging
 
         if host:
             # Determine if host is IPv4 or IPv6
@@ -1645,12 +1647,13 @@ class StatsdClient(object):
         all_keys = list(all_keys)
         report = {1: self._process_timing(self.stats[-1])}
         for num in 5, 15:
-            sub_report = dict([(k, 0) for k in all_keys])
+            sub_report = dict([(k, []) if k.endswith('|ms') else (k, 0)
+                               for k in all_keys])
             for item in self.stats[0 - num:]:
                 for k in all_keys:
                     try:
-                        if isinstance(item[k], list) and sub_report[k] == 0:
-                            sub_report[k] = list(item[k])
+                        if isinstance(sub_report[k], list) and not item.get(k):
+                            continue
                         else:
                             sub_report[k] += item[k]
                     except ValueError:
@@ -1664,12 +1667,14 @@ class StatsdClient(object):
         stats_file = os.path.join(self._recon_cache,
                                   "%s.stats" % self._tail_prefix)
         m_name = "%s|%s" % (m_name, m_type)
-        if now - self._last_report >= 60:
+        time_elapsed = now - self._last_report >= 60
+        if time_elapsed or not self._delay_logging:
             report = self._generate_report()
             report['time'] = now
             dump_recon_cache(report, stats_file, self.logger, replace=True)
-            self._last_report = now
-            self.stats.append(defaultdict(int))
+            if time_elapsed:
+                self._last_report = now
+                self.stats.append(defaultdict(int))
             if len(self.stats) > 15:
                 self.stats.pop(0)
 
@@ -1947,6 +1952,7 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
         log_statsd_sample_rate_factor = 1.0
         log_statsd_metric_prefix = (empty-string)
         log_stats = (disabled)
+        log_stats_delay = true
 
     :param conf: Configuration dict to read settings from
     :param name: Name of the logger
@@ -2016,6 +2022,7 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
     # Setup logger with a StatsD client if so configured
     statsd_host = conf.get('log_statsd_host')
     log_stats = config_true_value(conf.get('log_stats', 'no'))
+    delay_logging = config_true_value(conf.get('log_stats_delay', 'yes'))
     recon_cache_path = conf.get('recon_cache_path', '/var/cache/swift')
     if statsd_host or log_stats:
         statsd_port = int(conf.get('log_statsd_port', 8125))
@@ -2028,7 +2035,8 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
                                      name, default_sample_rate,
                                      sample_rate_factor, logger=logger,
                                      recon_cache=recon_cache_path,
-                                     log_stats=log_stats)
+                                     log_stats=log_stats,
+                                     delay_logging=delay_logging)
         logger.statsd_client = statsd_client
     else:
         logger.statsd_client = None
