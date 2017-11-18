@@ -425,7 +425,8 @@ def run_server(conf, logger, sock, global_conf=None):
             log_name = logger.server
         else:
             log_name = logger.name
-        global_conf = {'log_name': log_name}
+        global_conf = {'log_name': log_name,
+                       'worker_index': conf.get('worker_index', '0')}
     app = loadapp(conf['__file__'], global_conf=global_conf)
     max_clients = int(conf.get('max_clients', '1024'))
     pool = RestrictedGreenPool(size=max_clients)
@@ -510,7 +511,7 @@ class WorkersStrategy(object):
         """
 
         while len(self.children) < self.worker_count:
-            yield self.sock, None
+            yield self.sock, len(self.children)
 
     def post_fork_hook(self):
         """
@@ -937,7 +938,9 @@ def run_wsgi(conf_path, app_section, *args, **kwargs):
                 signal.signal(signal.SIGHUP, signal.SIG_DFL)
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 strategy.post_fork_hook()
-                run_server(conf, logger, sock)
+                worker_conf = conf.copy()
+                worker_conf['worker_index'] = str(sock_info + 1)
+                run_server(worker_conf, logger, sock)
                 strategy.log_sock_exit(sock, sock_info)
                 return 0
             else:
@@ -995,14 +998,21 @@ def _initrp(conf_path, app_section, *args, **kwargs):
 
     validate_configuration()
 
+    conf['worker_index'] = '0'
     # pre-configure logger
     log_name = conf.get('log_name', app_section)
     if 'logger' in kwargs:
         logger = kwargs.pop('logger')
     else:
-        logger = get_logger(conf, log_name,
-                            log_to_console=kwargs.pop('verbose', False),
-                            log_route='wsgi')
+        # we never want this logger to run a stats thread
+        try:
+            orig_log_stats = conf.get('log_stats')
+            conf['log_stats'] = 'no'
+            logger = get_logger(conf, log_name,
+                                log_to_console=kwargs.pop('verbose', False),
+                                log_route='wsgi')
+        finally:
+            conf['log_stats'] = orig_log_stats
 
     # disable fallocate if desired
     if config_true_value(conf.get('disable_fallocate', 'no')):

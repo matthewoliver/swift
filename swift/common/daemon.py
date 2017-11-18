@@ -155,6 +155,9 @@ class DaemonStrategy(object):
             signal.signal(signal.SIGHUP, signal.SIG_DFL)
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
+            self.daemon.logger.set_worker_index = \
+                str(kwargs.get('worker_index', 0))
+
             self.daemon.run(once, **kwargs)
 
             self.logger.debug('Forked worker %s finished', os.getpid())
@@ -213,7 +216,9 @@ class DaemonStrategy(object):
         self.ask_daemon_to_prepare_workers(once, **kwargs)
         if not self.unspawned_worker_options:
             return self._run_inline(once, **kwargs)
-        for per_worker_options in self.iter_unspawned_workers():
+        for worker_index, per_worker_options in \
+                enumerate(self.iter_unspawned_workers()):
+            per_worker_options['worker_index'] = worker_index
             if self._fork(once, **per_worker_options) == 0:
                 return 0
         while self.running:
@@ -276,9 +281,15 @@ def run_daemon(klass, conf_file, section_name='', once=False, **kwargs):
     if 'logger' in kwargs:
         logger = kwargs.pop('logger')
     else:
-        logger = utils.get_logger(conf, conf.get('log_name', section_name),
-                                  log_to_console=kwargs.pop('verbose', False),
-                                  log_route=section_name)
+        # we never want this logger to run a stats thread
+        try:
+            orig_log_stats = conf.get('log_stats')
+            conf['log_stats'] = 'no'
+            logger = utils.get_logger(conf, conf.get('log_name', section_name),
+                                      log_to_console=kwargs.pop('verbose', False),
+                                      log_route=section_name)
+        finally:
+            conf['log_stats'] = orig_log_stats
 
     # optional nice/ionice priority scheduling
     utils.modify_priority(conf, logger)

@@ -62,27 +62,52 @@ class SwiftStats(object):
             print(table_str % tuple(params))
 
     def display_report(self, recon_dir, files_iter):
+        def isfloat(s):
+            try:
+                float(s)
+                return True
+            except ValueError:
+                return False
+
         indent = 2
         now = time.time()
-        self._print_line(indent, '-' * 52, '-' * 20, '-' * 20, '-' * 20)
-        self._print_line(indent + 2, "METRIC", "1 min", "5 min", "15 min")
-        self._print_line(indent, '-' * 52, '-' * 20, '-' * 20, '-' * 20)
+        old_periods = []
         for statfile in files_iter:
-            self._print_line(indent, statfile[:0 - len('.stats')])
             try:
                 data = json.load(open(os.path.join(recon_dir, statfile)))
-                if now - (60 * 15) > data['time']:
+                periods = sorted([k for k in data.keys() if isfloat(k)],
+                                 key=float)
+                all_keys = set(chain.from_iterable(map(
+                    lambda x: x.keys(), [data[p] for p in periods])))
+                all_keys = list(all_keys)
+                if old_periods != periods:
+                    dashes = [indent, '-' * 52]
+                    dashes.extend(['-' * 20 for _ in range(len(periods))])
+                    heading = [indent + 2, "METRIC"]
+                    heading.extend(["%s %s" % seconds2timeunit(float(p))
+                                    for p in periods])
+                    self._print_line(*dashes)
+                    self._print_line(*heading)
+                    self._print_line(*dashes)
+                    old_periods = periods
+                self._print_line(indent, statfile[:0 - len('.stats')])
+                if now - float(periods[0]) > data['time']:
                     # don't report stale data.
                     continue
-                for key in sorted(data['1'].keys()):
-                    if isinstance(data['1'][key], list):
+                for key in sorted(all_keys):
+                    if any(map(self.isinstance_list,
+                               [data[p].get(key) for p in periods])):
                         continue
-                    self._print_line(indent + 2, key, data['1'][key],
-                                     data['5'][key], data['15'][key])
+                    line = [indent + 2, key]
+                    line.extend([data[p].get(key, 0) for p in periods])
+                    self._print_line(*line)
             except ValueError:
                 continue
             finally:
                 print('')
+
+    def isinstance_list(self, item):
+        return isinstance(item, list)
 
     def parse_recon_dir(self, recon_dir):
         account_stats = []

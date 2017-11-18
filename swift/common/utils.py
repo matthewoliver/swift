@@ -73,6 +73,8 @@ from six.moves.urllib.parse import ParseResult
 from six.moves.urllib.parse import quote as _quote
 from six.moves.urllib.parse import urlparse as stdlib_urlparse
 
+from threading import Timer
+
 from swift import gettext_ as _
 import swift.common.exceptions
 from swift.common.http import is_success, is_redirection, HTTP_NOT_FOUND, \
@@ -111,6 +113,8 @@ FALLOCATE_IS_PERCENT = False
 
 # from /usr/src/linux-headers-*/include/uapi/linux/resource.h
 PRIO_PROCESS = 0
+
+STATSDCLIENT_SINGLETON = None
 
 
 # /usr/include/x86_64-linux-gnu/asm/unistd_64.h defines syscalls there
@@ -1533,7 +1537,7 @@ class StatsdClient(object):
     def __init__(self, host, port, base_prefix='', tail_prefix='',
                  default_sample_rate=1, sample_rate_factor=1, logger=None,
                  recon_cache='/var/cache/swift', log_stats=False,
-                 delay_logging=True):
+                 stat_periods=None, worker_index=0):
         self._host = host
         self._port = port
         self._base_prefix = base_prefix
@@ -1547,7 +1551,17 @@ class StatsdClient(object):
         self._last_report = time.time()
         self._recon_cache = recon_cache
         self._log_stats = log_stats
-        self._delay_logging = delay_logging
+        self._stat_periods = sorted(stat_periods) \
+            if stat_periods else [60, 300, 900]
+        self._stat_interval = self._stat_periods[0]
+        mod = self._stat_periods[-1] % self._stat_interval
+        if mod != 0:
+            # adjust the upper period to fit.
+            self._stat_periods[-1] += (self._stat_interval - mod)
+        self._stats_max = self._stat_periods[-1] / self._stat_interval
+
+        self._worker_index = worker_index
+        self._start_stats_timer()
 
         if host:
             # Determine if host is IPv4 or IPv6
@@ -1584,6 +1598,15 @@ class StatsdClient(object):
                 self._target = (host,) + (sockaddr[1:])
             else:
                 self._target = (host, port)
+
+    def _start_stats_timer(self):
+        if self._log_stats:
+            #if self.timer:
+            #    self.timer.cancel()
+            #self.timer = Timer(self._stat_interval, self._generate_report)
+            #self.timer.daemon = False
+            self.timer = eventlet.spawn(self._generate_report)
+            sleep(0)
 
     def set_prefix(self, new_prefix):
         if new_prefix and self._base_prefix:
@@ -1629,6 +1652,8 @@ class StatsdClient(object):
         for key, value in stat_dict.items():
             if not isinstance(value, list):
                 continue
+            if not value:
+                continue
             metric, m_type = key.split('|')
             sum_key = "%s.sum|%s" % (metric, m_type)
             stat_dict[sum_key] = sum(value)
@@ -1643,41 +1668,41 @@ class StatsdClient(object):
         return stat_dict
 
     def _generate_report(self):
-        all_keys = set(chain.from_iterable(map(lambda x: x.keys(), self.stats)))
-        all_keys = list(all_keys)
-        report = {1: self._process_timing(self.stats[-1])}
-        for num in 5, 15:
-            sub_report = dict([(k, []) if k.endswith('|ms') else (k, 0)
-                               for k in all_keys])
-            for item in self.stats[0 - num:]:
-                for k in all_keys:
-                    try:
-                        if isinstance(sub_report[k], list) and not item.get(k):
+        while self._log_stats:
+            sleep(self._stat_interval)
+            now = time.time()
+            stats_file = "%s:%s.stats" % (self._tail_prefix, self._worker_index)
+            stats_file = os.path.join(self._recon_cache, stats_file)
+
+            all_keys = set(chain.from_iterable(map(lambda x: x.keys(), self.stats)))
+            all_keys = list(all_keys)
+            report = {}
+            for num in self._stat_periods:
+                index = int(num / self._stat_interval)
+                sub_report = dict([(k, []) if k.endswith('|ms') else (k, 0)
+                                   for k in all_keys])
+                for item in self.stats[0 - index:]:
+                    for k in all_keys:
+                        try:
+                            if isinstance(sub_report[k], list) and not item.get(k):
+                                continue
+                            else:
+                                sub_report[k] += item[k]
+                        except ValueError:
                             continue
-                        else:
-                            sub_report[k] += item[k]
-                    except ValueError:
-                        continue
-            report[num] = self._process_timing(sub_report)
+                report[num] = self._process_timing(sub_report)
 
-        return report
-
-    def _update_stats(self, m_name, m_value, m_type='c'):
-        now = time.time()
-        stats_file = os.path.join(self._recon_cache,
-                                  "%s.stats" % self._tail_prefix)
-        m_name = "%s|%s" % (m_name, m_type)
-        time_elapsed = now - self._last_report >= 60
-        if time_elapsed or not self._delay_logging:
-            report = self._generate_report()
             report['time'] = now
             dump_recon_cache(report, stats_file, self.logger, replace=True)
-            if time_elapsed:
-                self._last_report = now
-                self.stats.append(defaultdict(int))
-            if len(self.stats) > 15:
+            self.stats.append(defaultdict(int))
+            if len(self.stats) > self._stats_max:
                 self.stats.pop(0)
 
+            #if self._log_stats:
+            #    self._start_stats_timer()
+
+    def _update_stats(self, m_name, m_value, m_type='c'):
+        m_name = "%s|%s" % (m_name, m_type)
         if m_type == 'ms':
             if self.stats[-1].get(m_name):
                 self.stats[-1][m_name].append(m_value)
@@ -1685,6 +1710,7 @@ class StatsdClient(object):
                 self.stats[-1][m_name] = [m_value]
         else:
             self.stats[-1][m_name] += m_value
+        sleep(0)
 
     def update_stats(self, m_name, m_value, sample_rate=None):
         if self._log_stats:
@@ -1855,6 +1881,10 @@ class LogAdapter(logging.LoggerAdapter, object):
         if self.logger.statsd_client:
             self.logger.statsd_client.set_prefix(prefix)
 
+    def set_worker_index(self, index):
+        if self.logger.statsd_client:
+            self.logger.statsd_client._worker_index = index
+
     def statsd_delegate(statsd_func_name):
         """
         Factory to create methods which delegate to methods on
@@ -1952,7 +1982,7 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
         log_statsd_sample_rate_factor = 1.0
         log_statsd_metric_prefix = (empty-string)
         log_stats = (disabled)
-        log_stats_delay = true
+        log_stats_values = 60,300,900
 
     :param conf: Configuration dict to read settings from
     :param name: Name of the logger
@@ -2022,7 +2052,12 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
     # Setup logger with a StatsD client if so configured
     statsd_host = conf.get('log_statsd_host')
     log_stats = config_true_value(conf.get('log_stats', 'no'))
-    delay_logging = config_true_value(conf.get('log_stats_delay', 'yes'))
+    worker_index = conf.get('worker_index', 0)
+    stat_periods = list_from_csv(conf.get('log_stats_values'))
+    try:
+        stat_periods = map(float, stat_periods)
+    except ValueError:
+        stat_periods = None
     recon_cache_path = conf.get('recon_cache_path', '/var/cache/swift')
     if statsd_host or log_stats:
         statsd_port = int(conf.get('log_statsd_port', 8125))
@@ -2031,13 +2066,17 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
             'log_statsd_default_sample_rate', 1))
         sample_rate_factor = float(conf.get(
             'log_statsd_sample_rate_factor', 1))
-        statsd_client = StatsdClient(statsd_host, statsd_port, base_prefix,
-                                     name, default_sample_rate,
-                                     sample_rate_factor, logger=logger,
-                                     recon_cache=recon_cache_path,
-                                     log_stats=log_stats,
-                                     delay_logging=delay_logging)
-        logger.statsd_client = statsd_client
+        global STATSDCLIENT_SINGLETON
+        if STATSDCLIENT_SINGLETON is None:
+            statsd_client = StatsdClient(statsd_host, statsd_port, base_prefix,
+                                         name, default_sample_rate,
+                                         sample_rate_factor, logger=logger,
+                                         recon_cache=recon_cache_path,
+                                         log_stats=log_stats,
+                                         stat_periods=stat_periods,
+                                         worker_index=worker_index)
+            STATSDCLIENT_SINGLETON = statsd_client
+        logger.statsd_client = STATSDCLIENT_SINGLETON
     else:
         logger.statsd_client = None
 
