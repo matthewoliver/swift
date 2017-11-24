@@ -153,6 +153,7 @@ class SwiftRecon(object):
 
     def __init__(self):
         self.verbose = False
+        self.list_all = False
         self.suppress_errors = False
         self.timeout = 5
         self.pool_size = 30
@@ -185,6 +186,12 @@ class SwiftRecon(object):
               '%(average).1f, total: %(total)d, '
               'Failed: %(perc_none).1f%%, no_result: %(number_none)d, '
               'reported: %(reported)d' % stats)
+
+    def _print_list_stats(self, format, stats, footer=None):
+        for stat in stats:
+            print(format % stat)
+        if footer:
+            self._print_stats(footer)
 
     def _ptime(self, timev=None):
         """
@@ -241,13 +248,17 @@ class SwiftRecon(object):
         recon = Scout("ringmd5", self.verbose, self.suppress_errors,
                       self.timeout)
         print("[%s] Checking ring md5sums" % self._ptime())
-        if self.verbose:
+        if self.verbose or self.list_all:
             for ring_file, ring_sum in rings.items():
                 print("-> On disk %s md5sum: %s" % (ring_file, ring_sum))
         for url, response, status, ts_start, ts_end in self.pool.imap(
                 recon.scout, hosts):
+            netloc = urlparse(url).netloc
             if status != 200:
                 errors = errors + 1
+                if self.list_all:
+                    print("!! %s bad response %d" %
+                          (urlparse(url).netloc, status))
                 continue
             success = True
             for remote_ring_file, remote_ring_sum in response.items():
@@ -258,13 +269,13 @@ class SwiftRecon(object):
                 if remote_ring_sum != ring_sum:
                     success = False
                     print("!! %s (%s => %s) doesn't match on disk md5sum" % (
-                        url, remote_ring_name, remote_ring_sum))
+                        netloc, remote_ring_name, remote_ring_sum))
             if not success:
                 errors += 1
                 continue
             matches += 1
-            if self.verbose:
-                print("-> %s matches." % url)
+            if self.verbose or self.list_all:
+                print("-> %s matches." % netloc)
         print("%s/%s hosts matched, %s error[s] while checking hosts." % (
             matches, len(hosts), errors))
         print("=" * 79)
@@ -283,18 +294,19 @@ class SwiftRecon(object):
         recon = Scout("swiftconfmd5", self.verbose, self.suppress_errors,
                       self.timeout)
         printfn("[%s] Checking swift.conf md5sum" % self._ptime())
-        if self.verbose:
+        if self.verbose or self.list_all:
             printfn("-> On disk swift.conf md5sum: %s" % (conf_sum,))
         for url, response, status, ts_start, ts_end in self.pool.imap(
                 recon.scout, hosts):
+            netloc = urlparse(url).netloc
             if status == 200:
                 if response[SWIFT_CONF_FILE] != conf_sum:
                     printfn("!! %s (%s) doesn't match on disk md5sum" %
-                            (url, response[SWIFT_CONF_FILE]))
+                            (netloc, response[SWIFT_CONF_FILE]))
                 else:
                     matches = matches + 1
-                    if self.verbose:
-                        printfn("-> %s matches." % url)
+                    if self.verbose or self.list_all:
+                        printfn("-> %s matches." % netloc)
             else:
                 errors = errors + 1
         printfn("%s/%s hosts matched, %s error[s] while checking hosts."
@@ -316,9 +328,20 @@ class SwiftRecon(object):
                 recon.scout, hosts):
             if status == 200:
                 scan[url] = response['async_pending']
-        stats = self._gen_stats(scan.values(), 'async_pending')
-        if stats['reported'] > 0:
+            elif self.list_all:
+                scan[url] = '!'
+        stats = self._gen_stats([v for v in scan.values() if v != '!'],
+                                'async_pending')
+        if stats['reported'] > 0 and not self.list_all:
             self._print_stats(stats)
+        elif self.list_all and scan:
+            format = "%(url)s %(async_pending)s"
+            list_stats = [{'url': urlparse(u).netloc,
+                           'async_pending': str(v or '-')}
+                          for u, v in scan.items()]
+            footer = stats if stats['reported'] > 0 else None
+            self._print_list_stats(format, list_stats, footer)
+
         else:
             print("[async_pending] - No hosts returned valid data.")
         print("=" * 79)
@@ -338,9 +361,18 @@ class SwiftRecon(object):
                 recon.scout, hosts):
             if status == 200:
                 scan[url] = response['drive_audit_errors']
+            elif self.list_all:
+                scan[url] = '!'
         stats = self._gen_stats(scan.values(), 'drive_audit_errors')
         if stats['reported'] > 0:
             self._print_stats(stats)
+        elif self.list_all and scan:
+            format = "%(url)s %(drive_audit_errors)s"
+            list_stats = [{'url': urlparse(u).netloc,
+                           'drive_audit_errors': str(v or '-')}
+                          for u, v in scan.items()]
+            footer = stats if stats['reported'] > 0 else None
+            self._print_list_stats(format, list_stats, footer)
         else:
             print("[drive_audit_errors] - No hosts returned valid data.")
         print("=" * 79)
@@ -947,6 +979,8 @@ class SwiftRecon(object):
         args = optparse.OptionParser(usage)
         args.add_option('--verbose', '-v', action="store_true",
                         help="Print verbose info")
+        args.add_option('--list', '-L', action="store_true",
+                        help="List all results")
         args.add_option('--suppress', action="store_true",
                         help="Suppress most connection related errors")
         args.add_option('--async', '-a', action="store_true",
@@ -1025,6 +1059,7 @@ class SwiftRecon(object):
             reload_storage_policies()
 
         self.verbose = options.verbose
+        self.list_all = options.list
         self.suppress_errors = options.suppress
         self.timeout = options.timeout
 
