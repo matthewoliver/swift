@@ -340,6 +340,30 @@ class SwiftAuth(unittest.TestCase):
         self.assertEqual(headers_sent['X-Account-Sysmeta-Project-Domain-Id'],
                          UNKNOWN_ID)
 
+    def test_use_dynamic_reseller(self):
+        reseller_prefix = self.test_auth.reseller_prefixes[0]
+        headers = get_identity_headers()
+        self.test_auth.use_dynamic_reseller = True
+
+        def test(path, expected_path):
+            req = self._make_request(path=path, headers=headers)
+            resp = req.get_response(self.test_auth)
+            self.assertEqual(resp.request.path, expected_path)
+
+        tests = [
+            {'path': '/v1/%s/c/o' % reseller_prefix,
+             'expected_path': '/v1/%s%s/c/o' % (reseller_prefix,
+                                                headers['X_TENANT_ID'])},
+            {'path': '/v1/%s/c/o' % '',
+             'expected_path': '/v1//c/o'},
+            {'path': '/v1/%s/c/o' % 'BLAH_',
+             'expected_path': '/v1/BLAH_/c/o'},
+            {'path': '/v1/%s%s/c/o' % (reseller_prefix, '291912'),
+             'expected_path': '/v1/%s%s/c/o' % (reseller_prefix, '291912')}]
+
+        for params in tests:
+            test(**params)
+
 
 class SwiftAuthMultiple(SwiftAuth):
     """Runs same tests as SwiftAuth with multiple reseller prefixes
@@ -860,6 +884,7 @@ class TestAuthorize(BaseTestAuthorize):
             pass
         the_env = self._get_identity(
             tenant_id='test', roles=['reselleradmin'])
+        the_env['PATH_INFO'] = ''
         self.test_auth(the_env, fake_start_response)
 
         subreq = Request.blank(

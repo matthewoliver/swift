@@ -16,7 +16,8 @@ from swift.common import utils as swift_utils
 from swift.common.http import is_success
 from swift.common.middleware import acl as swift_acl
 from swift.common.request_helpers import get_sys_meta_prefix
-from swift.common.swob import HTTPNotFound, HTTPForbidden, HTTPUnauthorized
+from swift.common.swob import HTTPNotFound, HTTPForbidden, HTTPUnauthorized, \
+    Request
 from swift.common.utils import config_read_reseller_options, list_from_csv
 from swift.proxy.controllers.base import get_account_info
 import functools
@@ -167,6 +168,26 @@ class KeystoneAuth(object):
 
         allow_overrides = false
 
+    By default we assume the incoming request will point to a complete
+    account, meaning the object storage endpoint in keystone will end with
+    something like::
+
+        '<uri>/v1/AUTH_%(tenant_id)s'
+
+    If you enable ``use_dynamic_reseller`` then the keystoneauth middleware
+    will pull the tenant_id from keystone import environment. Allowing an
+    endpoint of the form::
+
+        '<uri>/v1/AUTH_/'
+
+    This shortcut makes configuration easier, but can only be reliably used
+    when on your own account and providing a token. API elements like tempurl
+    and public containers need the full account in the path.
+    To enable this dynamic reseller account completion you need to enable
+    ``use_dynamic_reseller`` which is by default ``false``::
+
+        use_dynamic_reseller = true
+
     :param app: The next WSGI app in the pipeline
     :param conf: The dict of configuration values
     """
@@ -192,9 +213,14 @@ class KeystoneAuth(object):
         self.default_domain_id = conf.get('default_domain_id', 'default')
         self.allow_names_in_acls = swift_utils.config_true_value(
             conf.get('allow_names_in_acls', 'true'))
+        self.use_dynamic_reseller = swift_utils.config_true_value(
+            conf.get('use_dynamic_reseller', 'false'))
 
     def __call__(self, environ, start_response):
         env_identity = self._keystone_identity(environ)
+
+        if self.use_dynamic_reseller:
+            self._set_dynamic_name(environ, env_identity)
 
         # Check if one of the middleware like tempurl or formpost have
         # set the swift.authorize_override environ and want to control the
@@ -265,6 +291,22 @@ class KeystoneAuth(object):
         identity['project_domain'] = project_domain
         identity['auth_version'] = auth_version
         return identity
+
+    def _set_dynamic_name(self, environ, env_identity):
+        try:
+            part = Request(environ).split_path(2, 4, True)
+            version, account, container, obj = part
+        except ValueError:
+            return
+
+        if account and account in self.reseller_prefixes:
+            path = "/%s/%s%s" % (version, account,
+                                 env_identity['tenant'][0])
+            if container:
+                path = "%s/%s" % (path, container)
+            if obj:
+                path = '%s/%s' % (path, obj)
+            environ['PATH_INFO'] = path
 
     def _get_account_name(self, prefix, tenant_id):
         return '%s%s' % (prefix, tenant_id)
