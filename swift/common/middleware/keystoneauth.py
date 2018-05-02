@@ -18,7 +18,8 @@ from swift.common.middleware import acl as swift_acl
 from swift.common.request_helpers import get_sys_meta_prefix
 from swift.common.swob import HTTPNotFound, HTTPForbidden, HTTPUnauthorized, \
     Request
-from swift.common.utils import config_read_reseller_options, list_from_csv
+from swift.common.utils import config_read_reseller_options, list_from_csv, \
+    split_path
 from swift.proxy.controllers.base import get_account_info
 import functools
 
@@ -250,33 +251,64 @@ class KeystoneAuth(object):
             self.logger.debug(msg)
             return self.app(environ, start_response)
 
-        if env_identity:
-            self.logger.debug('Using identity: %r', env_identity)
-            environ['REMOTE_USER'] = env_identity.get('tenant')
-            environ['keystone.identity'] = env_identity
-            environ['swift.authorize'] = functools.partial(
-                self.authorize, env_identity)
-            user_roles = (r.lower() for r in env_identity.get('roles', []))
-            if self.reseller_admin_role in user_roles:
-                environ['reseller_request'] = True
+        try:
+            part = split_path(environ['PATH_INFO'], 1, 4, True)
+            version, account, container, obj = part
+        except ValueError:
+                return HTTPNotFound()
+
+        is_reseller = self._get_account_prefix(account) is not None
+        # if we don't yet have anything in swift.authorize, let the first
+        # auth middleware place something so it can at least give an unauth
+        # response. A later auth will copy over so is all good.
+        if is_reseller or environ.get('swift.authorize') is None:
+            if env_identity:
+                self.logger.debug('Using identity: %r', env_identity)
+                environ['REMOTE_USER'] = env_identity.get('tenant')
+                environ['keystone.identity'] = env_identity
+                environ['swift.authorize'] = functools.partial(
+                    self.authorize, env_identity)
+                user_roles = (r.lower() for r in env_identity.get('roles', []))
+                if self.reseller_admin_role in user_roles:
+                    environ['reseller_request'] = True
+            else:
+                self.logger.debug('Authorizing as anonymous')
+                environ['swift.authorize'] = self.authorize_anonymous
+
+            environ['swift.clean_acl'] = swift_acl.clean_acl
+
+            def keystone_start_response(status, response_headers,
+                                        exc_info=None):
+                project_domain_id = None
+                for key, val in response_headers:
+                    if key.lower() == PROJECT_DOMAIN_ID_SYSMETA_HEADER:
+                        project_domain_id = val
+                        break
+                if project_domain_id:
+                    response_headers.append((PROJECT_DOMAIN_ID_HEADER,
+                                            project_domain_id))
+                return start_response(status, response_headers, exc_info)
+
+            if is_reseller:
+                # mark auth override true incase there are any other
+                # auths in the pipeline.
+                environ['swift.authorize_override'] = True
+            return self.app(environ, keystone_start_response)
         else:
-            self.logger.debug('Authorizing as anonymous')
-            environ['swift.authorize'] = self.authorize_anonymous
+            # not the reseller so continue.
+            self._clean_keystone_env(environ)
+            return self.app(environ, start_response)
 
-        environ['swift.clean_acl'] = swift_acl.clean_acl
-
-        def keystone_start_response(status, response_headers, exc_info=None):
-            project_domain_id = None
-            for key, val in response_headers:
-                if key.lower() == PROJECT_DOMAIN_ID_SYSMETA_HEADER:
-                    project_domain_id = val
-                    break
-            if project_domain_id:
-                response_headers.append((PROJECT_DOMAIN_ID_HEADER,
-                                         project_domain_id))
-            return start_response(status, response_headers, exc_info)
-
-        return self.app(environ, keystone_start_response)
+    def _clean_keystone_env(self, environ):
+        for k in ('HTTP_X_IDENTITY_STATUS', 'HTTP_X_SERVICE_IDENTITY_STATUS',
+                  'HTTP_X_ROLES', 'HTTP_X_SERVICE_ROLES', 'HTTP_X_USER_ID',
+                  'HTTP_X_USER_NAME', 'HTTP_X_PROJECT_ID', 'HTTP_X_TENANT_ID',
+                  'HTTP_X_PROJECT_NAME', 'HTTP_X_TENANT_NAME',
+                  'HTTP_X_USER_DOMAIN_ID', 'HTTP_X_USER_DOMAIN_NAME',
+                  'HTTP_X_PROJECT_DOMAIN_ID', 'HTTP_X_PROJECT_DOMAIN_NAME',
+                  'keystone.token_info'):
+            if environ.get(k):
+                del environ[k]
 
     def _keystone_identity(self, environ):
         """Extract the identity from the Keystone auth component."""
