@@ -364,6 +364,43 @@ class SwiftAuth(unittest.TestCase):
         for params in tests:
             test(**params)
 
+    def test_use_dynamic_reseller_name(self):
+        reseller_prefix = self.test_auth.reseller_prefixes[0]
+        self.test_auth.use_dynamic_reseller = True
+        self.test_auth.use_dynamic_reseller_names = True
+        headers = get_identity_headers()
+
+
+        def test(path, expected_path, env):
+            self.test_auth.logger = FakeLogger()
+            req = self._make_request(path=path, headers=headers, environ=env)
+            resp = req.get_response(self.test_auth)
+            self.assertEqual(resp.request.path, expected_path)
+            if path == expected_path:
+                errors = self.test_auth.logger.get_lines_for_level('error')
+                self.assertIn(('use_dynamic_reseller_names only available '
+                               'when using auth v3.'), errors)
+
+        # first run with auth_version 0 (ie no keystone.token_info)
+        test(path='/v1/%s/c/o' % reseller_prefix,
+             expected_path='/v1/%s/c/o' % reseller_prefix,
+             env=None)
+
+        # Next run with auth_version 2
+        environ = {'keystone.token_info': _fake_token_info(version='2')}
+        test(path='/v1/%s/c/o' % reseller_prefix,
+             expected_path='/v1/%s/c/o' % reseller_prefix,
+             env=environ)
+
+        # Next run with auth_version 3 - this should succeed
+        import pudb; pudb.set_trace()
+        environ = {'keystone.token_info': _fake_token_info(version='3')}
+        test(path='/v1/%s/c/o' % reseller_prefix,
+             expected_path='/v1/%s%s_%s/c/o' % (
+                 reseller_prefix, headers['X_PROJECT_DOMAIN_NAME'],
+                 headers['X_TENANT_NAME']),
+             env=environ)
+
 
 class SwiftAuthMultiple(SwiftAuth):
     """Runs same tests as SwiftAuth with multiple reseller prefixes

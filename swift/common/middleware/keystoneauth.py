@@ -188,6 +188,23 @@ class KeystoneAuth(object):
 
         use_dynamic_reseller = true
 
+    If your using auth version 3 and want to have an account based of the
+    name of the project, then you can enable ``use_dynamic_reseller_name``
+    in conjuction with ``use_dynamic_reseller`` to do so. The form used
+    for the account would be::
+
+        <reseller_prefix><project_domain_name>_<project_name>
+
+    Given a reseller_preix of 'AUTH_' as project_domain_name of 'Domain' and
+    a project name of 'Demo', this would generate::
+
+        AUTH_Domain_Demo
+
+    NOTE: however, that if you ever change the domain or project name then
+    users accounts will change, loosing access to their old data, and
+    a large serverside copy would need to happen.
+    This feature however is really useful for federated environments however.
+
     :param app: The next WSGI app in the pipeline
     :param conf: The dict of configuration values
     """
@@ -215,6 +232,8 @@ class KeystoneAuth(object):
             conf.get('allow_names_in_acls', 'true'))
         self.use_dynamic_reseller = swift_utils.config_true_value(
             conf.get('use_dynamic_reseller', 'false'))
+        self.use_dynamic_reseller_names = swift_utils.config_true_value(
+            conf.get('use_dynamic_reseller_names', 'false'))
 
     def __call__(self, environ, start_response):
         env_identity = self._keystone_identity(environ)
@@ -292,7 +311,7 @@ class KeystoneAuth(object):
         identity['auth_version'] = auth_version
         return identity
 
-    def _set_dynamic_name(self, environ, env_identity):
+    def _set_dynamic_name(self, environ, identity):
         try:
             part = Request(environ).split_path(2, 4, True)
             version, account, container, obj = part
@@ -300,8 +319,18 @@ class KeystoneAuth(object):
             return
 
         if account and account in self.reseller_prefixes:
-            path = "/%s/%s%s" % (version, account,
-                                 env_identity['tenant'][0])
+            if self.use_dynamic_reseller_names and \
+                    identity['auth_version'] == 3:
+                account = "%s%s_%s" % (account, identity['project_domain'][1],
+                                       identity['tenant'][1])
+            elif self.use_dynamic_reseller_names:
+                self.logger.error('use_dynamic_reseller_names only available '
+                                  'when using auth v3.')
+                return
+            else:
+                account = "%s%s" % (account, identity['tenant'][0])
+
+            path = "/%s/%s" % (version, account)
             if container:
                 path = "%s/%s" % (path, container)
             if obj:
