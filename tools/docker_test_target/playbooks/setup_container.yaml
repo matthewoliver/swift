@@ -1,0 +1,10 @@
+- hosts: all
+  become: true
+  tasks:
+    - name: create container conf
+      template:
+        src: files/container-server.conf
+        dest: /etc/swift/container-server.conf
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+        mode: 0644

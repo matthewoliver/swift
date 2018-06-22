@@ -1,0 +1,9 @@
+- hosts: all
+  tasks:
+    - name: Install distro dependencies
+      include: "{{ item }}"
+      static: no
+      with_first_found:
+        - "distro_dependencies/{{ ansible_distribution }}.yaml"
+        - "distro_dependencies/{{ ansible_os_family }}.yaml"
+        - "distro_dependencies/default.yaml"

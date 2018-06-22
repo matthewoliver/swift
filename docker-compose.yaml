@@ -1,0 +1,77 @@
+version: '3'
+services:
+  base-ubuntu:
+    build:
+      context: .
+      dockerfile: ./tools/docker_test_target/Dockerfile-ubuntu.base
+    image: base-swift-ubuntu
+
+  # base-alpine:
+  #   build:
+  #     context: .
+  #     dockerfile: ./Dockerfile-alpine.base
+  #   image: base-swift-alpine
+
+  syslog:
+    container_name: syslog
+    image: factorish/syslog
+    command: [ "-t", "udp" ]
+    expose:
+      - "514/udp"
+
+  memcache:
+    container_name: memcache
+    image: memcached:alpine
+    expose:
+      - "11211"
+
+  proxy:
+    image: "swift-proxy"
+    depends_on:
+      - syslog
+      - memcache
+    build:
+      context: .
+      dockerfile: ./tools/docker_test_target/Dockerfile.proxy
+    ports:
+      - "8080:8080/tcp"
+
+  account:
+    image: "swift-account"
+    depends_on:
+      - syslog
+    build:
+      context: .
+      dockerfile: ./tools/docker_test_target/Dockerfile.account
+    expose:
+      - "6202"
+    volumes:
+      - "swiftdata:/srv/node/d1"
+
+  container:
+    image: "swift-container"
+    depends_on:
+      - syslog
+    build:
+      context: .
+      dockerfile: ./tools/docker_test_target/Dockerfile.container
+    expose:
+      - "6102"
+    volumes:
+      - "swiftdata:/srv/node/d1"
+
+  object:
+    image: "swift-object"
+    depends_on:
+      - syslog
+    build:
+      context: .
+      dockerfile: ./tools/docker_test_target/Dockerfile.object
+    expose:
+      - "6002"
+    volumes:
+      - "swiftdata:/srv/node/d1"
+
+
+volumes:
+  swiftdata:

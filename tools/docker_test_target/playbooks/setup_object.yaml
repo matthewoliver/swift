@@ -1,0 +1,10 @@
+- hosts: all
+  become: true
+  tasks:
+    - name: create object conf
+      template:
+        src: files/object-server.conf
+        dest: /etc/swift/object-server.conf
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+        mode: 0644

@@ -1,0 +1,42 @@
+- hosts: all
+  become: true
+  tasks:
+    - name: Install swift
+      command: /usr/bin/python ./setup.py install
+      args:
+        chdir: /usr/local/src/swift
+
+    - name: create /var/run/swift
+      file: >
+        path=/var/run/swift
+        owner={{ ansible_user_id }}
+        group={{ ansible_user_gid }}
+        state=directory
+
+    - name: clean up /etc/swift directory
+      file: path=/etc/swift state=absent
+
+    - name: create clean /etc/swift
+      file:
+        path: /etc/swift
+        state: directory
+        mode: 0755
+
+    - name: create swift.conf
+      template:
+        src: files/swift.conf
+        dest: /etc/swift/swift.conf
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+        mode: 0644
+
+    - name: Copy remakerings
+      copy:
+        src: remakerings
+        dest: /usr/local/bin/remakerings
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+        mode: 0775
+
+    - name: Build rings
+      command: /usr/local/bin/remakerings

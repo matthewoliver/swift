@@ -1,0 +1,10 @@
+- hosts: all
+  become: true
+  tasks:
+    - name: create proxy conf
+      template:
+        src: files/proxy-server.conf
+        dest: /etc/swift/proxy-server.conf
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+        mode: 0644

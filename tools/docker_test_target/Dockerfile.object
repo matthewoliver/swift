@@ -1,0 +1,5 @@
+FROM base-swift-ubuntu:latest
+
+RUN ansible-playbook -i "localhost," -c local /usr/local/src/swift/tools/docker_test_target/playbooks/setup_object.yaml
+
+ENTRYPOINT ["swift-object-server", "/etc/swift/object-server.conf"]

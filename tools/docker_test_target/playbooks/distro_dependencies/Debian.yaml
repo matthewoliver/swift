@@ -1,0 +1,57 @@
+- name: install sudo
+  apt:
+    name: "{{ item }}"
+  with_items:
+    - sudo
+    - lsb-core
+
+- name: update pip
+  pip:
+    name: pip
+    state: latest
+
+# installing libec from source probably isn't necessary on ubuntu 18.04
+- name: install libec build tools
+  apt: name={{item}} state=installed
+  with_items:
+    - build-essential
+    - autoconf
+    - automake
+    - libtool
+    - zlib1g-dev
+
+- name: download libec code
+  git:
+    repo: https://github.com/openstack/liberasurecode.git
+    dest: /usr/local/src/liberasurecode
+
+- name: install libec from source
+  shell: ./autogen.sh && ./configure && make && sudo make install && ldconfig
+  args:
+    chdir: /usr/local/src/liberasurecode
+
+- name: install bindep
+  pip:
+    name: bindep
+    state: latest
+
+- name: run bindep
+  command: bindep platform:dpkg -b
+  args:
+    chdir: /usr/local/src/swift
+  register: bindep_output_deb
+  failed_when: ( bindep_output_deb.rc not in [ 0, 1 ] )
+
+- name: install requirements from bindep
+  apt:
+    name: "{{ bindep_output_deb.stdout_lines }}"
+  when:
+    - bindep_output_deb.rc == 1
+
+- name: install dependencies with pip
+  pip:
+    requirements: "{{item}}"
+    chdir: /usr/local/src/swift
+  with_items:
+    - requirements.txt
+    - test-requirements.txt

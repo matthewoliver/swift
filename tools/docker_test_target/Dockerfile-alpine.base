@@ -1,0 +1,12 @@
+FROM alpine:latest
+
+RUN apk update && apk upgrade
+
+RUN apk add ansible git py-pip
+
+# When this is called by docker-compose in swift's root directory,
+# the whole swift source tree gets added--not just the directory
+# this file is in.
+ADD ./ /usr/local/src/swift
+
+RUN ansible-playbook -i "localhost," -c local /usr/local/src/swift/tools/docker_test_target/playbooks/install_dependencies.yaml /usr/local/src/swift/tools/docker_test_target/playbooks/common.yaml

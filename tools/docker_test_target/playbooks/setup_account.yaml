@@ -1,0 +1,10 @@
+- hosts: all
+  become: true
+  tasks:
+    - name: create account conf
+      template:
+        src: files/account-server.conf
+        dest: /etc/swift/account-server.conf
+        owner: "{{ ansible_user_id }}"
+        group: "{{ ansible_user_gid }}"
+        mode: 0644
