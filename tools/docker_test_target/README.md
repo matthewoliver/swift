@@ -88,3 +88,32 @@ logging
 -------
 
 to check logs: `docker logs -f syslog`. These logs are buffered.
+
+grafana / statsd
+----------------
+
+To access the grafana web interface access browse to http://localhost:9000::
+
+    username: root
+    password: root
+
+Add the datasource to grafana:
+
+1. Open Data Sources from left side menu, then click on Add data source
+2. Choose a `name` for the source and flag it as `Default`
+3. Choose InfluxDB as `type`
+4. Choose `direct` or `proxy` as access
+5. Then the datasource fields are:
+
+```
+Url: http://localhost:8086
+Database: datasource
+User: datasource
+Password: datasource
+```
+
+If you need access to the InfluxDB webui open http://localhost:8083 and use:
+
+    Username: root
+    Password: root
+    Port: 8086

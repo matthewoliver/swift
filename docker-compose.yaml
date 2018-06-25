@@ -72,6 +72,15 @@ services:
     volumes:
       - "swiftdata:/srv/node/d1"
 
+  grafana:
+    container_name: grafana
+    image: advantageous/grafana:latest
+    expose:
+      - "8125/udp"
+      - "8086"
+    ports:
+      - "9000:9000/tcp"
+      - "8086:8086/tcp"
 
 volumes:
   swiftdata:
