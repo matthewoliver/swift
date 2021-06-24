@@ -53,6 +53,7 @@ from swift.common.swob import HTTPBadRequest, HTTPForbidden, \
 from swift.common.exceptions import APIVersionError
 from swift.common.wsgi import run_wsgi
 from swift.obj import expirer
+from swift.common.trace import wsgi_trace, trace_add
 
 DEFAULT_NAMESPACE_AVG_BACKEND_FETCH_TIME = 0.3  # seconds
 DEFAULT_NAMESPACE_CACHE_TOKENS_PER_SESSION = 3  # 3 tokens per session
@@ -201,6 +202,7 @@ class ProxyOverrideOptions(object):
         ))
 
 
+@wsgi_trace
 class Application(object):
     """WSGI application for the proxy server."""
 
@@ -514,6 +516,9 @@ class Application(object):
         """
         try:
             req = Request(env)
+            trace_add('error_limiting', dict(
+                error_suppression_limit=self.error_limiter.suppression_limit,
+                **self.error_limiter.stats), env)
             return self.handle_request(req)(env, start_response)
         except UnicodeError:
             err = HTTPPreconditionFailed(
@@ -590,6 +595,7 @@ class Application(object):
                 self.logger.txn_id = trans_id
             req.headers['x-trans-id'] = req.environ['swift.trans_id']
             controller.trans_id = req.environ['swift.trans_id']
+            controller.env = req.environ
             self.logger.client_ip = get_remote_client(req)
 
             allowed_methods = controller.allowed_methods

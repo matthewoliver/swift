@@ -80,7 +80,7 @@ bind_port = 6202
 # ionice_priority =
 
 [pipeline:main]
-pipeline = healthcheck recon backend_ratelimit account-server
+pipeline = healthcheck trace recon backend_ratelimit account-server
 
 [app:account-server]
 use = egg:swift#account
@@ -147,6 +147,31 @@ use = egg:swift#backend_ratelimit
 # that the file is loaded at start-up but not subsequently reloaded. Note that
 # config options in this section are never reloaded after start-up.
 # config_reload_interval = 60
+
+[filter:trace]
+use = egg:swift#trace
+# trace_exporter_module = egg:swift#jaeger_exporter
+# trace_exporter_config = /etc/swift/jaeger_exporter.json
+
+# On the storage nodes, the following options are not really needed.
+# traces are usually initiated on on the proxy by one of the mechanisms
+# below. Storage nodes tend to pick up tracing from an X-Backend-Tracing-Continue
+# header and the last span injected into the request headers.
+# But you could use the below, if you want.
+#
+# The trace_key is the secret used when creating the trace_sig HMAC.
+# trace_key =
+#
+# If you want to trace every x'th request then you can use the trace_every_x parameter. The default is 0
+# which is disabled.
+# trace_every_x = 0
+#
+# Prepend trace names with trace_name. The pid will then be appended to it.
+# trace_name = swift
+#
+# The digest algorithm(s) supported for generating signatures;
+# whitespace-delimited.
+# allowed_digests = sha1 sha256 sha512
 
 [account-replicator]
 # You can override the default log routing for this app here (don't use set!):

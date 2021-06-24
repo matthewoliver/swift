@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from swift.common.trace import wsgi_trace
 from swift.common.memcached import load_memcache
 from swift.common.utils import get_logger
 
 
+@wsgi_trace
 class MemcacheMiddleware(object):
     """
     Caching middleware that manages caching in swift.

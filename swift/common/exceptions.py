@@ -332,3 +332,7 @@ class ClientException(Exception):
 
 class InvalidPidFileException(Exception):
     pass
+
+
+class TracerLoadException(SwiftException):
+    pass

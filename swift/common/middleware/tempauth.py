@@ -190,6 +190,7 @@ from swift.common.swob import (
     HTTPUnauthorized, HTTPMethodNotAllowed, HTTPServiceUnavailable,
 )
 
+from swift.common.trace import wsgi_trace
 from swift.common.request_helpers import get_sys_meta_prefix
 from swift.common.middleware.acl import (
     clean_acl, parse_acl, referrer_allowed, acls_from_account_info)
@@ -203,6 +204,7 @@ from swift.proxy.controllers.base import get_account_info
 DEFAULT_TOKEN_LIFE = 86400
 
 
+@wsgi_trace
 class TempAuth(object):
     """
     :param app: The next WSGI app in the pipeline

@@ -42,6 +42,7 @@ from swift.common.utils import split_path, validate_device_partition, \
     parse_content_range, csv_append, list_from_csv, Spliterator, quote, \
     RESERVED, config_true_value, md5, CloseableChain, select_ip_port
 from swift.common.wsgi import make_subrequest
+from swift.common.trace import new_trace_span, trace_exception
 
 
 OBJECT_TRANSIENT_SYSMETA_PREFIX = 'x-object-transient-sysmeta-'
@@ -606,7 +607,12 @@ class SegmentedIterable(object):
                 yield ('data segment', data_or_req)
                 continue
             seg_req = data_or_req
-            seg_resp = seg_req.get_response(self.app)
+            # Because we are in an response iter object, the current span
+            # may not be enabled anymore.. so enable it as we trace the next
+            # iter
+            with new_trace_span(self.req.environ, '_requests_to_bytes_iter',
+                                force_current_span=True):
+                seg_resp = seg_req.get_response(self.app)
             if not is_success(seg_resp.status_int):
                 # Error body should be short
                 body = seg_resp.body.decode('utf8')
@@ -615,11 +621,13 @@ class SegmentedIterable(object):
                         self.name, seg_resp.status_int,
                         body if len(body) <= 60 else body[:57] + '...',
                         seg_req.path)
+                exception_to_raise = SegmentError(msg)
                 if is_server_error(seg_resp.status_int):
                     self.logger.error(msg)
-                    raise HTTPServiceUnavailable(
+                    exception_to_raise = HTTPServiceUnavailable(
                         request=seg_req, content_type='text/plain')
-                raise SegmentError(msg)
+                trace_exception(exception_to_raise, self.req.environ)
+                raise exception_to_raise
             elif ((seg_etag and (seg_resp.etag != seg_etag)) or
                     (seg_size and (seg_resp.content_length != seg_size) and
                      not seg_req.range)):
@@ -716,16 +724,18 @@ class SegmentedIterable(object):
     def _internal_iter(self):
         # Top level of our iterator stack: pass bytes through; catch and
         # handle exceptions.
-        try:
-            for chunk in self._time_limited_iter():
-                yield chunk
-        except (ListingIterError, SegmentError) as err:
-            self.logger.error(err)
-            if not self.validated_first_segment:
-                raise
-        finally:
-            if self.current_resp:
-                close_if_possible(self.current_resp.app_iter)
+        with new_trace_span(self.req.environ, 'SegmentedIterable'):
+            try:
+                for chunk in self._time_limited_iter():
+                    yield chunk
+            except (ListingIterError, SegmentError) as err:
+                trace_exception(err, self.req.environ)
+                self.logger.error(err)
+                if not self.validated_first_segment:
+                    raise
+            finally:
+                if self.current_resp:
+                    close_if_possible(self.current_resp.app_iter)
 
     def app_iter_range(self, *a, **kw):
         """

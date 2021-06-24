@@ -35,7 +35,6 @@ import math
 import random
 
 from greenlet import GreenletExit
-from eventlet import GreenPile
 from eventlet.queue import Queue, Empty
 from eventlet.timeout import Timeout
 
@@ -77,6 +76,8 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPNotFound, \
 from swift.common.request_helpers import update_etag_is_at_header, \
     resolve_etag_is_at_header, validate_internal_obj, get_ip_port, \
     is_open_expired, append_log_info
+from swift.common.trace import new_trace_span, trace_add, trace_exception, \
+    get_trace_headers, trace_function
 
 
 def check_content_type(req):
@@ -299,6 +300,7 @@ class BaseObjectController(Controller):
             'object', self.app, ring, partition, self.logger, request,
             node_iter=node_iter, policy=policy)
 
+    @trace_function
     def GETorHEAD(self, req):
         """Handle HTTP GET or HEAD requests."""
         container_info = self.container_info(
@@ -364,6 +366,7 @@ class BaseObjectController(Controller):
             req, account, container, headers=headers, params=params)
         return self._parse_namespaces(req, listing, response), response
 
+    @trace_function
     def _get_update_shard_caching_disabled(self, req, account, container, obj):
         """
         Fetch the corresponding updating shard range for the given object when
@@ -385,6 +388,7 @@ class BaseObjectController(Controller):
         # there will be only one Namespace in the list if any
         return namespaces[0] if namespaces else None
 
+    @trace_function
     def _get_backend_updating_namespaces(self, req, account, container):
         """
         Retrieve the updating namespaces from the backend.
@@ -400,6 +404,7 @@ class BaseObjectController(Controller):
         ns_bound_list = NamespaceBoundList.parse(namespaces)
         return ns_bound_list, backend_response
 
+    @trace_function
     def _get_update_shard(self, req, account, container, obj):
         """
         Find the appropriate shard range for an object update.
@@ -456,6 +461,7 @@ class BaseObjectController(Controller):
             get_cache_state, response)
         return ns_bound_list.get_namespace(obj) if ns_bound_list else None
 
+    @trace_function
     def _get_update_target(self, req, container_info):
         # find the sharded container to which we'll send the update
         db_state = container_info.get('sharding_state', 'unsharded')
@@ -607,6 +613,7 @@ class BaseObjectController(Controller):
         """
         raise NotImplementedError
 
+    @trace_function
     def _get_put_responses(self, req, putters, num_nodes, final_phase=True,
                            min_responses=None):
         """
@@ -628,7 +635,7 @@ class BaseObjectController(Controller):
         bodies = []
         etags = set()
 
-        pile = GreenAsyncPile(len(putters))
+        pile = GreenAsyncPile(len(putters), req.environ)
         for putter in putters:
             if putter.failed:
                 continue
@@ -693,6 +700,7 @@ class BaseObjectController(Controller):
 
         return req, delete_at_container, delete_at_part, delete_at_nodes
 
+    @trace_function
     def _update_content_type(self, req):
         # Sometimes the 'content-type' header exists, but is set to None.
         detect_content_type = \
@@ -704,6 +712,7 @@ class BaseObjectController(Controller):
             if detect_content_type:
                 req.headers.pop('x-detect-content-type')
 
+    @trace_function
     def _check_failure_put_connections(self, putters, req, min_conns):
         """
         Identify any failed connections and check minimum connection count.
@@ -774,20 +783,28 @@ class BaseObjectController(Controller):
         """
         self.logger.thread_locals = logger_thread_locals
         for node in nodes:
-            try:
-                putter = self._make_putter(node, part, req, headers)
-                self.app.set_node_timing(node, putter.connect_duration)
-                return putter
-            except InsufficientStorage:
-                self.app.error_limit(node, 'ERROR Insufficient Storage')
-            except PutterConnectError as e:
-                msg = 'ERROR %d Expect: 100-continue From Object Server'
-                self.app.error_occurred(node, msg % e.status)
-            except (Exception, Timeout):
-                self.app.exception_occurred(
-                    node, 'Object',
-                    'Expect: 100-continue on %s' %
-                    quote(req.swift_entity_path))
+            ip, port = get_ip_port(node, headers)
+            with new_trace_span(
+                    self.env,
+                    "_connect_put_node -> ({}:{})".format(ip, port)):
+                headers.update(get_trace_headers(self.env))
+                try:
+                    putter = self._make_putter(node, part, req, headers)
+                    self.app.set_node_timing(node, putter.connect_duration)
+                    return putter
+                except InsufficientStorage as e:
+                    self.app.error_limit(node, 'ERROR Insufficient Storage')
+                    trace_exception(e, self.env)
+                except PutterConnectError as e:
+                    msg = 'ERROR %d Expect: 100-continue From Object Server'
+                    self.app.error_occurred(node, msg % e.status)
+                    trace_exception(e, self.env)
+                except (Exception, Timeout) as e:
+                    msg = ('Expect: 100-continue on %s' %
+                           quote(req.swift_entity_path))
+                    self.app.exception_occurred(node, 'Object', msg)
+                    trace_add('Error', msg, self.env)
+                    trace_exception(e, self.env)
 
     def _get_put_connections(self, req, nodes, partition, outgoing_headers,
                              policy):
@@ -798,7 +815,7 @@ class BaseObjectController(Controller):
         node_iter = GreenthreadSafeIterator(
             self.iter_nodes_local_first(obj_ring, partition, req,
                                         policy=policy))
-        pile = GreenPile(len(nodes))
+        pile = GreenAsyncPile(len(nodes), req.environ)
 
         for nheaders in outgoing_headers:
             # RFC2616:8.2.3 disallows 100-continue without a body,
@@ -847,6 +864,7 @@ class BaseObjectController(Controller):
         """
         raise NotImplementedError()
 
+    @trace_function
     def _delete_object(self, req, obj_ring, partition, headers,
                        node_count=None, node_iterator=None):
         """Delete object considering write-affinity.
@@ -870,6 +888,7 @@ class BaseObjectController(Controller):
                                   node_iterator=node_iterator)
         return resp
 
+    @trace_function
     def _post_extra_handoffs(self, req, obj_ring, partition, headers, results,
                              handoff_nodes):
         """
@@ -908,6 +927,7 @@ class BaseObjectController(Controller):
             status_map[resp.status].append(node_to_string(node))
         return status_map
 
+    @trace_function
     def _post_object(self, req, obj_ring, partition, headers):
         """
         send object POST request to storage nodes.
@@ -1020,8 +1040,9 @@ class BaseObjectController(Controller):
             delete_at_container, delete_at_part, delete_at_nodes)
 
         # send object to storage nodes
-        resp = self._store_object(
-            req, data_source, nodes, partition, outgoing_headers)
+        with new_trace_span(self.env, '_store_object'):
+            resp = self._store_object(
+                req, data_source, nodes, partition, outgoing_headers)
         return resp
 
     @public
@@ -1114,6 +1135,7 @@ class ReplicatedObjectController(BaseObjectController):
                 chunked=te.endswith(',chunked'))
         return putter
 
+    @trace_function
     def _transfer_data(self, req, data_source, putters, nodes):
         """
         Transfer data for a replicated object.
@@ -1193,6 +1215,7 @@ class ReplicatedObjectController(BaseObjectController):
     def _have_adequate_put_responses(self, statuses, num_nodes, min_responses):
         return self.have_quorum(statuses, num_nodes)
 
+    @trace_function
     def _store_object(self, req, data_source, nodes, partition,
                       outgoing_headers):
         """
@@ -1208,20 +1231,25 @@ class ReplicatedObjectController(BaseObjectController):
         if not nodes:
             return HTTPNotFound()
 
-        putters = self._get_put_connections(
-            req, nodes, partition, outgoing_headers, policy)
+        with new_trace_span(self.env, '_get_put_connections'):
+            putters = self._get_put_connections(
+                req, nodes, partition, outgoing_headers, policy)
         min_conns = quorum_size(len(nodes))
         try:
             # check that a minimum number of connections were established and
             # meet all the correct conditions set in the request
-            self._check_failure_put_connections(putters, req, min_conns)
+            with new_trace_span(
+                    self.env, '_check_failure_put_connections'):
+                self._check_failure_put_connections(putters, req, min_conns)
 
             # transfer data
-            self._transfer_data(req, data_source, putters, nodes)
+            with new_trace_span(self.env, '_transfer_data'):
+                self._transfer_data(req, data_source, putters, nodes)
 
             # get responses
-            statuses, reasons, bodies, etags = \
-                self._get_put_responses(req, putters, len(nodes))
+            with new_trace_span(self.env, '_get_put_responses'):
+                statuses, reasons, bodies, etags = \
+                    self._get_put_responses(req, putters, len(nodes))
         except HTTPException as resp:
             return resp
         finally:
@@ -2750,60 +2778,66 @@ class ECFragGetter(GetterBase):
         self.logger.thread_locals = self.logger_thread_locals
         req_headers = dict(self.backend_headers)
         ip, port = get_ip_port(node, req_headers)
-        req_headers.update(self.header_provider())
-        start_node_timing = time.time()
-        try:
-            with ConnectionTimeout(self.app.conn_timeout):
-                conn = http_connect(
-                    ip, port, node['device'],
-                    self.partition, 'GET', self.path,
-                    headers=req_headers,
-                    query_string=self.req.query_string)
-            self.app.set_node_timing(node, time.time() - start_node_timing)
+        with new_trace_span(
+                self.req.environ,
+                "ECFragGetter._make_node_request -> ({}:{})".format(ip, port)):
+            req_headers.update(get_trace_headers(self.req.environ))
+            req_headers.update(self.header_provider())
+            start_node_timing = time.time()
+            try:
+                with ConnectionTimeout(self.app.conn_timeout):
+                    conn = http_connect(
+                        ip, port, node['device'],
+                        self.partition, 'GET', self.path,
+                        headers=req_headers,
+                        query_string=self.req.query_string)
+                self.app.set_node_timing(node, time.time() - start_node_timing)
 
-            with Timeout(self.node_timeout):
-                possible_source = conn.getresponse()
-                # See NOTE: swift_conn at top of file about this.
-                possible_source.swift_conn = conn
-        except (Exception, Timeout):
-            self.app.exception_occurred(
-                node, 'Object',
-                'Trying to %(method)s %(path)s' %
-                {'method': self.req.method, 'path': self.req.path})
-            return None
+                with Timeout(self.node_timeout):
+                    possible_source = conn.getresponse()
+                    # See NOTE: swift_conn at top of file about this.
+                    possible_source.swift_conn = conn
+            except (Exception, Timeout) as ex:
+                msg = ('Trying to %(method)s %(path)s' %
+                       {'method': self.req.method, 'path': self.req.path})
+                self.app.exception_occurred(node, 'Object', msg)
+                trace_add('Error', msg, self.req.environ)
+                trace_exception(ex, self.req.environ)
+                return None
 
-        src_headers = dict(
-            (k.lower(), v) for k, v in
-            possible_source.getheaders())
+            src_headers = dict(
+                (k.lower(), v) for k, v in
+                possible_source.getheaders())
 
-        if 'handoff_index' in node and \
-                (is_server_error(possible_source.status) or
-                 possible_source.status == HTTP_NOT_FOUND) and \
-                not Timestamp(
-                    src_headers.get('x-backend-timestamp', Timestamp.zero())):
-            # throw out 5XX and 404s from handoff nodes unless the data is
-            # really on disk and had been DELETEd
-            self.logger.debug('Ignoring %s from handoff' %
-                              possible_source.status)
-            conn.close()
-            return None
+            if 'handoff_index' in node and \
+                    (is_server_error(possible_source.status) or
+                    possible_source.status == HTTP_NOT_FOUND) and \
+                    not Timestamp(
+                        src_headers.get('x-backend-timestamp', Timestamp.zero())):
+                # throw out 5XX and 404s from handoff nodes unless the data is
+                # really on disk and had been DELETEd
+                self.logger.debug('Ignoring %s from handoff' %
+                                possible_source.status)
+                conn.close()
+                return None
 
-        self.status = possible_source.status
-        self.reason = possible_source.reason
-        self.source_headers = possible_source.getheaders()
-        if is_good_source(possible_source.status, server_type='Object'):
-            self.body = None
-            return possible_source
-        else:
-            self.body = possible_source.read()
-            conn.close()
+            self.status = possible_source.status
+            self.reason = possible_source.reason
+            self.source_headers = possible_source.getheaders()
+            if is_good_source(possible_source.status, server_type='Object'):
+                self.body = None
+                return possible_source
+            else:
+                self.body = possible_source.read()
+                conn.close()
 
-            if self.app.check_response(node, 'Object', possible_source, 'GET',
-                                       self.path):
-                self.logger.debug(
-                    'Ignoring %s from primary' % possible_source.status)
+                if self.app.check_response(
+                        node, 'Object', possible_source, 'GET',
+                        self.path):
+                    self.logger.debug(
+                        'Ignoring %s from primary' % possible_source.status)
 
-            return None
+                return None
 
     @property
     def source_iter(self):
@@ -3007,7 +3041,7 @@ class ECObjectController(BaseObjectController):
         if policy_options.concurrent_gets:
             ec_request_count += policy_options.concurrent_ec_extra_requests
         with ContextPool(policy.ec_n_unique_fragments) as pool:
-            pile = GreenAsyncPile(pool)
+            pile = GreenAsyncPile(pool, req.environ)
             buckets = ECGetResponseCollection(policy)
             node_iter.set_node_provider(buckets.provide_alternate_node)
 
@@ -3514,16 +3548,20 @@ class ECObjectController(BaseObjectController):
         etag_hasher = md5(usedforsecurity=False)
 
         min_conns = policy.quorum
-        putters = self._get_put_connections(
-            req, nodes, partition, outgoing_headers, policy)
+        with new_trace_span(self.env, '_get_put_connections'):
+            putters = self._get_put_connections(
+                req, nodes, partition, outgoing_headers, policy)
 
         try:
             # check that a minimum number of connections were established and
             # meet all the correct conditions set in the request
-            self._check_failure_put_connections(putters, req, min_conns)
+            with new_trace_span(
+                    self.env, '_check_failure_put_connections'):
+                self._check_failure_put_connections(putters, req, min_conns)
 
-            self._transfer_data(req, policy, data_source, putters,
-                                nodes, min_conns, etag_hasher)
+            with new_trace_span(self.env, '_transfer_data'):
+                self._transfer_data(req, policy, data_source, putters,
+                                    nodes, min_conns, etag_hasher)
             # The durable state will propagate in a replicated fashion; if
             # one fragment is durable then the reconstructor will spread the
             # durable status around.
@@ -3534,10 +3572,11 @@ class ECObjectController(BaseObjectController):
             # future able to serve their non-durable fragment archives we may
             # be able to reduce this quorum count if needed.
             # ignore response etags
-            statuses, reasons, bodies, _etags = \
-                self._get_put_responses(req, putters, len(nodes),
-                                        final_phase=True,
-                                        min_responses=min_conns)
+            with new_trace_span(self.env, '_get_put_responses'):
+                statuses, reasons, bodies, _etags = \
+                    self._get_put_responses(req, putters, len(nodes),
+                                            final_phase=True,
+                                            min_responses=min_conns)
         except HTTPException as resp:
             return resp
         finally:

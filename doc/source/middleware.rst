@@ -389,6 +389,13 @@ TempURL
 
 .. _versioned_writes:
 
+Trace (Request Tracing)
+========================
+
+.. automodule:: swift.common.middleware.request_trace
+    :members:
+    :show-inheritance:
+
 Versioned Writes
 =================
 

@@ -210,6 +210,7 @@ from swift.common import constraints
 from swift.common.http import HTTP_UNAUTHORIZED, HTTP_NOT_FOUND, HTTP_CONFLICT
 from swift.common.request_helpers import is_user_meta
 from swift.common.wsgi import make_subrequest
+from swift.common.trace import wsgi_trace, new_trace_span, trace_function
 
 
 class CreateContainerError(Exception):
@@ -240,6 +241,7 @@ def pax_key_to_swift_header(pax_key):
         return None
 
 
+@wsgi_trace
 class Bulk(object):
 
     def __init__(self, app, conf, max_containers_per_extraction=10000,
@@ -260,6 +262,7 @@ class Bulk(object):
         self.max_path_length = constraints.MAX_OBJECT_NAME_LENGTH \
             + constraints.MAX_CONTAINER_NAME_LENGTH + 2
 
+    @trace_function
     def create_container(self, req, container_path):
         """
         Checks if the container exists and if not try to create it.
@@ -286,6 +289,7 @@ class Bulk(object):
             "Create Container Failed: " + container_path,
             resp.status_int, resp.status)
 
+    @trace_function
     def get_objs_to_delete(self, req):
         """
         Will populate objs_to_delete with data from request input.
@@ -328,6 +332,7 @@ class Bulk(object):
                 raise HTTPBadRequest('Invalid File Name')
         return objs_to_delete
 
+    @trace_function
     def handle_delete_iter(self, req, objs_to_delete=None,
                            user_agent='BulkDelete', swift_source='BD',
                            out_content_type='text/plain'):
@@ -409,17 +414,19 @@ class Bulk(object):
                                     objs_to_delete)
 
             def do_delete(obj_name, delete_path, version_id):
-                delete_obj_req = make_subrequest(
-                    req.environ, method='DELETE',
-                    path=wsgi_quote(str_to_wsgi(delete_path)),
-                    headers={'X-Auth-Token': req.headers.get('X-Auth-Token')},
-                    body='', agent='%(orig)s ' + user_agent,
-                    swift_source=swift_source)
-                if version_id is None:
-                    delete_obj_req.params = {}
-                else:
-                    delete_obj_req.params = {'version-id': version_id}
-                return (delete_obj_req.get_response(self.app), obj_name, 0)
+                with new_trace_span(req.environ, "handle_delete.do_delete"):
+                    delete_obj_req = make_subrequest(
+                        req.environ, method='DELETE',
+                        path=wsgi_quote(str_to_wsgi(delete_path)),
+                        headers={
+                            'X-Auth-Token': req.headers.get('X-Auth-Token')},
+                        body='', agent='%(orig)s ' + user_agent,
+                        swift_source=swift_source)
+                    if version_id is None:
+                        delete_obj_req.params = {}
+                    else:
+                        delete_obj_req.params = {'version-id': version_id}
+                    return delete_obj_req.get_response(self.app), obj_name, 0
 
             with StreamingPile(self.delete_concurrency) as pile:
                 for names_to_delete in objs_then_containers(objs_to_delete):
@@ -465,6 +472,7 @@ class Bulk(object):
                                                       resp_dict, failed_files,
                                                       'delete')
 
+    @trace_function
     def handle_extract_iter(self, req, compress_type,
                             out_content_type='text/plain'):
         """
@@ -630,6 +638,7 @@ class Bulk(object):
         yield separator + get_heartbeat_response_body(
             out_content_type, resp_dict, failed_files, 'extract')
 
+    @trace_function
     def _process_delete(self, resp, pile, obj_name, resp_dict,
                         failed_files, failed_file_response, retry=0):
         if resp.status_int // 100 == 2:

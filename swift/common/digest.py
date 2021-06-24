@@ -15,7 +15,7 @@
 import binascii
 import hmac
 
-from swift.common.utils import strict_b64decode
+from swift.common import utils
 
 
 DEFAULT_ALLOWED_DIGESTS = 'sha1 sha256 sha512'
@@ -128,7 +128,7 @@ def extract_digest_and_algorithm(value):
                 '+' in value or '/' in value):
             value = value.replace('-', '+').replace('_', '/')
         value = binascii.hexlify(
-            strict_b64decode(value + '==')).decode('ascii')
+            utils.strict_b64decode(value + '==')).decode('ascii')
     else:
         binascii.unhexlify(value)  # make sure it decodes
         algo = {

@@ -45,6 +45,7 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, \
     HTTPInsufficientStorage, HTTPException, wsgi_to_str
 from swift.common.request_helpers import is_sys_or_user_meta
 from swift.common.wsgi import run_wsgi
+from swift.common.trace import wsgi_trace
 
 
 def get_account_name_and_placement(req):
@@ -73,6 +74,7 @@ def get_container_name_and_placement(req):
     return drive, part, account, container
 
 
+@wsgi_trace
 class AccountController(BaseStorageServer):
     """WSGI controller for the account server."""
 

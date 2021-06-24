@@ -15,7 +15,6 @@ import unittest
 
 from swift.common.swob import Request, wsgify, HTTPForbidden, HTTPOk, \
     HTTPServiceUnavailable, HTTPNotFound
-
 from swift.common.middleware import account_quotas, copy
 
 from test.unit import patch_policies

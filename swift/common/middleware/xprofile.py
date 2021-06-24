@@ -89,6 +89,7 @@ import urllib
 
 from swift.common.utils import get_logger, config_true_value
 from swift.common.swob import Request
+from swift.common.trace import wsgi_trace
 from swift.common.middleware.x_profile.exceptions import MethodNotAllowed
 from swift.common.middleware.x_profile.exceptions import NotFoundException
 from swift.common.middleware.x_profile.exceptions import ProfileException
@@ -144,6 +145,7 @@ def new_runcall(self, func, *args, **kw):
         self.TallyTimings()
 
 
+@wsgi_trace
 class ProfileMiddleware(object):
 
     def __init__(self, app, conf):

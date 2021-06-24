@@ -1,0 +1,8 @@
+{
+  "agent_host_name": "localhost",
+  "agent_port": "6831",
+  "collector_endpoint": "OPTIONAL http://localhost:14268/api/traces?format=jaeger.thrift",
+  "username": "optional item",
+  "password": "optional item",
+  "max_tag_value_length": null
+}

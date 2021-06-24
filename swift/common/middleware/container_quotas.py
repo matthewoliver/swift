@@ -55,9 +55,11 @@ from swift.common.http import is_success
 from swift.common.swob import HTTPRequestEntityTooLarge, HTTPBadRequest, \
     wsgify
 from swift.common.registry import register_swift_info
+from swift.common.trace import wsgi_trace
 from swift.proxy.controllers.base import get_container_info
 
 
+@wsgi_trace
 class ContainerQuotaMiddleware(object):
     def __init__(self, app, *args, **kwargs):
         self.app = app

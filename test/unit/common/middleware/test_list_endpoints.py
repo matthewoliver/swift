@@ -26,9 +26,11 @@ from swift.common.utils import split_path
 from swift.common.swob import Request, Response
 from swift.common.middleware import list_endpoints
 from swift.common.storage_policy import StoragePolicy, POLICIES
+from swift.common.trace import wsgi_trace
 from test.unit import patch_policies
 
 
+@wsgi_trace
 class FakeApp(object):
     def __call__(self, env, start_response):
         return Response(body="FakeApp")(env, start_response)

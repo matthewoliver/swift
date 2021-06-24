@@ -27,6 +27,7 @@ from tempfile import mkdtemp
 from eventlet import sleep
 from unittest.mock import patch, call
 from test.debug_logger import debug_logger
+from test.unit import activate_tracing, TraceAssertMixin
 from test.unit.common.middleware.helpers import FakeSwift
 from swift.common import utils, constraints, registry
 from swift.common.header_key_dict import HeaderKeyDict
@@ -150,7 +151,7 @@ def build_tar_tree(tar, start_path, tree_obj, base_path=''):
     raise TypeError("can't build tree from %r" % tree_obj)
 
 
-class TestUntarMetadata(unittest.TestCase):
+class TestUntarMetadata(unittest.TestCase, TraceAssertMixin):
     def setUp(self):
         self.app = FakeSwift()
         self.bulk = bulk.filter_factory({})(self.app)
@@ -218,6 +219,7 @@ class TestUntarMetadata(unittest.TestCase):
         tar_ball.seek(0)
 
         req = Request.blank('/v1/a/c?extract-archive=tar')
+        _, in_memory = activate_tracing(req.environ)
         req.environ['REQUEST_METHOD'] = 'PUT'
         req.environ['wsgi.input'] = tar_ball
         # Since there should be a proxy-logging left of us...
@@ -261,9 +263,13 @@ class TestUntarMetadata(unittest.TestCase):
         self.assertEqual(put2_headers.get('X-Delete-At'), '1577383915')
         self.assertEqual(put2_headers.get('X-Object-Meta-Dog'), 'Rantanplan')
         self.assertIsNone(put2_headers.get('X-Horse'))
+        self.assert_span_names(
+            in_memory,
+            ['Bulk', 'FakeSwift', 'handle_extract_iter', 'create_container',
+             'FakeSwift_1', 'FakeSwift_2'])
 
 
-class TestUntar(unittest.TestCase):
+class TestUntar(unittest.TestCase, TraceAssertMixin):
 
     def setUp(self):
         self.app = FakeApp()
@@ -286,6 +292,7 @@ class TestUntar(unittest.TestCase):
 
     def test_create_container_for_path(self):
         req = Request.blank('/')
+        _, in_memory = activate_tracing(req.environ)
         self.assertEqual(
             self.bulk.create_container(req, '/create_cont/acc/cont'),
             True)
@@ -295,6 +302,9 @@ class TestUntar(unittest.TestCase):
             self.bulk.create_container,
             req, '/create_cont_fail/acc/cont')
         self.assertEqual(self.app.calls, 3)
+        self.assert_span_names(
+            in_memory,
+            ['create_container'] * 2)
 
     def test_extract_tar_works(self):
         # On systems where $TMPDIR is long (like OS X), we need to do this
@@ -322,15 +332,20 @@ class TestUntar(unittest.TestCase):
             tar.add(os.path.join(self.testdir, base_name))
             tar.close()
             req = Request.blank('/tar_works/acc/cont/')
+            _, in_memory = activate_tracing(req.environ)
             req.environ['wsgi.input'] = open(
                 os.path.join(self.testdir, 'tar_works.tar' + extension), 'rb')
             req.headers['transfer-encoding'] = 'chunked'
             resp_body = self.handle_extract_and_iter(req, compress_format)
             resp_data = utils.json.loads(resp_body)
             self.assertEqual(resp_data['Number Files Created'], 6)
+            self.assert_span_names(
+                in_memory,
+                ['handle_extract_iter', 'create_container'])
 
             # test out xml
             req = Request.blank('/tar_works/acc/cont/')
+            _, in_memory = activate_tracing(req.environ)
             req.environ['wsgi.input'] = open(
                 os.path.join(self.testdir, 'tar_works.tar' + extension), 'rb')
             req.headers['transfer-encoding'] = 'chunked'
@@ -342,10 +357,14 @@ class TestUntar(unittest.TestCase):
             self.assertIn(
                 b'<number_files_created>6</number_files_created>',
                 resp_body)
+            self.assert_span_names(
+                in_memory,
+                ['handle_extract_iter', 'create_container'])
 
             # test out nonexistent format
             req = Request.blank('/tar_works/acc/cont/?extract-archive=tar',
                                 headers={'Accept': 'good_xml'})
+            _, in_memory = activate_tracing(req.environ)
             req.environ['REQUEST_METHOD'] = 'PUT'
             req.environ['wsgi.input'] = open(
                 os.path.join(self.testdir, 'tar_works.tar' + extension), 'rb')
@@ -358,6 +377,13 @@ class TestUntar(unittest.TestCase):
             resp_body = b''.join(app_iter)
 
             self.assertIn(b'Response Status: 406', resp_body)
+            # It wont get to the create container function so no
+            # create_container spans. Because we are calling the bulk
+            # middleware directly we get the default middleware span generated
+            # from the mixin.
+            self.assert_span_names(
+                in_memory,
+                ['Bulk', 'handle_extract_iter'])
 
     def test_extract_call(self):
         base_name = 'base_works_gz'
@@ -377,10 +403,14 @@ class TestUntar(unittest.TestCase):
             pass
 
         req = Request.blank('/tar_works/acc/cont/?extract-archive=tar.gz')
+        _, in_memory = activate_tracing(req.environ)
         req.environ['wsgi.input'] = open(
             os.path.join(self.testdir, 'tar_works.tar.gz'), 'rb')
         self.bulk(req.environ, fake_start_response)
         self.assertEqual(self.app.calls, 1)
+        self.assert_span_names(
+            in_memory,
+            ['Bulk'])
 
         self.app.calls = 0
         req.environ['wsgi.input'] = open(
@@ -390,15 +420,25 @@ class TestUntar(unittest.TestCase):
         app_iter = self.bulk(req.environ, fake_start_response)
         list(app_iter)  # iter over resp
         self.assertEqual(self.app.calls, 7)
+        # Because we're using the same trace environment and calling bulk
+        # twice, the second bulk call's default mixin span is 'Bulk_1'. Ie
+        # like visiting the bulk middleware twice in a pipeline.
+        self.assert_span_names(
+            in_memory,
+            ['Bulk', 'Bulk_1', 'handle_extract_iter', 'create_container'])
 
         self.app.calls = 0
         req = Request.blank('/tar_works/acc/cont/?extract-archive=bad')
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'PUT'
         req.headers['transfer-encoding'] = 'Chunked'
         req.environ['wsgi.input'] = open(
             os.path.join(self.testdir, 'tar_works.tar.gz'), 'rb')
         t = self.bulk(req.environ, fake_start_response)
         self.assertEqual(t, [b"Unsupported archive format"])
+        self.assert_span_names(
+            in_memory,
+            ['Bulk'])
 
         tar = tarfile.open(name=os.path.join(self.testdir,
                                              'tar_works.tar'),
@@ -407,6 +447,7 @@ class TestUntar(unittest.TestCase):
         tar.close()
         self.app.calls = 0
         req = Request.blank('/tar_works/acc/cont/?extract-archive=tar')
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'PUT'
         req.headers['transfer-encoding'] = 'Chunked'
         req.environ['wsgi.input'] = open(
@@ -414,19 +455,27 @@ class TestUntar(unittest.TestCase):
         app_iter = self.bulk(req.environ, fake_start_response)
         list(app_iter)  # iter over resp
         self.assertEqual(self.app.calls, 7)
+        self.assert_span_names(
+            in_memory,
+            ['Bulk', 'handle_extract_iter', 'create_container'])
 
     def test_bad_container(self):
         req = Request.blank('/invalid/', body=b'')
+        _, in_memory = activate_tracing(req.environ)
         resp_body = self.handle_extract_and_iter(req, '')
         self.assertIn(b'404 Not Found', resp_body)
+        self.assert_span_names(in_memory, ['handle_extract_iter'])
 
     def test_content_length_required(self):
         req = Request.blank('/create_cont_fail/acc/cont')
+        _, in_memory = activate_tracing(req.environ)
         resp_body = self.handle_extract_and_iter(req, '')
         self.assertIn(b'411 Length Required', resp_body)
+        self.assert_span_names(in_memory, ['handle_extract_iter'])
 
     def test_bad_tar(self):
         req = Request.blank('/create_cont_fail/acc/cont', body='')
+        _, in_memory = activate_tracing(req.environ)
 
         def bad_open(*args, **kwargs):
             raise zlib.error('bad tar')
@@ -434,6 +483,7 @@ class TestUntar(unittest.TestCase):
         with patch.object(tarfile, 'open', bad_open):
             resp_body = self.handle_extract_and_iter(req, '')
             self.assertIn(b'400 Bad Request', resp_body)
+        self.assert_span_names(in_memory, ['handle_extract_iter'])
 
     def build_tar(self, dir_tree=None):
         if not dir_tree:
@@ -457,17 +507,22 @@ class TestUntar(unittest.TestCase):
                              {'sub_dir3': [{'sub4_dir1': 'sub4_file1'}]}]}]
         self.build_tar(dir_tree)
         req = Request.blank('/tar_works/acc/')
+        _, in_memory = activate_tracing(req.environ)
         req.environ['wsgi.input'] = open(os.path.join(self.testdir,
                                                       'tar_fails.tar'), 'rb')
         req.headers['transfer-encoding'] = 'chunked'
         resp_body = self.handle_extract_and_iter(req, '')
         resp_data = utils.json.loads(resp_body)
         self.assertEqual(resp_data['Number Files Created'], 4)
+        self.assert_span_names(
+            in_memory,
+            ['handle_extract_iter', 'create_container'])
 
     def test_extract_tar_fail_cont_401(self):
         self.build_tar()
         req = Request.blank('/unauth/acc/',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.environ['wsgi.input'] = open(os.path.join(self.testdir,
                                                       'tar_fails.tar'), 'rb')
         req.headers['transfer-encoding'] = 'chunked'
@@ -476,11 +531,15 @@ class TestUntar(unittest.TestCase):
         resp_data = utils.json.loads(resp_body)
         self.assertEqual(resp_data['Response Status'], '401 Unauthorized')
         self.assertEqual(resp_data['Errors'], [])
+        self.assert_span_names(
+            in_memory,
+            ['handle_extract_iter', 'create_container'])
 
     def test_extract_tar_fail_obj_401(self):
         self.build_tar()
         req = Request.blank('/create_obj_unauth/acc/cont/',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.environ['wsgi.input'] = open(os.path.join(self.testdir,
                                                       'tar_fails.tar'), 'rb')
         req.headers['transfer-encoding'] = 'chunked'
@@ -491,11 +550,15 @@ class TestUntar(unittest.TestCase):
         self.assertEqual(
             resp_data['Errors'],
             [['cont/base_fails1/sub_dir1/sub1_file1', '401 Unauthorized']])
+        self.assert_span_names(
+            in_memory,
+            ['handle_extract_iter', 'create_container'])
 
     def test_extract_tar_fail_obj_name_len(self):
         self.build_tar()
         req = Request.blank('/tar_works/acc/cont/',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.environ['wsgi.input'] = open(os.path.join(self.testdir,
                                                       'tar_fails.tar'), 'rb')
         req.headers['transfer-encoding'] = 'chunked'
@@ -506,11 +569,15 @@ class TestUntar(unittest.TestCase):
         self.assertEqual(
             resp_data['Errors'],
             [['cont/base_fails1/' + ('f' * 101), '400 Bad Request']])
+        self.assert_span_names(
+            in_memory,
+            ['handle_extract_iter', 'create_container'])
 
     def test_extract_tar_fail_compress_type(self):
         self.build_tar()
         req = Request.blank('/tar_works/acc/cont/',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.environ['wsgi.input'] = open(os.path.join(self.testdir,
                                                       'tar_fails.tar'), 'rb')
         req.headers['transfer-encoding'] = 'chunked'
@@ -521,6 +588,7 @@ class TestUntar(unittest.TestCase):
         self.assertEqual(
             resp_data['Response Body'].lower(),
             'invalid tar file: not a gzip file')
+        self.assert_span_names(in_memory, ['handle_extract_iter'])
 
     def test_extract_tar_fail_max_failed_extractions(self):
         self.build_tar()
@@ -528,6 +596,7 @@ class TestUntar(unittest.TestCase):
             self.app.calls = 0
             req = Request.blank('/tar_works/acc/cont/',
                                 headers={'Accept': 'application/json'})
+            _, in_memory = activate_tracing(req.environ)
             req.environ['wsgi.input'] = open(
                 os.path.join(self.testdir, 'tar_fails.tar'), 'rb')
             req.headers['transfer-encoding'] = 'chunked'
@@ -538,6 +607,8 @@ class TestUntar(unittest.TestCase):
             self.assertEqual(
                 resp_data['Errors'],
                 [['cont/base_fails1/' + ('f' * 101), '400 Bad Request']])
+            self.assert_span_names(in_memory,
+                                   ['handle_extract_iter', 'create_container'])
 
     @patch.object(constraints, 'MAX_FILE_SIZE', 4)
     def test_extract_tar_fail_max_file_size(self):
@@ -552,6 +623,7 @@ class TestUntar(unittest.TestCase):
         self.app.calls = 0
         req = Request.blank('/tar_works/acc/cont/',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.environ['wsgi.input'] = open(
             os.path.join(self.testdir, 'tar_works.tar'), 'rb')
         req.headers['transfer-encoding'] = 'chunked'
@@ -561,6 +633,7 @@ class TestUntar(unittest.TestCase):
             resp_data['Errors'],
             [['cont' + self.testdir + '/test/sub_dir1/sub1_file1',
               '413 Request Entity Too Large']])
+        self.assert_span_names(in_memory, ['handle_extract_iter'])
 
     def test_extract_tar_fail_max_cont(self):
         dir_tree = [{'sub_dir1': ['sub1_file1']},
@@ -573,6 +646,7 @@ class TestUntar(unittest.TestCase):
             body = open(os.path.join(self.testdir, 'tar_fails.tar')).read()
             req = Request.blank('/tar_works_cont_head_fail/acc/', body=body,
                                 headers={'Accept': 'application/json'})
+            _, in_memory = activate_tracing(req.environ)
             req.headers['transfer-encoding'] = 'chunked'
             resp_body = self.handle_extract_and_iter(req, '')
             self.assertEqual(self.app.calls, 5)
@@ -581,6 +655,9 @@ class TestUntar(unittest.TestCase):
             self.assertEqual(
                 resp_data['Response Body'],
                 'More than 1 containers to create from tar.')
+            self.assert_span_names(in_memory,
+                                   ['handle_extract_iter'] +
+                                   ['create_container'] * 2)
 
     def test_extract_tar_fail_create_cont(self):
         dir_tree = [{'base_fails1': [
@@ -590,6 +667,7 @@ class TestUntar(unittest.TestCase):
         self.build_tar(dir_tree)
         req = Request.blank('/create_cont_fail/acc/cont/',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.environ['wsgi.input'] = open(os.path.join(self.testdir,
                                                       'tar_fails.tar'), 'rb')
         req.headers['transfer-encoding'] = 'chunked'
@@ -597,11 +675,15 @@ class TestUntar(unittest.TestCase):
         resp_data = utils.json.loads(resp_body)
         self.assertEqual(self.app.calls, 5)
         self.assertEqual(len(resp_data['Errors']), 5)
+        self.assert_span_names(
+            in_memory,
+            ['handle_extract_iter', 'create_container'])
 
     def test_extract_tar_fail_create_cont_value_err(self):
         self.build_tar()
         req = Request.blank('/create_cont_fail/acc/cont/',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.environ['wsgi.input'] = open(os.path.join(self.testdir,
                                                       'tar_fails.tar'), 'rb')
         req.headers['transfer-encoding'] = 'chunked'
@@ -617,6 +699,8 @@ class TestUntar(unittest.TestCase):
             self.assertEqual(
                 resp_data['Errors'][0],
                 ['cont/base_fails1/sub_dir1/sub1_file1', '400 Bad Request'])
+        # We've patched the function out so it doesn't trigger a span.
+        self.assert_span_names(in_memory, ['handle_extract_iter'])
 
     def test_extract_tar_fail_unicode(self):
         dir_tree = [{'sub_dir1': ['sub1_file1']},
@@ -626,6 +710,7 @@ class TestUntar(unittest.TestCase):
         self.build_tar(dir_tree)
         req = Request.blank('/tar_works/acc/',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.environ['wsgi.input'] = open(os.path.join(self.testdir,
                                                       'tar_fails.tar'), 'rb')
         req.headers['transfer-encoding'] = 'chunked'
@@ -643,6 +728,9 @@ class TestUntar(unittest.TestCase):
             '/tar_works/acc/sub_dir2/sub2_file2',
             '/tar_works/acc/good_\xe2\x98\x83/still_good/\xe2\x98\x83',
         ])
+        self.assert_span_names(
+            in_memory,
+            ['handle_extract_iter'] + ['create_container'] * 3)
 
     def test_get_response_body(self):
         txt_body = bulk.get_heartbeat_response_body(
@@ -657,7 +745,7 @@ class TestUntar(unittest.TestCase):
         self.assertTrue(xml_body.endswith(b'\n</root_tag>\n'))
 
 
-class TestDelete(unittest.TestCase):
+class TestDelete(unittest.TestCase, TraceAssertMixin):
     conf = {'delete_concurrency': 1}  # default to old single-threaded behavior
 
     def setUp(self):
@@ -679,6 +767,7 @@ class TestDelete(unittest.TestCase):
 
     def test_bulk_delete_uses_predefined_object_errors(self):
         req = Request.blank('/delete_works/AUTH_Acc')
+        _, in_memory = activate_tracing(req.environ)
         objs_to_delete = [
             {'name': '/c/file_a'},
             {'name': '/c/file_b', 'error': {'code': HTTP_NOT_FOUND,
@@ -699,10 +788,15 @@ class TestDelete(unittest.TestCase):
         self.assertEqual(resp_data['Number Not Found'], 1)
         self.assertEqual(resp_data['Errors'],
                          [['/c/file_c', 'unauthorized']])
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'handle_delete.do_delete',
+             'handle_delete.do_delete', '_process_delete', '_process_delete'])
 
     def test_bulk_delete_works_with_POST_verb(self):
         req = Request.blank('/delete_works/AUTH_Acc', body='/c/f\n/c/f404',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         resp_body = self.handle_delete_and_iter(req)
         self.assertEqual(set(self.app.delete_paths),
@@ -712,10 +806,16 @@ class TestDelete(unittest.TestCase):
         resp_data = utils.json.loads(resp_body)
         self.assertEqual(resp_data['Number Deleted'], 1)
         self.assertEqual(resp_data['Number Not Found'], 1)
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'get_objs_to_delete',
+             'handle_delete.do_delete', 'handle_delete.do_delete',
+             '_process_delete', '_process_delete'])
 
     def test_bulk_delete_works_with_DELETE_verb(self):
         req = Request.blank('/delete_works/AUTH_Acc', body='/c/f\n/c/f404',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'DELETE'
         resp_body = self.handle_delete_and_iter(req)
         self.assertEqual(set(self.app.delete_paths),
@@ -725,6 +825,11 @@ class TestDelete(unittest.TestCase):
         resp_data = utils.json.loads(resp_body)
         self.assertEqual(resp_data['Number Deleted'], 1)
         self.assertEqual(resp_data['Number Not Found'], 1)
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'get_objs_to_delete',
+             'handle_delete.do_delete', 'handle_delete.do_delete',
+             '_process_delete', '_process_delete'])
 
     def test_bulk_delete_bad_content_type(self):
         req = Request.blank('/delete_works/AUTH_Acc',
@@ -733,17 +838,20 @@ class TestDelete(unittest.TestCase):
         req = Request.blank('/delete_works/AUTH_Acc',
                             headers={'Accept': 'application/json',
                                      'Content-Type': 'text/xml'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         req.environ['wsgi.input'] = BytesIO(b'/c/f\n/c/f404')
         resp_body = self.handle_delete_and_iter(req)
         resp_data = utils.json.loads(resp_body)
         self.assertEqual(resp_data['Response Status'], '406 Not Acceptable')
+        self.assert_span_names(in_memory, ['handle_delete_iter'])
 
     def test_bulk_delete_call_and_content_type(self):
         def fake_start_response(*args, **kwargs):
             self.assertEqual(args[1][0], ('Content-Type', 'application/json'))
 
         req = Request.blank('/delete_works/AUTH_Acc?bulk-delete')
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         req.headers['Transfer-Encoding'] = 'chunked'
         req.headers['Accept'] = 'application/json'
@@ -752,6 +860,10 @@ class TestDelete(unittest.TestCase):
         self.assertEqual(
             self.app.delete_paths, ['/delete_works/AUTH_Acc/c/f '])
         self.assertEqual(self.app.calls, 1)
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'Bulk', 'get_objs_to_delete',
+             'handle_delete.do_delete', '_process_delete'])
 
     def test_bulk_delete_get_objs(self):
         req = Request.blank('/delete_works/AUTH_Acc', body='1%20\r\n2\r\n')
@@ -778,6 +890,7 @@ class TestDelete(unittest.TestCase):
         req = Request.blank('/delete_works/AUTH_Acc',
                             body='/c/f\n\n\n/c/f404\n\n\n/c/%2525',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         resp_body = self.handle_delete_and_iter(req)
         self.assertEqual(
@@ -789,6 +902,10 @@ class TestDelete(unittest.TestCase):
         resp_data = utils.json.loads(resp_body)
         self.assertEqual(resp_data['Number Deleted'], 2)
         self.assertEqual(resp_data['Number Not Found'], 1)
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'get_objs_to_delete'] +
+            ['handle_delete.do_delete', '_process_delete'] * 3)
 
     def test_bulk_delete_too_many_newlines(self):
         req = Request.blank('/delete_works/AUTH_Acc')
@@ -805,6 +922,7 @@ class TestDelete(unittest.TestCase):
                 b'/c/f\xdebadutf8\n')
         req = Request.blank('/delete_works/AUTH_Acc', body=body,
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         resp_body = self.handle_delete_and_iter(req)
         self.assertEqual(
@@ -822,20 +940,31 @@ class TestDelete(unittest.TestCase):
                            '412 Precondition Failed'),
                           ('/c/f%DEbadutf8',
                            '412 Precondition Failed')])))
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'get_objs_to_delete'] +
+            ['handle_delete.do_delete', '_process_delete'] * 2)
 
     def test_bulk_delete_no_body(self):
         req = Request.blank('/unauth/AUTH_acc/')
+        _, in_memory = activate_tracing(req.environ)
         resp_body = self.handle_delete_and_iter(req)
         self.assertIn(b'411 Length Required', resp_body)
+        self.assert_span_names(in_memory,
+                               ['handle_delete_iter', 'get_objs_to_delete'])
 
     def test_bulk_delete_no_files_in_body(self):
         req = Request.blank('/unauth/AUTH_acc/', body=' ')
+        _, in_memory = activate_tracing(req.environ)
         resp_body = self.handle_delete_and_iter(req)
         self.assertIn(b'400 Bad Request', resp_body)
+        self.assert_span_names(in_memory,
+                               ['handle_delete_iter', 'get_objs_to_delete'])
 
     def test_bulk_delete_unauth(self):
         req = Request.blank('/unauth/AUTH_acc/', body='/c/f\n/c/f_ok\n',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         resp_body = self.handle_delete_and_iter(req)
         self.assertEqual(self.app.calls, 2)
@@ -843,10 +972,17 @@ class TestDelete(unittest.TestCase):
         self.assertEqual(resp_data['Errors'], [['/c/f', '401 Unauthorized']])
         self.assertEqual(resp_data['Response Status'], '400 Bad Request')
         self.assertEqual(resp_data['Number Deleted'], 1)
+        # The spans are created, but doesn't mean the delete was a success,
+        # just that we are capturing each attempted delete in spans.
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'get_objs_to_delete'] +
+            ['handle_delete.do_delete', '_process_delete'] * 2)
 
     def test_bulk_delete_500_resp(self):
         req = Request.blank('/broke/AUTH_acc/', body='/c/f\nc/f2\n',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         resp_body = self.handle_delete_and_iter(req)
         resp_data = utils.json.loads(resp_body)
@@ -855,15 +991,24 @@ class TestDelete(unittest.TestCase):
             Counter([('/c/f', '500 Internal Error'),
                      ('c/f2', '500 Internal Error')]))
         self.assertEqual(resp_data['Response Status'], '502 Bad Gateway')
+        # The spans are created, but doesn't mean the delete was a success,
+        # just that we are capturing each attempted delete in spans.
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'get_objs_to_delete'] +
+            ['handle_delete.do_delete', '_process_delete'] * 2)
 
     def test_bulk_delete_bad_path(self):
         req = Request.blank('/delete_cont_fail/')
+        _, in_memory = activate_tracing(req.environ)
         resp_body = self.handle_delete_and_iter(req)
         self.assertIn(b'404 Not Found', resp_body)
+        self.assert_span_names(in_memory, ['handle_delete_iter'])
 
     def test_bulk_delete_container_delete(self):
         req = Request.blank('/delete_cont_fail/AUTH_Acc', body='c\n',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         with patch('swift.common.middleware.bulk.sleep',
                    new=mock.MagicMock(wraps=sleep,
@@ -874,11 +1019,18 @@ class TestDelete(unittest.TestCase):
             self.assertEqual(resp_data['Errors'], [['c', '409 Conflict']])
             self.assertEqual(resp_data['Response Status'], '400 Bad Request')
             self.assertEqual([], mock_sleep.call_args_list)
+        # The span is created, but doesn't mean the delete was a success,
+        # just that we are capturing each attempted delete in a span.
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'get_objs_to_delete', '_process_delete',
+             'handle_delete.do_delete'])
 
     def test_bulk_delete_container_delete_retry_and_fails(self):
         self.bulk.retry_count = 3
         req = Request.blank('/delete_cont_fail/AUTH_Acc', body='c\n',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         with patch('swift.common.middleware.bulk.sleep',
                    new=mock.MagicMock(wraps=sleep,
@@ -892,12 +1044,20 @@ class TestDelete(unittest.TestCase):
                               call(self.bulk.retry_interval ** 2),
                               call(self.bulk.retry_interval ** 3)],
                              mock_sleep.call_args_list)
+        # The span is created, but doesn't mean the delete was a success,
+        # just that we are capturing each attempted delete in a span.
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'get_objs_to_delete',
+             'handle_delete.do_delete', '_process_delete', '_process_delete',
+             '_process_delete', '_process_delete'])
 
     def test_bulk_delete_container_delete_retry_and_success(self):
         self.bulk.retry_count = 3
         self.app.del_container_total = 2
         req = Request.blank('/delete_cont_success_after_attempts/AUTH_Acc',
                             body='c\n', headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'DELETE'
         with patch('swift.common.middleware.bulk.sleep',
                    new=mock.MagicMock(wraps=sleep,
@@ -910,10 +1070,16 @@ class TestDelete(unittest.TestCase):
             self.assertEqual([call(self.bulk.retry_interval),
                               call(self.bulk.retry_interval ** 2)],
                              mock_sleep.call_args_list)
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'get_objs_to_delete',
+             'handle_delete.do_delete', '_process_delete', '_process_delete',
+             '_process_delete'])
 
     def test_bulk_delete_bad_file_too_long(self):
         req = Request.blank('/delete_works/AUTH_Acc',
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         bad_file = 'c/' + ('1' * self.bulk.max_path_length)
         data = b'/c/f\n' + bad_file.encode('ascii') + b'\n/c/f'
@@ -924,13 +1090,22 @@ class TestDelete(unittest.TestCase):
         self.assertEqual(resp_data['Number Deleted'], 2)
         self.assertEqual(resp_data['Errors'], [[bad_file, '400 Bad Request']])
         self.assertEqual(resp_data['Response Status'], '400 Bad Request')
+        # The spans are created, but doesn't mean the delete was a success,
+        # just that we are capturing each attempted delete in a span.
+        self.assert_span_names(
+            in_memory,
+            ['handle_delete_iter', 'get_objs_to_delete'] +
+            ['handle_delete.do_delete', '_process_delete'] * 3)
 
     def test_bulk_delete_bad_file_over_twice_max_length(self):
         body = '/c/f\nc/' + ('123456' * self.bulk.max_path_length) + '\n'
         req = Request.blank('/delete_works/AUTH_Acc', body=body)
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         resp_body = self.handle_delete_and_iter(req)
         self.assertIn(b'400 Bad Request', resp_body)
+        self.assert_span_names(in_memory,
+                               ['handle_delete_iter', 'get_objs_to_delete'])
 
     def test_bulk_delete_max_failures(self):
         body = '\n'.join([
@@ -938,6 +1113,7 @@ class TestDelete(unittest.TestCase):
         ])
         req = Request.blank('/unauth/AUTH_Acc', body=body,
                             headers={'Accept': 'application/json'})
+        _, in_memory = activate_tracing(req.environ)
         req.method = 'POST'
         with patch.object(self.bulk, 'max_failed_deletes', 2):
             resp_body = self.handle_delete_and_iter(req)
@@ -962,6 +1138,10 @@ class TestDelete(unittest.TestCase):
                              'Max delete failures exceeded')
             self.assertIn(['/c/f1', '401 Unauthorized'], resp_data['Errors'])
             self.assertIn(['/c/f2', '401 Unauthorized'], resp_data['Errors'])
+        # The spans are created, but doesn't mean the delete was a success,
+        # just that we are capturing each attempted delete in a span.
+        self.assertIn('handle_delete.do_delete',
+                      [s.name for s in in_memory.get_finished_spans()])
 
 
 class TestConcurrentDelete(TestDelete):

@@ -32,6 +32,7 @@ from test.debug_logger import debug_logger
 from test.unit.common.middleware.crypto.crypto_helpers import md5hex, \
     fetch_crypto_keys, FAKE_IV, encrypt, fake_get_crypto_meta
 from test.unit.common.middleware.helpers import FakeSwift, FakeAppThatExcepts
+from test.unit import activate_tracing, TraceAssertMixin
 
 
 def get_crypto_meta_header(crypto_meta=None):
@@ -48,7 +49,7 @@ def encrypt_and_append_meta(value, key, crypto_meta=None):
         get_crypto_meta_header(crypto_meta))
 
 
-class TestDecrypterObjectRequests(unittest.TestCase):
+class TestDecrypterObjectRequests(unittest.TestCase, TraceAssertMixin):
     def setUp(self):
         self.app = FakeSwift()
         self.decrypter = decrypter.Decrypter(self.app, {})
@@ -92,6 +93,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': method,
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         plaintext_etag = md5hex(body)
         body_key = os.urandom(32)
         enc_body = encrypt(body, body_key, FAKE_IV)
@@ -126,6 +128,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertNotIn('X-Object-Sysmeta-Crypto-Body-Meta', resp.headers)
         self.assertNotIn('X-Object-Sysmeta-Crypto-Etag', resp.headers)
         self.assertNotIn('Access-Control-Expose-Headers', resp.headers)
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
         return resp
 
     def test_GET_success(self):
@@ -158,6 +163,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': method,
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         data_key_id = {}
         metadata_key_id = {'secret_id': 'myid'}
         body = b'object data'
@@ -189,6 +195,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual(
             'encrypt me, too',
             resp.headers['X-Object-Sysmeta-Container-Update-Override-Etag'])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
         return resp
 
     def test_GET_different_keys_for_data_and_metadata(self):
@@ -203,6 +212,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': method,
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'object data'
         plaintext_etag = md5hex(body)
         metadata_key = fetch_crypto_keys()
@@ -228,6 +238,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual('text/plain', resp.headers['Content-Type'])
         self.assertEqual('encrypt me', resp.headers['x-object-meta-test'])
         self.assertNotIn('Access-Control-Expose-Headers', resp.headers)
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
         return resp
 
     def test_GET_unencrypted_data_and_encrypted_metadata(self):
@@ -242,6 +255,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': method,
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'object data'
         plaintext_etag = md5hex(body)
         body_key = os.urandom(32)
@@ -262,6 +276,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual('text/plain', resp.headers['Content-Type'])
         self.assertEqual('unencrypted', resp.headers['x-object-meta-test'])
         self.assertNotIn('Access-Control-Expose-Headers', resp.headers)
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
         return resp
 
     def test_GET_encrypted_data_and_unencrypted_metadata(self):
@@ -276,6 +293,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         body = b'fAkE ApP'
         req = Request.blank('/v1/a/c/o', body='FaKe', headers={
             'Origin': 'http://example.com'})
+        _, in_memory = activate_tracing(req.environ)
         req.environ[CRYPTO_KEY_CALLBACK] = fetch_crypto_keys
         plaintext_etag = md5hex(body)
         body_key = os.urandom(32)
@@ -311,12 +329,16 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         }
         self.assertEqual(dict(headers), expected)
         self.assertEqual(b'fAkE ApP', b''.join(app_iter))
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     def _test_412_response(self, method):
         # simulate a 412 response to a conditional GET which has an Etag header
         data = b'the object content'
         env = {CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env, method=method)
+        _, in_memory = activate_tracing(req.environ)
         resp_body = b'I am sorry, you have failed to meet a precondition'
         hdrs = self._make_response_headers(
             len(resp_body), md5hex(data), fetch_crypto_keys(), b'not used')
@@ -333,6 +355,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual('encrypt me', resp.headers['x-object-meta-test'])
         self.assertEqual('do not encrypt me',
                          resp.headers['x-object-sysmeta-test'])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     def test_GET_412_response(self):
         self._test_412_response('GET')
@@ -344,6 +369,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         # simulate a 404 response, sanity check response headers
         env = {CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env, method=method)
+        _, in_memory = activate_tracing(req.environ)
         resp_body = b'You still have not found what you are looking for'
         hdrs = {'content-type': 'text/plain',
                 'content-length': len(resp_body)}
@@ -357,6 +383,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         # there should be no etag header inserted by decrypter
         self.assertNotIn('Etag', resp.headers)
         self.assertEqual('text/plain', resp.headers['Content-Type'])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     def test_GET_404_response(self):
         self._test_404_response('GET')
@@ -368,6 +397,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         key = fetch_crypto_keys()['object']
         enc_body = encrypt(body, key, FAKE_IV)
@@ -383,11 +413,15 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertIn(b'Error decrypting header', resp.body)
         self.assertIn('Error decrypting header X-Object-Sysmeta-Crypto-Etag',
                       self.decrypter.logger.get_lines_for_level('error')[0])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     def _test_override_etag_bad_meta(self, method, bad_crypto_meta):
         env = {'REQUEST_METHOD': method,
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         key = fetch_crypto_keys()['object']
         enc_body = encrypt(body, key, FAKE_IV)
@@ -404,6 +438,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertIn('Error decrypting header '
                       'X-Object-Sysmeta-Container-Update-Override-Etag',
                       self.decrypter.logger.get_lines_for_level('error')[0])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
         return resp
 
     def test_GET_override_etag_bad_iv(self):
@@ -440,6 +477,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': method,
                CRYPTO_KEY_CALLBACK: bad_fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         key = fetch_crypto_keys()['object']
         enc_body = encrypt(body, key, FAKE_IV)
@@ -447,7 +485,11 @@ class TestDecrypterObjectRequests(unittest.TestCase):
             len(body), md5hex(body), fetch_crypto_keys(), b'not used')
         self.app.register(method, '/v1/a/c/o', HTTPOk, body=enc_body,
                           headers=hdrs)
-        return req.get_response(self.decrypter)
+        resp = req.get_response(self.decrypter)
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'Decrypter'])
+        return resp
 
     def test_HEAD_with_bad_key(self):
         resp = self._test_bad_key('HEAD')
@@ -468,6 +510,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': method,
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         key = fetch_crypto_keys()['object']
         enc_body = encrypt(body, key, FAKE_IV)
@@ -487,6 +530,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertIn(
             'Error decrypting header X-Object-Transient-Sysmeta-Crypto-Meta-'
             'Test', self.decrypter.logger.get_lines_for_level('error')[0])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
         return resp
 
     def test_HEAD_with_missing_crypto_meta_for_user_metadata(self):
@@ -531,11 +577,13 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertIn(
             'iv', self.decrypter.logger.get_lines_for_level('error')[0])
 
-    def _test_GET_with_bad_crypto_meta_for_object_body(self, bad_crypto_meta):
+    def _test_GET_with_bad_crypto_meta_for_object_body(
+            self, bad_crypto_meta, calls_decript_headers=False):
         # use bad iv for object body
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         key = fetch_crypto_keys()['object']
         enc_body = encrypt(body, key, FAKE_IV)
@@ -550,6 +598,12 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual(b'Error decrypting object', resp.body)
         self.assertIn('Error decrypting object',
                       self.decrypter.logger.get_lines_for_level('error')[0])
+        expected_spans = ['FakeSwift', 'handle', 'Decrypter']
+        if calls_decript_headers:
+            expected_spans = ['FakeSwift', 'handle', 'decrypt_resp_headers',
+                              'Decrypter']
+        self.assert_span_names(
+            in_memory, expected_spans)
 
     def test_GET_with_bad_iv_for_object_body(self):
         bad_crypto_meta = fake_get_crypto_meta(key=os.urandom(32))
@@ -568,13 +622,15 @@ class TestDecrypterObjectRequests(unittest.TestCase):
     def test_GET_with_bad_body_key_for_object_body(self):
         body_key_meta = {'key': b'wrapped too short key', 'iv': FAKE_IV}
         bad_crypto_meta = fake_get_crypto_meta(body_key=body_key_meta)
-        self._test_GET_with_bad_crypto_meta_for_object_body(bad_crypto_meta)
+        self._test_GET_with_bad_crypto_meta_for_object_body(
+            bad_crypto_meta, True)
         self.assertIn('Key must be length 32',
                       self.decrypter.logger.get_lines_for_level('error')[0])
 
     def test_GET_with_missing_body_key_for_object_body(self):
         bad_crypto_meta = fake_get_crypto_meta()  # no key by default
-        self._test_GET_with_bad_crypto_meta_for_object_body(bad_crypto_meta)
+        self._test_GET_with_bad_crypto_meta_for_object_body(
+            bad_crypto_meta, True)
         self.assertIn("Missing 'body_key'",
                       self.decrypter.logger.get_lines_for_level('error')[0])
 
@@ -584,6 +640,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': method,
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         plaintext_etag = md5hex(body)
         body_key = os.urandom(32)
@@ -600,6 +657,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual('text/plain', resp.headers['Content-Type'])
         self.assertEqual('plaintext not encrypted',
                          resp.headers['x-object-meta-test'])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     def test_HEAD_metadata_not_encrypted(self):
         self._test_req_metadata_not_encrypted('HEAD')
@@ -613,6 +673,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         obj_key = fetch_crypto_keys()['object']
         hdrs = {'Etag': md5hex(body),
@@ -634,11 +695,15 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         # PUT sysmeta was not encrypted
         self.assertEqual('do not encrypt me',
                          resp.headers['x-object-sysmeta-test'])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     def test_GET_multiseg(self):
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         chunks = [b'some', b'chunks', b'of data']
         body = b''.join(chunks)
         plaintext_etag = md5hex(body)
@@ -655,11 +720,15 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual('200 OK', resp.status)
         self.assertEqual(plaintext_etag, resp.headers['Etag'])
         self.assertEqual('text/plain', resp.headers['Content-Type'])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     def test_GET_multiseg_with_range(self):
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         req.headers['Content-Range'] = 'bytes 3-10/17'
         chunks = [b'0123', b'45678', b'9abcdef']
         body = b''.join(chunks)
@@ -679,6 +748,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual('200 OK', resp.status)
         self.assertEqual(plaintext_etag, resp.headers['Etag'])
         self.assertEqual('text/plain', resp.headers['Content-Type'])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     # Force the decrypter context updates to be less than one of our range
     # sizes to check that the decrypt context offset is setup correctly with
@@ -716,6 +788,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         resp = req.get_response(self.decrypter)
 
         self.assertEqual('206 Partial Content', resp.status)
@@ -723,6 +796,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual(len(body), int(resp.headers['Content-Length']))
         self.assertEqual('multipart/byteranges;boundary=multipartboundary',
                          resp.headers['Content-Type'])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
         # the multipart headers could be re-ordered, so parse response body to
         # verify expected content
@@ -762,6 +838,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         resp = req.get_response(self.decrypter)
 
         self.assertEqual('200 OK', resp.status)
@@ -770,6 +847,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertEqual('multipart/byteranges;boundary=multipartboundary',
                          resp.headers['Content-Type'])
         self.assertEqual(plaintext, resp.body)
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     def test_GET_multipart_no_body_crypto_meta(self):
         # build fake multipart response body
@@ -799,6 +879,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         resp = req.get_response(self.decrypter)
 
         self.assertEqual('206 Partial Content', resp.status)
@@ -809,6 +890,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
 
         # the multipart response body should be unchanged
         self.assertEqual(body, resp.body)
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     def _test_GET_multipart_bad_body_crypto_meta(self, bad_crypto_meta):
         # build fake multipart response body
@@ -842,12 +926,16 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         resp = req.get_response(self.decrypter)
 
         self.assertEqual('500 Internal Error', resp.status)
         self.assertEqual(b'Error decrypting object', resp.body)
         self.assertIn('Error decrypting object',
                       self.decrypter.logger.get_lines_for_level('error')[0])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'Decrypter'])
 
     def test_GET_multipart_bad_body_cipher(self):
         self._test_GET_multipart_bad_body_crypto_meta(
@@ -883,6 +971,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         # Do not provide keys, and do not set override flag
         env = {'REQUEST_METHOD': 'GET'}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         enc_body = encrypt(body, fetch_crypto_keys()['object'], FAKE_IV)
         hdrs = self._make_response_headers(
@@ -896,6 +985,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
                          resp.body)
         self.assertIn('missing callback',
                       self.decrypter.logger.get_lines_for_level('error')[0])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'Decrypter'])
 
     def test_GET_error_in_key_callback(self):
         def raise_exc(**kwargs):
@@ -904,6 +996,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: raise_exc}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         enc_body = encrypt(body, fetch_crypto_keys()['object'], FAKE_IV)
         hdrs = self._make_response_headers(
@@ -916,12 +1009,16 @@ class TestDecrypterObjectRequests(unittest.TestCase):
                          resp.body)
         self.assertIn('from callback: Testing',
                       self.decrypter.logger.get_lines_for_level('error')[0])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'Decrypter'])
 
     def test_GET_cipher_mismatch_for_body(self):
         # Cipher does not match
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         enc_body = encrypt(body, fetch_crypto_keys()['object'], FAKE_IV)
         bad_crypto_meta = fake_get_crypto_meta()
@@ -939,12 +1036,16 @@ class TestDecrypterObjectRequests(unittest.TestCase):
                       self.decrypter.logger.get_lines_for_level('error')[0])
         self.assertIn('Bad crypto meta: Cipher',
                       self.decrypter.logger.get_lines_for_level('error')[0])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'Decrypter'])
 
     def test_GET_cipher_mismatch_for_metadata(self):
         # Cipher does not match
         env = {'REQUEST_METHOD': 'GET',
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         key = fetch_crypto_keys()['object']
         enc_body = encrypt(body, key, FAKE_IV)
@@ -966,6 +1067,9 @@ class TestDecrypterObjectRequests(unittest.TestCase):
         self.assertIn(
             'Error decrypting header X-Object-Transient-Sysmeta-Crypto-Meta-'
             'Test', self.decrypter.logger.get_lines_for_level('error')[0])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'decrypt_resp_headers', 'Decrypter'])
 
     def test_GET_decryption_override(self):
         # This covers the case of an old un-encrypted object
@@ -973,6 +1077,7 @@ class TestDecrypterObjectRequests(unittest.TestCase):
                CRYPTO_KEY_CALLBACK: fetch_crypto_keys,
                'swift.crypto.override': True}
         req = Request.blank('/v1/a/c/o', environ=env)
+        _, in_memory = activate_tracing(req.environ)
         body = b'FAKE APP'
         hdrs = {'Etag': md5hex(body),
                 'content-type': 'text/plain',
@@ -989,16 +1094,19 @@ class TestDecrypterObjectRequests(unittest.TestCase):
                          resp.headers['x-object-meta-test'])
         self.assertEqual('do not encrypt me',
                          resp.headers['x-object-sysmeta-test'])
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'handle', 'Decrypter'])
 
 
-class TestDecrypterContainerRequests(unittest.TestCase):
+class TestDecrypterContainerRequests(unittest.TestCase, TraceAssertMixin):
     def setUp(self):
         self.app = FakeSwift()
         self.decrypter = decrypter.Decrypter(self.app, {})
         self.decrypter.logger = debug_logger()
 
     def _make_cont_get_req(self, resp_body, format, override=False,
-                           callback=fetch_crypto_keys):
+                           callback=fetch_crypto_keys, expected_spans=None):
         path = '/v1/a/c'
         content_type = 'text/plain'
         if format:
@@ -1009,9 +1117,19 @@ class TestDecrypterContainerRequests(unittest.TestCase):
         if override:
             env['swift.crypto.override'] = True
         req = Request.blank(path, environ=env)
+        _, in_memory = activate_tracing(req.environ)
         hdrs = {'content-type': content_type}
         self.app.register('GET', path, HTTPOk, body=resp_body, headers=hdrs)
-        return req.get_response(self.decrypter)
+        resp = req.get_response(self.decrypter)
+        if not expected_spans:
+            if format == 'json':
+                expected_spans = ['FakeSwift', 'decrypt_obj_dict',
+                                  'process_json_resp', 'handle', 'Decrypter']
+            else:
+                expected_spans = ['FakeSwift', 'Decrypter', 'handle']
+        self.assert_span_names(
+            in_memory, expected_spans)
+        return resp
 
     def test_GET_container_success(self):
         # no format requested, listing has names only
@@ -1022,8 +1140,8 @@ class TestDecrypterContainerRequests(unittest.TestCase):
             calls[0] += 1
             return fetch_crypto_keys()
 
-        resp = self._make_cont_get_req(fake_body, None,
-                                       callback=wrapped_fetch_crypto_keys)
+        resp = self._make_cont_get_req(
+            fake_body, None, callback=wrapped_fetch_crypto_keys)
 
         self.assertEqual('200 OK', resp.status)
         self.assertEqual(resp.body.split(b'\n'), [
@@ -1059,7 +1177,12 @@ class TestDecrypterContainerRequests(unittest.TestCase):
         listing = [subdir, obj_dict_1, obj_dict_2]
         fake_body = json.dumps(listing).encode('ascii')
 
-        resp = self._make_cont_get_req(fake_body, 'json')
+        expected_spans = [
+            'FakeSwift', 'Decrypter',
+            'decrypt_obj_dict', 'decrypt_obj_dict', 'decrypt_obj_dict',
+            'process_json_resp', 'handle']
+        resp = self._make_cont_get_req(fake_body, 'json',
+                                       expected_spans=expected_spans)
 
         self.assertEqual('200 OK', resp.status)
         body = resp.body
@@ -1093,7 +1216,12 @@ class TestDecrypterContainerRequests(unittest.TestCase):
         listing = [obj_dict_1, obj_dict_2]
         fake_body = json.dumps(listing).encode('ascii')
 
-        resp = self._make_cont_get_req(fake_body, 'json', override=True)
+        expected_spans = [
+            'FakeSwift', 'Decrypter',
+            'decrypt_obj_dict', 'decrypt_obj_dict',
+            'process_json_resp', 'handle']
+        resp = self._make_cont_get_req(fake_body, 'json', override=True,
+                                       expected_spans=expected_spans)
 
         self.assertEqual('200 OK', resp.status)
         body = resp.body

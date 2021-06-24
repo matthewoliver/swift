@@ -22,6 +22,7 @@ from swift.common.utils import public, config_true_value, \
     LOG_LINE_DEFAULT_FORMAT
 from swift.common.http import is_server_error
 from swift.common.swob import Response, HTTPException
+from swift.common.trace import trace_function
 
 
 class TimingBreakdown(object):
@@ -208,6 +209,7 @@ class BaseStorageServer(object):
         return self._allowed_methods
 
     @public
+    @trace_function
     @timing_stats()
     def OPTIONS(self, req):
         """

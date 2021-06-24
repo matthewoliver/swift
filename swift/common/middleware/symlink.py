@@ -204,6 +204,7 @@ from swift.common.utils import get_logger, split_path, \
     MD5_OF_EMPTY_STRING, close_if_possible, closing_if_possible, \
     config_true_value, drain_and_close, parse_header
 from swift.common.registry import register_swift_info
+from swift.common.trace import wsgi_trace, trace_function
 from swift.common.constraints import check_account_format
 from swift.common.wsgi import WSGIContext, make_subrequest, \
     make_pre_authed_request
@@ -335,6 +336,7 @@ class SymlinkContainerContext(WSGIContext):
         super(SymlinkContainerContext, self).__init__(wsgi_app)
         self.logger = logger
 
+    @trace_function
     def handle_container(self, req, start_response):
         """
         Handle container requests.
@@ -412,6 +414,7 @@ class SymlinkObjectContext(WSGIContext):
         self._loop_count = 0
         self._last_target_path = None
 
+    @trace_function
     def handle_get_head_symlink(self, req):
         """
         Handle get/head request when client sent parameter ?symlink=get
@@ -425,6 +428,7 @@ class SymlinkObjectContext(WSGIContext):
         self._response_headers = list(response_header_dict.items())
         return resp
 
+    @trace_function
     def handle_get_head(self, req):
         """
         Handle get/head request and in case the response is a symlink,
@@ -526,6 +530,7 @@ class SymlinkObjectContext(WSGIContext):
 
             return resp
 
+    @trace_function
     def _validate_etag_and_update_sysmeta(self, req, symlink_target_path,
                                           etag):
         if req.environ.get('swift.symlink_override'):
@@ -577,6 +582,7 @@ class SymlinkObjectContext(WSGIContext):
         if not req.headers.get('Content-Type'):
             req.headers['Content-Type'] = response_headers['Content-Type']
 
+    @trace_function
     def handle_put(self, req):
         """
         Handle put request when it contains X-Symlink-Target header.
@@ -638,6 +644,7 @@ class SymlinkObjectContext(WSGIContext):
 
         return self._app_call(req.environ)
 
+    @trace_function
     def handle_post(self, req):
         """
         Handle post request. If POSTing to a symlink, a HTTPTemporaryRedirect
@@ -689,6 +696,7 @@ class SymlinkObjectContext(WSGIContext):
         else:
             return resp
 
+    @trace_function
     def handle_object(self, req, start_response):
         """
         Handle object requests.
@@ -717,6 +725,7 @@ class SymlinkObjectContext(WSGIContext):
         return resp
 
 
+@wsgi_trace
 class SymlinkMiddleware(object):
     """
     Middleware that implements symlinks.

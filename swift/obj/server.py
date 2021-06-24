@@ -26,7 +26,6 @@ import traceback
 import socket
 
 from eventlet import sleep, wsgi, Timeout, tpool
-from eventlet.greenthread import spawn
 
 from swift.common.utils import public, get_logger, \
     config_true_value, config_percent_value, \
@@ -34,7 +33,8 @@ from swift.common.utils import public, get_logger, \
     get_log_line, Timestamp, parse_mime_headers, \
     iter_multipart_mime_documents, extract_swift_bytes, safe_json_loads, \
     config_auto_int_value, split_path, get_redirect_data, \
-    normalize_timestamp, md5, parse_options, CooperativeIterator
+    normalize_timestamp, md5, parse_options, CooperativeIterator, \
+    TraceAwareGreenPile
 from swift.common.bufferedhttp import http_connect
 from swift.common.constraints import check_object_creation, \
     valid_timestamp, check_utf8, AUTO_CREATE_ACCOUNT_PREFIX
@@ -66,6 +66,8 @@ from swift.container.backend import SHARDED
 from swift.obj.diskfile import RESERVED_DATAFILE_META, DiskFileRouter
 from swift.obj.expirer import build_task_obj, embed_expirer_bytes_in_ctype, \
     X_DELETE_TYPE
+from swift.common.trace import wsgi_trace, get_trace_headers, trace_add, \
+    trace_exception, trace_function
 
 
 LABELED_METRIC_NAME = 'swift_object_server_request_timing'
@@ -135,6 +137,7 @@ class EventletPlungerString(bytes):
         return wsgi.MINIMUM_CHUNK_SIZE + 1
 
 
+@wsgi_trace
 class ObjectController(BaseStorageServer):
     """Implements the WSGI application for the Swift Object Server."""
 
@@ -279,8 +282,9 @@ class ObjectController(BaseStorageServer):
         return self._diskfile_router[policy].get_diskfile(
             device, partition, account, container, obj, policy, **kwargs)
 
+    @trace_function
     def async_update(self, op, account, container, obj, host, partition,
-                     contdevice, headers_out, objdevice, policy,
+                     contdevice, headers_out, objdevice, policy, request,
                      logger_thread_locals=None, container_path=None,
                      db_state=None, attempt_sync_update=True):
         """
@@ -297,6 +301,7 @@ class ObjectController(BaseStorageServer):
                             request
         :param objdevice: device name that the object is in
         :param policy: the associated BaseStoragePolicy instance
+        :param request: The original request received by the server
         :param logger_thread_locals: The thread local values to be set on the
                                      self.logger to retain transaction
                                      logging information.
@@ -311,7 +316,11 @@ class ObjectController(BaseStorageServer):
         """
         if logger_thread_locals:
             self.logger.thread_locals = logger_thread_locals
+        # let's use a copy of headers_out
+        headers_out = HeaderKeyDict(headers_out.copy())
         headers_out['user-agent'] = 'object-server %s' % os.getpid()
+        headers_out.update(get_trace_headers(request.environ))
+
         if container_path:
             # use explicitly specified container path
             full_path = '/%s/%s' % (container_path, obj)
@@ -327,8 +336,8 @@ class ObjectController(BaseStorageServer):
                 # Do an sync update
                 with ConnectionTimeout(self.conn_timeout):
                     ip, port = host.rsplit(':', 1)
-                    conn = http_connect(ip, port, contdevice, partition, op,
-                                        full_path, headers_out)
+                    conn = http_connect(ip, port, contdevice, partition,
+                                        op, full_path, headers_out)
                 with Timeout(self.node_timeout):
                     response = conn.getresponse()
                     response.read()
@@ -341,29 +350,33 @@ class ObjectController(BaseStorageServer):
                     try:
                         redirect_data = get_redirect_data(response)
                     except ValueError as err:
+                        trace_exception(err)
                         self.logger.error(
                             'Container update failed for %r; problem with '
                             'redirect location: %s' % (obj, err))
                     else:
                         success = True
                 else:
-                    self.logger.error(
-                        'ERROR Container update failed '
-                        '(saving for async update later): %(status)d '
-                        'response from %(ip)s:%(port)s/%(dev)s',
-                        {'status': response.status, 'ip': ip, 'port': port,
-                         'dev': contdevice})
+                    msg = ('ERROR Container update failed '
+                           '(saving for async update later): %(status)d '
+                           'response from %(ip)s:%(port)s/%(dev)s' %
+                           {'status': response.status, 'ip': ip,
+                            'port': port, 'dev': contdevice})
+                    self.logger.error(msg)
+                    trace_add('error', msg, request.environ)
 
         except (Exception, Timeout) as e:
             if isinstance(e, Timeout):
                 status_or_error = 'timeout'
             else:
                 status_or_error = 'exception'
-            self.logger.exception(
-                'ERROR container update failed (%(error_type)s) with '
-                '%(ip)s:%(port)s/%(dev)s (saving for async update later)',
+            msg = ('ERROR container update failed (%(error_type)s) with '
+                '%(ip)s:%(port)s/%(dev)s (saving for async update later)' %
                 {'ip': ip, 'port': port, 'dev': contdevice,
                  'error_type': status_or_error})
+            self.logger.exception(msg)
+            trace_exception(ex, request.environ)
+            trace_add('Error', msg, request.environ)
         finally:
             # self.stats.increment('sync_update', **sync_update_ctx)
             if skip:
@@ -387,6 +400,7 @@ class ObjectController(BaseStorageServer):
         self._diskfile_router[policy].pickle_async_update(
             objdevice, account, container, obj, data, timestamp, policy)
 
+    @trace_function
     def container_update(self, op, account, container, obj, request,
                          headers_out, objdevice, policy):
         """
@@ -459,15 +473,14 @@ class ObjectController(BaseStorageServer):
         headers_out['x-trans-id'] = headers_in.get('x-trans-id', '-')
         headers_out['referer'] = request.as_referer()
         headers_out['X-Backend-Storage-Policy-Index'] = int(policy)
-        update_greenthreads = []
+        pile = TraceAwareGreenPile(len(updates), request.environ)
         for conthost, contdevice in updates:
-            gt = spawn(self.async_update, op, account, container, obj,
+            pile.spawn(self.async_update, op, account, container, obj,
                        conthost, contpartition, contdevice, headers_out,
-                       objdevice, policy,
+                       objdevice, policy, request,
                        logger_thread_locals=self.logger.thread_locals,
                        container_path=contpath, db_state=contdbstate,
                        attempt_sync_update=not skip_sync_update)
-            update_greenthreads.append(gt)
         # Wait a little bit to see if the container updates are successful.
         # If we immediately return after firing off the greenthread above, then
         # we're more likely to confuse the end-user who does a listing right
@@ -476,14 +489,16 @@ class ObjectController(BaseStorageServer):
         # one slow container server doesn't make the entire request lag.
         try:
             with Timeout(self.container_update_timeout):
-                for gt in update_greenthreads:
-                    gt.wait()
-        except Timeout:
+                all(pile)
+        except Timeout as ex:
             # updates didn't go through, log it and return
-            self.logger.debug(
-                'Container update timeout (%.4fs) waiting for %s',
+            msg = 'Container update timeout (%.4fs) waiting for %s' % (
                 self.container_update_timeout, updates)
+            self.logger.debug(msg)
+            trace_add('Timeout', msg, request.environ)
+            trace_exception(ex, request.environ)
 
+    @trace_function
     def delete_at_update(self, op, delete_at, account, container, obj,
                          request, objdevice, policy, extra_headers=None):
         """
@@ -575,7 +590,7 @@ class ObjectController(BaseStorageServer):
                 op, expiring_objects_account_name, delete_at_container,
                 build_task_obj(delete_at, account, container, obj),
                 host, partition, contdevice, headers_out, objdevice,
-                policy)
+                policy, request)
 
     def _make_timeout_reader(self, file_like):
         def timeout_reader():
@@ -694,6 +709,7 @@ class ObjectController(BaseStorageServer):
                 request, device, policy)
 
     @public
+    @trace_function
     @timing_stats()
     @labeled_timing_stats(metric=LABELED_METRIC_NAME)
     def POST(self, request, timing_stats_labels):
@@ -951,6 +967,7 @@ class ObjectController(BaseStorageServer):
             multi_stage_mime_state = {}
         return obj_input, multi_stage_mime_state
 
+    @trace_function
     def _stage_obj_data(self, request, device, obj_input, writer, fsize):
         """
         Feed the object_input into the writer.
@@ -984,6 +1001,7 @@ class ObjectController(BaseStorageServer):
                 upload_size)
         return upload_size, etag
 
+    @trace_function
     def _get_request_metadata(self, request, upload_size, etag):
         """
         Pull object metadata off the request.
@@ -1072,6 +1090,7 @@ class ObjectController(BaseStorageServer):
         except StopIteration:
             pass
 
+    @trace_function
     def _post_commit_updates(self, request, device,
                              account, container, obj, policy,
                              orig_metadata, footers_metadata, metadata):
@@ -1095,6 +1114,7 @@ class ObjectController(BaseStorageServer):
             update_headers, device, policy)
 
     @public
+    @trace_function
     @timing_stats()
     @labeled_timing_stats(metric=LABELED_METRIC_NAME)
     def PUT(self, request, timing_stats_labels):
@@ -1144,6 +1164,7 @@ class ObjectController(BaseStorageServer):
         return HTTPCreated(request=request, etag=etag)
 
     @public
+    @trace_function
     @timing_stats()
     @labeled_timing_stats(metric=LABELED_METRIC_NAME)
     def GET(self, request, timing_stats_labels):
@@ -1234,6 +1255,7 @@ class ObjectController(BaseStorageServer):
         return resp
 
     @public
+    @trace_function
     @timing_stats(sample_rate=0.8)
     @labeled_timing_stats(metric=LABELED_METRIC_NAME)
     def HEAD(self, request, timing_stats_labels):
@@ -1322,6 +1344,7 @@ class ObjectController(BaseStorageServer):
             return False
 
     @public
+    @trace_function
     @timing_stats()
     @labeled_timing_stats(metric=LABELED_METRIC_NAME)
     @request_timing_logging(threshold_attr='slow_delete_log_threshold')
@@ -1440,6 +1463,7 @@ class ObjectController(BaseStorageServer):
 
     @public
     @replication
+    @trace_function
     @timing_stats(sample_rate=0.1)
     @labeled_timing_stats(metric=LABELED_METRIC_NAME)
     def REPLICATE(self, request, timing_stats_labels):
@@ -1471,6 +1495,7 @@ class ObjectController(BaseStorageServer):
 
     @public
     @replication
+    @trace_function
     @timing_stats(sample_rate=0.1)
     @labeled_timing_stats(metric=LABELED_METRIC_NAME)
     def SSYNC(self, request, timing_stats_labels):
@@ -1503,11 +1528,12 @@ class ObjectController(BaseStorageServer):
                 res = HTTPForbidden(request=req)
             except HTTPException as error_response:
                 res = error_response
-            except (Exception, Timeout):
+            except (Exception, Timeout) as ex:
                 self.logger.exception(
                     'ERROR __call__ error with %(method)s'
                     ' %(path)s ', {'method': req.method, 'path': req.path})
                 res = HTTPInternalServerError(body=traceback.format_exc())
+                trace_exception(ex, env)
         trans_time = time.time() - start_time
         res.fix_conditional_response()
         if self.log_requests:

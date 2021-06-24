@@ -23,6 +23,7 @@ from swift.common.constraints import check_metadata, CONTAINER_LISTING_LIMIT
 from swift.common.http import HTTP_ACCEPTED, is_success
 from swift.common.request_helpers import get_sys_meta_prefix, get_param, \
     constrain_req_limit, validate_container_params
+from swift.common.trace import trace_function
 from swift.proxy.controllers.base import Controller, delay_denial, NodeIter, \
     cors_validation, set_info_cache, clear_info_cache, get_container_info, \
     record_cache_op_metrics, get_cache_key, headers_from_container_info, \
@@ -94,6 +95,7 @@ class ContainerController(Controller):
                          self.account_name, self.container_name, 'listing')
         # TODO: should we also purge updating shards from cache?
 
+    @trace_function
     def _GETorHEAD_from_backend(self, req):
         part = self.app.container_ring.get_part(
             self.account_name, self.container_name)
@@ -128,6 +130,7 @@ class ContainerController(Controller):
             namespaces.reverse()
         return namespaces
 
+    @trace_function
     def _get_listing_namespaces_from_cache(self, req, headers):
         """
         Try to fetch shard namespace data from cache and, if successful, return
@@ -165,6 +168,7 @@ class ContainerController(Controller):
         namespaces = self._filter_complete_listing(req, namespaces)
         return resp, namespaces, cache_state
 
+    @trace_function
     def _set_listing_namespaces_in_cache(self, req, namespaces):
         """
         Store a list of namespaces in both infocache and memcache.
@@ -200,6 +204,7 @@ class ContainerController(Controller):
         # return the de-gapped namespaces
         return ns_bound_list.get_namespaces()
 
+    @trace_function
     def _get_listing_namespaces_from_backend(self, req, cache_enabled):
         """
         Fetch shard namespace data from the backend and, if successful, return
@@ -303,6 +308,7 @@ class ContainerController(Controller):
                 self.logger, self.server_type.lower(), 'shard_listing',
                 cache_state, resp)
 
+    @trace_function
     def _GET_auto(self, req):
         # This is an object listing but the backend may be sharded.
         # Only lookup container info from cache and skip the backend HEAD,
@@ -440,6 +446,7 @@ class ContainerController(Controller):
 
         return self._get_or_head_post_check(req, resp)
 
+    @trace_function
     def _get_from_shards(self, req, resp, namespaces):
         """
         Construct an object listing using shards described by the list of

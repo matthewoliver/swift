@@ -48,6 +48,7 @@ from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
                                          VALID_EC_TYPES)
 from swift.common.utils import Timestamp, md5, close_if_possible, checksum
 from test import get_config, BaseTestCase
+from swift.common import trace as swift_trace
 from test.debug_logger import FakeLogger
 from test.unit.common.test_memcached import MockedMemcachePool, \
     MockMemcached
@@ -60,6 +61,10 @@ from unittest import mock as mocklib
 import inspect
 from unittest import SkipTest
 
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider, export
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import \
+    InMemorySpanExporter
 
 class BaseUnitTestCase(BaseTestCase):
     def setUp(self):
@@ -1638,3 +1643,46 @@ def set_node_errors(proxy_app, ring_node, value, last_error):
     stats = {'errors': value,
              'last_error': last_error}
     proxy_app.error_limiter.stats[node_key] = stats
+
+
+def get_debug_tracer_and_exporter():
+    trace_provider = TracerProvider()
+    tracer = trace_provider.get_tracer(__name__)
+    memory_exporter = InMemorySpanExporter()
+    span_processer = export.SimpleSpanProcessor(memory_exporter)
+    trace_provider.add_span_processor(span_processer)
+    trace.set_tracer_provider(trace_provider)
+    return tracer, memory_exporter
+
+
+def activate_tracing(env):
+    in_memory_tracer, in_memory = get_debug_tracer_and_exporter()
+    env[swift_trace.TRACE_ACTIVATED_KEY] = 'yes'
+    env[swift_trace.TRACE_TRACER] = in_memory_tracer
+    return in_memory_tracer, in_memory
+
+
+def clear_tracing(env):
+    for k in swift_trace.TRACE_ENV_KEYS:
+        del env[k]
+
+
+class TraceAssertMixin(object):
+    def assert_span_names(self, in_memory_spans, expected_spans,
+                          fuzzy_make_node_request=False):
+        actual_spans = [s.name
+                        for s in in_memory_spans.get_finished_spans()]
+        for span in expected_spans:
+            if span in actual_spans:
+                actual_spans.remove(span)
+            elif fuzzy_make_node_request and \
+                    '_make_node_request' in span:
+                for s in actual_spans:
+                    if '_make_node_request' in s:
+                        actual_spans.remove(s)
+                        break
+            else:
+                self.fail("%s not found in actual spans" % span)
+        if actual_spans:
+            self.fail("Left over spans: %s" % (
+                ", ".join(["%r" % s for s in actual_spans])))

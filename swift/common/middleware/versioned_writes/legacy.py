@@ -231,6 +231,7 @@ from swift.common.utils import get_logger, Timestamp, \
     config_true_value, close_if_possible, FileLikeIter, drain_and_close
 from swift.common.request_helpers import get_sys_meta_prefix, \
     copy_header_subset
+from swift.common.trace import wsgi_trace, trace_function
 from swift.common.wsgi import WSGIContext, make_pre_authed_request
 from swift.common.constraints import check_container_format, MAX_FILE_SIZE
 from swift.proxy.controllers.base import get_container_info
@@ -369,6 +370,7 @@ class VersionedWritesContext(WSGIContext):
             marker = last_item
             yield sublisting
 
+    @trace_function
     def _get_source_object(self, req, path_info):
         # make a pre_auth request in case the user has write access
         # to container, but not READ. This was allowed in previous version
@@ -387,6 +389,7 @@ class VersionedWritesContext(WSGIContext):
 
         return source_resp
 
+    @trace_function
     def _put_versioned_obj(self, req, put_path_info, source_resp):
         # Create a new Request object to PUT to the container, copying
         # all headers from the source object apart from x-timestamp.
@@ -693,6 +696,7 @@ class VersionedWritesContext(WSGIContext):
         return app_resp
 
 
+@wsgi_trace
 class VersionedWritesMiddleware(object):
 
     def __init__(self, app, conf):

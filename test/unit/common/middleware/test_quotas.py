@@ -18,6 +18,7 @@ import unittest
 from swift.common.swob import Request, HTTPUnauthorized, HTTPOk
 from swift.common.middleware import container_quotas, copy
 from test.unit.common.middleware.helpers import FakeSwift
+from swift.common.trace import wsgi_trace
 
 
 class FakeCache(object):
@@ -31,6 +32,7 @@ class FakeCache(object):
         return self.val
 
 
+@wsgi_trace
 class FakeApp(object):
 
     def __init__(self):
@@ -41,6 +43,7 @@ class FakeApp(object):
         return []
 
 
+@wsgi_trace
 class FakeMissingApp(object):
 
     def __init__(self):

@@ -25,10 +25,12 @@ from swift.proxy.controllers.base import get_cache_key, \
     headers_to_container_info
 from swift.common.swob import Request
 from swift.common import registry
+from swift.common.trace import wsgi_trace
 
 threading = eventlet.patcher.original('threading')
 
 
+@wsgi_trace
 class FakeApp(object):
     skip_handled_check = False
 

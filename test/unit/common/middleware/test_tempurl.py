@@ -40,10 +40,12 @@ from time import time, strftime, gmtime
 from swift.common.middleware import tempauth, tempurl, proxy_logging
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.swob import Request, Response
-from swift.common import utils, registry
+from swift.common import utils, registry, trace
 from test.debug_logger import debug_logger
+from test.unit import activate_tracing, TraceAssertMixin
 
 
+@trace.wsgi_trace
 class FakeApp(object):
 
     def __init__(self, status_headers_body_iter=None):
@@ -71,13 +73,14 @@ class FakeApp(object):
                         body=body)(env, start_response)
 
 
-class TestTempURL(unittest.TestCase):
+class TestTempURL(unittest.TestCase, TraceAssertMixin):
 
     def setUp(self):
         self.app = FakeApp()
         self.auth = tempauth.filter_factory({'reseller_prefix': ''})(self.app)
         self.tempurl = tempurl.filter_factory({})(self.auth)
         self.logger = self.tempurl.logger = debug_logger()
+        self.spans_in_memory = []
 
     def _make_request(self, path, environ=None, keys=(), container_keys=None,
                       **kwargs):
@@ -88,6 +91,7 @@ class TestTempURL(unittest.TestCase):
         self._fake_cache_environ(environ, account, keys,
                                  container_keys=container_keys)
         req = Request.blank(path, environ=environ, **kwargs)
+        _, self.spans_in_memory = activate_tracing(req.environ)
         return req
 
     def _fake_cache_environ(self, environ, account, keys, container_keys=None):
@@ -117,10 +121,16 @@ class TestTempURL(unittest.TestCase):
         container_cache_key = 'container/' + account + '/c'
         ic.setdefault(container_cache_key, {'meta': meta})
 
+    def assert_span_names(self, expected_spans):
+        super(TestTempURL, self).assert_span_names(
+            self.spans_in_memory, expected_spans)
+
     def test_passthrough(self):
         resp = self._make_request('/v1/a/c/o').get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
         self.assertNotIn(b'Temp URL invalid', resp.body)
+        self.assert_span_names(['_get_info_from_caches(a, None)', 'FakeApp',
+                                'TempAuth', 'TempURL'])
 
     def test_allow_options(self):
         self.app.status_headers_body_iter = iter([('200 Ok', {}, '')])
@@ -128,6 +138,7 @@ class TestTempURL(unittest.TestCase):
             '/v1/a/c/o?temp_url_sig=abcde&temp_url_expires=12345',
             environ={'REQUEST_METHOD': 'OPTIONS'}).get_response(self.tempurl)
         self.assertEqual(resp.status_int, 200)
+        self.assert_span_names(['FakeApp', 'TempAuth', 'TempURL'])
 
     def assert_valid_sig(self, expires, path, keys, sig, environ=None,
                          prefix=None):
@@ -150,6 +161,9 @@ class TestTempURL(unittest.TestCase):
                                   gmtime(expires)))
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_get_valid(self):
         method = 'GET'
@@ -240,6 +254,9 @@ class TestTempURL(unittest.TestCase):
             logger.get_lines_for_level('info')
 
         self.assertIn(trimmed_sig_qs, info_lines[0])
+        self.assert_span_names(
+            ['FakeApp', 'ProxyLoggingMiddleware', 'TempAuth', 'TempURL',
+             'log_request'])
 
     @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
     def test_get_valid_with_filename(self, mock_time):
@@ -263,6 +280,9 @@ class TestTempURL(unittest.TestCase):
                          resp.headers['expires'])
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_head_valid_with_filename(self):
         method = 'HEAD'
@@ -281,6 +301,12 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.headers['content-disposition'],
                          'attachment; filename="bob_killer.txt"; ' +
                          "filename*=UTF-8''bob_killer.txt")
+        # heads calculate a hmac for each 'HEAD', 'GET', 'POST', and 'PUT' so
+        # there are 4x _get_hmacs
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', '_get_hmacs', '_get_hmacs',
+             '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_head_and_get_headers_match(self):
         method = 'HEAD'
@@ -295,6 +321,12 @@ class TestTempURL(unittest.TestCase):
             % (sig, expires)})
         self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
         resp = req.get_response(self.tempurl)
+        # heads calculate a hmac for each 'HEAD', 'GET', 'POST', and 'PUT' so
+        # there are 4x _get_hmacs
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', '_get_hmacs', '_get_hmacs',
+            '_get_hmacs', 'FakeApp', 'TempURL'])
 
         get_method = 'GET'
         get_hmac_body = ('%s\n%i\n%s' %
@@ -307,6 +339,9 @@ class TestTempURL(unittest.TestCase):
         self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
         get_resp = get_req.get_response(self.tempurl)
         self.assertEqual(resp.headers, get_resp.headers)
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
     def test_get_valid_with_filename_and_inline(self, mock_time):
@@ -330,6 +365,9 @@ class TestTempURL(unittest.TestCase):
                          resp.headers['expires'])
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_get_valid_with_inline(self):
         method = 'GET'
@@ -348,6 +386,9 @@ class TestTempURL(unittest.TestCase):
         self.assertIn('expires', resp.headers)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_get_valid_with_prefix(self):
         method = 'GET'
@@ -422,6 +463,9 @@ class TestTempURL(unittest.TestCase):
         self.assertIn('expires', resp.headers)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_obj_odd_chars_in_content_disposition_metadata(self):
         method = 'GET'
@@ -442,6 +486,9 @@ class TestTempURL(unittest.TestCase):
         self.assertIn('expires', resp.headers)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_obj_trailing_slash(self):
         method = 'GET'
@@ -462,6 +509,9 @@ class TestTempURL(unittest.TestCase):
         self.assertIn('expires', resp.headers)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_filename_trailing_slash(self):
         method = 'GET'
@@ -483,6 +533,9 @@ class TestTempURL(unittest.TestCase):
         self.assertIn('expires', resp.headers)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_get_valid_but_404(self):
         method = 'GET'
@@ -501,6 +554,9 @@ class TestTempURL(unittest.TestCase):
         self.assertNotIn('expires', resp.headers)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_put_not_allowed_by_get(self):
         method = 'GET'
@@ -518,6 +574,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'TempURL'])
 
     def test_put_valid(self):
         method = 'PUT'
@@ -535,6 +594,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_put_response_headers_in_list(self):
         class Validator(object):
@@ -571,6 +633,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_get_not_allowed_by_put(self):
         method = 'PUT'
@@ -587,6 +652,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', '_get_hmacs', 'TempURL'])
 
     def test_missing_sig(self):
         method = 'GET'
@@ -602,6 +670,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
     def test_missing_expires(self):
         method = 'GET'
@@ -617,6 +686,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
     def test_bad_path(self):
         method = 'GET'
@@ -633,6 +703,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
     def test_no_key(self):
         method = 'GET'
@@ -649,6 +720,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(
+            ['_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+             '_get_keys', 'TempURL'])
 
     def test_head_allowed_by_get(self):
         method = 'GET'
@@ -666,6 +740,10 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', '_get_hmacs', '_get_hmacs',
+            '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_head_allowed_by_put(self):
         method = 'PUT'
@@ -683,6 +761,10 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', '_get_hmacs', '_get_hmacs',
+            '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_head_allowed_by_post(self):
         method = 'POST'
@@ -700,6 +782,10 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', '_get_hmacs', '_get_hmacs',
+            '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_head_otherwise_not_allowed(self):
         method = 'PUT'
@@ -719,6 +805,10 @@ class TestTempURL(unittest.TestCase):
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 401)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', '_get_hmacs', '_get_hmacs',
+            '_get_hmacs', 'TempURL'])
 
     def test_post_when_forbidden_by_config(self):
         self.tempurl.conf['methods'].remove('POST')
@@ -737,6 +827,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
     def test_delete_when_forbidden_by_config(self):
         self.tempurl.conf['methods'].remove('DELETE')
@@ -755,6 +846,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
     def test_delete_allowed(self):
         method = 'DELETE'
@@ -770,6 +862,9 @@ class TestTempURL(unittest.TestCase):
                          sig, expires)})
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 404)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_unknown_not_allowed(self):
         method = 'UNKNOWN'
@@ -787,6 +882,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
     def test_authorize_limits_scope(self):
         req_other_object = Request.blank("/v1/a/c/o2")
@@ -822,6 +918,9 @@ class TestTempURL(unittest.TestCase):
         self.assertIsNone(oc_resp)
         oa_resp = authorize(req_other_account)
         self.assertEqual(oa_resp.status_int, 401)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
         # A request with the container key limits the pre-authed scope to
         # the container level; a different container in the same account is
@@ -841,6 +940,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(oc_resp.status_int, 401)
         oa_resp = authorize(req_other_account)
         self.assertEqual(oa_resp.status_int, 401)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
         # If account and container share a key (users set these, so this can
         # happen by accident, stupidity, *or* malice!), limit the scope to
@@ -862,6 +964,9 @@ class TestTempURL(unittest.TestCase):
         self.assertIsNone(oc_resp)
         oa_resp = authorize(req_other_account)
         self.assertEqual(oa_resp.status_int, 401)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_changed_path_invalid(self):
         method = 'GET'
@@ -878,6 +983,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'TempURL'])
 
     def test_changed_sig_invalid(self):
         method = 'GET'
@@ -898,6 +1006,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'TempURL'])
 
     def test_changed_expires_invalid(self):
         method = 'GET'
@@ -914,6 +1025,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'TempURL'])
 
     def test_ip_range_value_error(self):
         method = 'GET'
@@ -938,6 +1052,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
     def test_bad_ip_range_invalid(self):
         method = 'GET'
@@ -962,6 +1077,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
     def test_different_key_invalid(self):
         method = 'GET'
@@ -978,6 +1094,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertTrue(b'Temp URL invalid' in resp.body)
         self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'TempURL'])
 
     def test_no_prefix_match_invalid(self):
         method = 'GET'
@@ -997,6 +1116,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertTrue(b'Temp URL invalid' in resp.body)
         self.assertTrue('Www-Authenticate' in resp.headers)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', 'TempURL'])
 
     def test_object_url_with_prefix_invalid(self):
         method = 'GET'
@@ -1015,6 +1137,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'TempURL'])
 
     def test_disallowed_header_object_manifest(self):
         self.tempurl = tempurl.filter_factory({})(self.auth)
@@ -1038,6 +1163,10 @@ class TestTempURL(unittest.TestCase):
                 self.assertIn(b'header', resp.body)
                 self.assertIn(b'not allowed', resp.body)
                 self.assertIn(hdr.encode('utf-8'), resp.body)
+                self.assert_span_names([
+                    '_get_info_from_caches(a, None)',
+                    '_get_info_from_caches(a, c)', '_get_keys', '_get_hmacs',
+                    'TempURL'])
 
     def test_removed_incoming_header_defaults(self):
         self.tempurl = tempurl.filter_factory({})(self.auth)
@@ -1082,6 +1211,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertNotIn('x-remove-this', self.app.request.headers)
         self.assertIn('x-open-expired', self.app.request.headers)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_removed_incoming_headers_match(self):
         self.tempurl = tempurl.filter_factory({
@@ -1104,6 +1236,9 @@ class TestTempURL(unittest.TestCase):
         self.assertNotIn('x-remove-this-one', self.app.request.headers)
         self.assertEqual(
             self.app.request.headers['x-remove-this-except-this'], 'value2')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_allow_trumps_incoming_header_conflict(self):
         self.tempurl = tempurl.filter_factory({
@@ -1123,6 +1258,9 @@ class TestTempURL(unittest.TestCase):
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 404)
         self.assertTrue('x-conflict-header' in self.app.request.headers)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_allow_trumps_incoming_header_startswith_conflict(self):
         self.tempurl = tempurl.filter_factory({
@@ -1142,6 +1280,9 @@ class TestTempURL(unittest.TestCase):
         resp = req.get_response(self.tempurl)
         self.assertEqual(resp.status_int, 404)
         self.assertTrue('x-conflict-header-test' in self.app.request.headers)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_removed_outgoing_header(self):
         self.tempurl = tempurl.filter_factory({
@@ -1160,6 +1301,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 404)
         self.assertNotIn('x-test-header-one-a', resp.headers)
         self.assertEqual(resp.headers['x-test-header-two-a'], 'value2')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_removed_outgoing_headers_match(self):
         self.tempurl = tempurl.filter_factory({
@@ -1180,6 +1324,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.headers['x-test-header-one-a'], 'value1')
         self.assertNotIn('x-test-header-two-a', resp.headers)
         self.assertEqual(resp.headers['x-test-header-two-b'], 'value3')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempAuth', 'TempURL'])
 
     def test_allow_trumps_outgoing_header_conflict(self):
         self.tempurl = tempurl.filter_factory({
@@ -1202,6 +1349,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
         self.assertTrue('x-conflict-header' in resp.headers)
         self.assertEqual(resp.headers['x-conflict-header'], 'value')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_allow_trumps_outgoing_header_startswith_conflict(self):
         self.tempurl = tempurl.filter_factory({
@@ -1224,6 +1374,9 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
         self.assertTrue('x-conflict-header-test' in resp.headers)
         self.assertEqual(resp.headers['x-conflict-header-test'], 'value')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_get_path_parts(self):
         self.assertEqual(self.tempurl._get_path_parts({
@@ -1410,6 +1563,9 @@ class TestTempURL(unittest.TestCase):
         self.assertNotIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
         self.assertNotIn('swift.auth_scheme', environ)
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', 'FakeApp', 'TempAuth',
+            'TempURL'])
 
         # Rejected by TempURL
         environ = {'REQUEST_METHOD': 'PUT',
@@ -1421,6 +1577,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
     def test_clean_incoming_headers(self):
         irh = []
@@ -1567,6 +1724,9 @@ class TestTempURL(unittest.TestCase):
                          resp.headers['expires'])
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
     def test_get_valid_with_ip_from_remote_addr(self, mock_time):
@@ -1591,6 +1751,9 @@ class TestTempURL(unittest.TestCase):
                          resp.headers['expires'])
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_get_valid_with_fake_ip_from_x_forwarded_for(self):
         method = 'GET'
@@ -1612,6 +1775,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
     @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
     def test_get_valid_with_single_ipv6(self, mock_time):
@@ -1636,6 +1800,9 @@ class TestTempURL(unittest.TestCase):
                          resp.headers['expires'])
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
     def test_get_valid_with_ipv6_range(self, mock_time):
@@ -1660,6 +1827,9 @@ class TestTempURL(unittest.TestCase):
                          resp.headers['expires'])
         self.assertEqual(req.environ['swift.authorize_override'], True)
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assert_span_names([
+            '_get_info_from_caches(a, None)', '_get_info_from_caches(a, c)',
+            '_get_keys', '_get_hmacs', 'FakeApp', 'TempURL'])
 
     def test_get_valid_with_no_client_address(self):
         method = 'GET'
@@ -1679,6 +1849,7 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(resp.status_int, 401)
         self.assertIn(b'Temp URL invalid', resp.body)
         self.assertIn('Www-Authenticate', resp.headers)
+        self.assert_span_names(['TempURL'])
 
 
 class TestSwiftInfo(unittest.TestCase):

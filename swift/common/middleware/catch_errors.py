@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from swift.common.trace import wsgi_trace
 from swift.common.swob import Request, HTTPServerError
 from swift.common.utils import get_logger, generate_trans_id, close_if_possible
 from swift.common.wsgi import WSGIContext
@@ -136,6 +137,7 @@ class CatchErrorsContext(WSGIContext):
         return resp
 
 
+@wsgi_trace
 class CatchErrorMiddleware(object):
     """
     Middleware that provides high-level error handling and ensures that a

@@ -23,6 +23,7 @@ from contextlib import contextmanager
 
 from swift.common import swob
 from swift.common.http import is_success
+from swift.common.trace import wsgi_trace
 
 from swift.common.middleware.s3api.s3api import filter_factory
 from swift.common.middleware.s3api.etree import fromstring
@@ -34,6 +35,7 @@ from test.unit.common.middleware.helpers import FakeSwift
 from test.debug_logger import FakeLabeledStatsdClient
 
 
+@wsgi_trace
 class FakeAuthApp(object):
     container_existence_skip_cache = 0.0
     account_existence_skip_cache = 0.0

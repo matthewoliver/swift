@@ -305,6 +305,7 @@ from ipaddress import ip_address, ip_network
 
 from urllib.parse import parse_qs, urlencode
 
+from swift.common.trace import wsgi_trace, trace_function
 from swift.proxy.controllers.base import get_account_info, get_container_info
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_success
@@ -313,7 +314,8 @@ from swift.common.digest import get_allowed_digests, \
 from swift.common.swob import header_to_environ_key, HTTPUnauthorized, \
     HTTPBadRequest, wsgi_to_str, date_header_format
 from swift.common.utils import split_path, \
-    streq_const_time, quote, get_logger, close_if_possible
+    streq_const_time, quote, get_logger, close_if_possible, \
+    EXPIRES_ISO8601_FORMAT
 from swift.common.registry import register_swift_info, register_sensitive_param
 from swift.common.wsgi import WSGIContext
 
@@ -344,8 +346,6 @@ DEFAULT_OUTGOING_ALLOW_HEADERS = 'x-object-meta-public-*'
 
 CONTAINER_SCOPE = 'container'
 ACCOUNT_SCOPE = 'account'
-
-EXPIRES_ISO8601_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 
 
 def get_tempurl_keys_from_metadata(meta):
@@ -456,6 +456,7 @@ def authorize_same_container(account_to_match, container_to_match):
     return auth_callback_same_container
 
 
+@wsgi_trace
 class TempURL(object):
     """
     WSGI Middleware to grant temporary URLs specific access to Swift
@@ -725,6 +726,7 @@ class TempURL(object):
                         wsgi_to_str(obj) if obj else '')
         return (None, None, None)
 
+    @trace_function
     def _get_keys(self, env):
         """
         Returns the X-[Account|Container]-Meta-Temp-URL-Key[-2] header values
@@ -753,6 +755,7 @@ class TempURL(object):
         return ([(ak, ACCOUNT_SCOPE) for ak in account_keys] +
                 [(ck, CONTAINER_SCOPE) for ck in container_keys])
 
+    @trace_function
     def _get_hmacs(self, env, expires, path, scoped_keys, hash_algorithm,
                    request_method=None, ip_range=None):
         """

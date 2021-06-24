@@ -23,6 +23,7 @@ from swift.common.request_helpers import is_user_meta, \
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import HTTPMethodNotAllowed
 from swift.common.utils import split_path, md5
+from swift.common.trace import wsgi_trace
 
 from test.debug_logger import debug_logger
 from test.unit import FakeRing
@@ -141,6 +142,7 @@ def normalize_path(path):
     return parsed.path + normalize_query_string(parsed.query)
 
 
+@wsgi_trace
 class FakeSwift(object):
     """
     A good-enough fake Swift proxy server to use in testing middleware.

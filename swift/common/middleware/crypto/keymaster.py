@@ -16,6 +16,7 @@ import hashlib
 import hmac
 
 from swift.common.exceptions import UnknownSecretIdError
+from swift.common.trace import wsgi_trace, trace_function
 from swift.common.middleware.crypto.crypto_utils import CRYPTO_KEY_CALLBACK
 from swift.common.swob import Request, HTTPException, wsgi_to_str, str_to_wsgi
 from swift.common.utils import readconf, strict_b64decode, get_logger, \
@@ -60,6 +61,7 @@ class KeyMasterContext(WSGIContext):
             key_id['secret_id'] = secret_id
         return key_id
 
+    @trace_function
     def fetch_crypto_keys(self, key_id=None, *args, **kwargs):
         """
         Setup container and object keys based on the request path.
@@ -197,6 +199,7 @@ class KeyMasterContext(WSGIContext):
         return resp
 
 
+@wsgi_trace
 class BaseKeyMaster(object):
     """Base middleware for providing encryption keys.
 

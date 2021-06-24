@@ -37,6 +37,7 @@ from swift.proxy.controllers.base import get_cache_key
 from test.unit import patch_policies, FakeMemcache, make_timestamp_iter, \
     mock_timestamp_now, BaseUnitTestCase
 from test.unit.common.middleware.helpers import FakeSwift
+from test.unit import activate_tracing, clear_tracing, TraceAssertMixin
 
 
 def local_tz(func):
@@ -59,7 +60,7 @@ def local_tz(func):
     return wrapper
 
 
-class ObjectVersioningBaseTestCase(BaseUnitTestCase):
+class ObjectVersioningBaseTestCase(BaseUnitTestCase, TraceAssertMixin):
     def setUp(self):
         self.app = FakeSwift()
         conf = {}
@@ -108,6 +109,7 @@ class ObjectVersioningBaseTestCase(BaseUnitTestCase):
         self.cache_version_never_on.set(get_cache_key('a', 'c'),
                                         {'status': 200})
         self.expected_unread_requests = {}
+        self.spans_in_memory = []
 
     def tearDown(self):
         self.assertEqual(self.app.unclosed_requests, {})
@@ -133,10 +135,12 @@ class ObjectVersioningBaseTestCase(BaseUnitTestCase):
             status[0] = s
             headers[0] = h
 
+        _, self.spans_in_memory = activate_tracing(req.environ)
         body_iter = self.lf(req.environ, start_response)
         with utils.closing_if_possible(body_iter):
             body = b''.join(body_iter)
 
+        clear_tracing(req.environ)
         return status[0], headers[0], body
 
     def assertRequestEqual(self, req, other):
@@ -160,6 +164,10 @@ class ObjectVersioningBaseTestCase(BaseUnitTestCase):
             return str_to_wsgi("/v1/%s/%s" % (acc, cont))
         obj = self.build_object_name(obj, version)
         return str_to_wsgi("/v1/%s/%s/%s" % (acc, cont, obj))
+
+    def assert_span_names(self, expected_spans):
+        super(ObjectVersioningBaseTestCase, self).assert_span_names(
+            self.spans_in_memory, expected_spans)
 
 
 class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
@@ -190,6 +198,15 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertEqual(headers[SYSMETA_VERSIONS_ENABLED], 'True')
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'FakeSwift_2', 'SymlinkMiddleware_2', 'FakeSwift_3',
+            'SymlinkMiddleware_3', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'container_request'] +
+            ['handle_container'] * 3)
 
     @patch_policies([StoragePolicy(0, 'zero', True),
                      StoragePolicy(1, 'one', False)])
@@ -229,6 +246,15 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
                              self.build_container_name('c'))))
         self.assertIn(SYSMETA_VERSIONS_ENABLED, headers)
         self.assertEqual(headers[SYSMETA_VERSIONS_ENABLED], 'True')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'FakeSwift_2', 'SymlinkMiddleware_2', 'FakeSwift_3',
+            'SymlinkMiddleware_3', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'container_request'] +
+            ['handle_container'] * 3)
 
     @patch_policies([StoragePolicy(0, 'zero', True),
                      StoragePolicy(1, 'one', False, is_deprecated=True)])
@@ -249,6 +275,13 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertEqual(2, len(calls))
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_container', 'container_request'])
 
     @patch_policies([StoragePolicy(0, 'zero', True),
                      StoragePolicy(1, 'one', False, is_deprecated=True)])
@@ -272,6 +305,13 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertEqual(2, len(calls))
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_container', 'container_request'])
 
     def test_same_policy_as_primary_container(self):
         self.app.register('GET', '/v1/a', swob.HTTPOk, {}, '')
@@ -311,6 +351,15 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertEqual(headers[SYSMETA_VERSIONS_ENABLED], 'True')
         self.assertIn('X-Storage-Policy', headers)
         self.assertEqual('ec42', headers['X-Storage-Policy'])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'FakeSwift_2', 'SymlinkMiddleware_2', 'FakeSwift_3',
+            'SymlinkMiddleware_3', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'container_request'] +
+            ['handle_container'] * 3)
 
     def test_enable_versioning_failed_primary_container(self):
         self.app.register('GET', '/v1/a', swob.HTTPOk, {}, 'passed')
@@ -326,6 +375,16 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
                             environ={'REQUEST_METHOD': 'PUT'})
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '500 Internal Error')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'FakeSwift_2', 'SymlinkMiddleware_2', 'FakeSwift_3',
+            'SymlinkMiddleware_3', 'FakeSwift_4', 'SymlinkMiddleware_4',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'container_request'] +
+            ['handle_container'] * 4)
 
     def test_enable_versioning_failed_versions_container(self):
         self.app.register('GET', '/v1/a', swob.HTTPOk, {}, '')
@@ -337,6 +396,15 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
                             environ={'REQUEST_METHOD': 'PUT'})
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '500 Internal Error')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'FakeSwift_2', 'SymlinkMiddleware_2',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'container_request'] +
+            ['handle_container'] * 2)
 
     def test_enable_versioning_existing_container(self):
         self.app.register('HEAD', '/v1/a', swob.HTTPOk, {}, '')
@@ -367,6 +435,19 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
                          'True')
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, None)', 'FakeSwift_2',
+            'SymlinkMiddleware_2', 'FakeSwift_3', 'SymlinkMiddleware_3',
+            'FakeSwift_4', 'SymlinkMiddleware_4',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'container_request'] +
+            ['handle_container'] * 4)
 
     def test_put_container_with_legacy_versioning(self):
         self.app.register('GET', '/v1/a', swob.HTTPOk, {}, '')
@@ -379,6 +460,13 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
                             environ={'REQUEST_METHOD': 'POST'})
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '400 Bad Request')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_container', 'container_request'])
 
     def test_put_container_with_super_legacy_versioning(self):
         # x-versions-location was used before versioned writes
@@ -393,6 +481,13 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
                             environ={'REQUEST_METHOD': 'POST'})
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '400 Bad Request')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_container', 'container_request'])
 
     def test_get_container(self):
         self.app.register('GET', '/v1/a', swob.HTTPOk, {}, 'passed')
@@ -408,6 +503,10 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertIn(('X-Versions-Enabled', 'True'), headers)
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            'FakeSwift', 'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_container',
+            'container_request'])
 
     def test_get_reserved_container_passthrough(self):
         self.app.register('GET', '/v1/a', swob.HTTPOk, {}, 'passed')
@@ -418,6 +517,10 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertEqual(status, '200 OK')
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            'FakeSwift', 'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_container',
+            'container_request'])
 
     def test_head_container(self):
         self.app.register('GET', '/v1/a', swob.HTTPOk, {}, 'passed')
@@ -433,6 +536,10 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertIn(('X-Versions-Enabled', 'True'), headers)
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            'FakeSwift', 'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_container',
+            'container_request'])
 
     def test_delete_container_success(self):
         self.app.register(
@@ -460,6 +567,19 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             ('DELETE', self.build_versions_path()),
             ('DELETE', '/v1/a/c'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, None)', 'FakeSwift_2',
+            'SymlinkMiddleware_2', 'FakeSwift_3', 'SymlinkMiddleware_3',
+            'FakeSwift_4', 'SymlinkMiddleware_4', 'FakeSwift_5',
+            'SymlinkMiddleware_5', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'container_request'] +
+            ['handle_container'] * 5)
 
     def test_delete_container_fail_object_count(self):
         self.app.register('HEAD', '/v1/a', swob.HTTPOk, {}, '')
@@ -482,6 +602,18 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             ('HEAD', self.build_versions_path()),
             ('HEAD', self.build_versions_path()),  # get_container_info
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, None)', 'FakeSwift_2',
+            'SymlinkMiddleware_2', 'FakeSwift_3', 'SymlinkMiddleware_3',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'container_request'] +
+            ['handle_container'] * 3)
 
     def test_delete_container_fail_delete_versions_cont(self):
         # N.B.: Notice lack of a call to DELETE /v1/a/c
@@ -509,6 +641,19 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             ('HEAD', self.build_versions_path()),  # get_container_info
             ('DELETE', self.build_versions_path()),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, None)', 'FakeSwift_2',
+            'SymlinkMiddleware_2', 'FakeSwift_3', 'SymlinkMiddleware_3',
+            'FakeSwift_4', 'SymlinkMiddleware_4',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'container_request'] +
+            ['handle_container'] * 4)
 
     def test_get(self):
         self.app.register(
@@ -528,6 +673,13 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertIn(
             ('Content-Location', '/v1/a/c/o?version-id=0000001234.00000'),
             headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_get_head',
+            'handle_object', 'object_request'])
 
     def test_get_symlink(self):
         self.app.register(
@@ -563,6 +715,13 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
             ('X-Symlink-Target', 'c/o?version-id=0000001234.00000'),
             headers)
         self.assertEqual(body, b'')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter',
+            'handle_get_head_symlink', 'handle_object', 'object_request'])
 
     def test_put_object_no_versioning(self):
         self.app.register(
@@ -578,6 +737,11 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertEqual(status, '200 OK')
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', 'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'object_request',
+            'handle_object'])
 
     def test_PUT_overwrite(self):
         ts_now = Timestamp.now()
@@ -630,6 +794,18 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         symlink_put_headers = self.app.call_list[-1].headers
         for k, v in symlink_expected_headers.items():
             self.assertEqual(symlink_put_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', '_get_source_object', 'FakeSwift_1',
+            'SymlinkMiddleware_1', '_put_versioned_obj_from_client',
+            'FakeSwift_2', 'SymlinkMiddleware_2', '_put_symlink_to_version',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_put', 'handle_object', 'object_request'])
 
     def test_PUT_timestamp_set_by_object_versioning(self):
         # verify timestamps set by versioning
@@ -762,6 +938,14 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         version_obj_post_headers = self.app.call_list[1].headers
         for k, v in expected_hdrs.items():
             self.assertEqual(version_obj_post_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_post', 'handle_object', 'handle_post',
+            'handle_object', 'object_request'])
 
     def test_POST_mismatched_location(self):
         # This is a defensive chech, ideally a mistmached
@@ -796,6 +980,13 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertEqual(self.app.calls, [
             ('POST', '/v1/a/c/o'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter',
+            'handle_post', 'handle_object', 'object_request'])
 
     def test_POST_regular_symlink(self):
         ts_now = Timestamp.now()
@@ -825,6 +1016,13 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertEqual(self.app.calls, [
             ('POST', '/v1/a/c/o'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter',
+            'handle_post', 'handle_object', 'object_request'])
 
     def test_denied_PUT_of_versioned_object(self):
         authorize_call = []
@@ -851,6 +1049,14 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertRequestEqual(expected_req, authorize_call[0])
 
         self.assertEqual(self.app.calls, [])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'ObjectVersioningMiddleware', 'object_request',
+            'ServerSideCopyMiddleware', 'ListingFilter'])
 
     def test_PUT_overwrite_tombstone(self):
         ts_now = Timestamp.now()
@@ -902,6 +1108,18 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         symlink_put_headers = self.app.call_list[-1].headers
         for k, v in expected_headers.items():
             self.assertEqual(symlink_put_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', '_get_source_object', 'FakeSwift_1',
+            'SymlinkMiddleware_1', '_put_versioned_obj_from_client',
+            'FakeSwift_2', 'SymlinkMiddleware_2', '_put_symlink_to_version',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_put', 'handle_object', 'object_request'])
 
     def test_PUT_overwrite_object_with_DLO(self):
         ts_now = Timestamp.now()
@@ -960,6 +1178,20 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         for k, v in expected_headers.items():
             self.assertEqual(symlink_put_headers[k], v)
         self.assertNotIn('x-object-manifest', symlink_put_headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', '_get_source_object', 'FakeSwift_1',
+            'SymlinkMiddleware_1', '_put_versioned_obj', 'FakeSwift_2',
+            'SymlinkMiddleware_2', '_put_versioned_obj_from_client',
+            'FakeSwift_3', 'SymlinkMiddleware_3', '_put_symlink_to_version',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_object', 'handle_put', 'handle_object',
+            'object_request'])
 
     def test_PUT_overwrite_DLO_with_object(self):
         ts_now = Timestamp.now()
@@ -1022,6 +1254,20 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         for k, v in expected_headers.items():
             self.assertEqual(symlink_put_headers[k], v)
         self.assertNotIn('x-object-manifest', symlink_put_headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', '_get_source_object', 'FakeSwift_1',
+            'SymlinkMiddleware_1', '_put_versioned_obj', 'FakeSwift_2',
+            'SymlinkMiddleware_2', '_put_versioned_obj_from_client',
+            'FakeSwift_3', 'SymlinkMiddleware_3', '_put_symlink_to_version',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_object', 'handle_put', 'handle_object',
+            'object_request'])
 
     def test_PUT_overwrite_SLO_with_object(self):
         ts_now = Timestamp.now()
@@ -1102,6 +1348,20 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         for k, v in expected_headers.items():
             self.assertEqual(symlink_put_headers[k], v)
         self.assertNotIn('x-object-manifest', symlink_put_headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', '_get_source_object', 'FakeSwift_1',
+            'SymlinkMiddleware_1', '_put_versioned_obj', 'FakeSwift_2',
+            'SymlinkMiddleware_2', '_put_versioned_obj_from_client',
+            'FakeSwift_3', 'SymlinkMiddleware_3', '_put_symlink_to_version',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_object', 'handle_put', 'handle_object',
+            'object_request'])
 
     def test_PUT_overwrite_object(self):
         ts_iter = make_timestamp_iter()
@@ -1165,6 +1425,20 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         symlink_put_headers = self.app.call_list[-1].headers
         for k, v in expected_headers.items():
             self.assertEqual(symlink_put_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', '_get_source_object', 'FakeSwift_1',
+            'SymlinkMiddleware_1', '_put_versioned_obj', 'FakeSwift_2',
+            'SymlinkMiddleware_2', '_put_versioned_obj_from_client',
+            'FakeSwift_3', 'SymlinkMiddleware_3', '_put_symlink_to_version',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_object', 'handle_put', 'handle_object',
+            'object_request'])
 
     def test_new_version_get_errors(self):
         # GET on source fails, expect client error response,
@@ -1187,6 +1461,16 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '503 Service Unavailable')
         self.assertEqual(2, self.app.call_count)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', '_get_source_object',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'object_request'])
 
     def test_new_version_put_errors(self):
         # PUT of version fails, expect client error response
@@ -1232,6 +1516,17 @@ class ObjectVersioningTestCase(ObjectVersioningBaseTestCase):
         self.assertEqual(status, '500 Internal Error')
         self.assertIn(b'container does not exist', body)
         self.assertIn(b're-enable object versioning', body)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', '_get_source_object', 'FakeSwift_1',
+            'SymlinkMiddleware_1', '_put_versioned_obj',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'object_request'])
 
 
 class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
@@ -1249,6 +1544,10 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
         self.assertIn(('X-Versions-Enabled', 'False'), headers)
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            'FakeSwift', 'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_container',
+            'container_request'])
 
     def test_head_container(self):
         self.app.register('GET', '/v1/a', swob.HTTPOk, {}, 'passed')
@@ -1264,6 +1563,10 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
         self.assertIn(('X-Versions-Enabled', 'False'), headers)
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            'FakeSwift', 'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_container',
+            'container_request'])
 
     def test_disable_versioning(self):
         self.app.register('POST', '/v1/a/c', swob.HTTPOk, {}, 'passed')
@@ -1273,6 +1576,13 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
                                      'swift.cache': self.cache_version_on})
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '200 OK')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'FakeSwift', 'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_container',
+            'container_request'])
 
     def test_PUT_overwrite_null_marker_versioning_disabled(self):
         # During object PUT with a versioning disabled, if the most
@@ -1332,6 +1642,13 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
 
         obj_put_headers = self.app.call_list[-1].headers
         self.assertNotIn(SYSMETA_VERSIONS_SYMLINK, obj_put_headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_object',
+            'object_request'])
 
     def test_put_object_versioning_disabled(self):
         listing_body = [{
@@ -1363,6 +1680,13 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
         ])
         obj_put_headers = self.app.call_list[-1].headers
         self.assertNotIn(SYSMETA_VERSIONS_SYMLINK, obj_put_headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_object',
+            'object_request'])
 
     def test_PUT_with_recent_versioned_marker_versioning_disabled(self):
         # During object PUT with a versioning disabled, if the most
@@ -1418,6 +1742,13 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
 
         obj_put_headers = self.app.call_list[-1].headers
         self.assertNotIn(SYSMETA_VERSIONS_SYMLINK, obj_put_headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_object',
+            'object_request'])
 
     def test_delete_object_with_versioning_disabled(self):
         # When versioning is disabled, swift will simply issue the
@@ -1432,6 +1763,13 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
         self.assertEqual(status, '204 No Content')
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_object',
+            'object_request'])
 
     def test_POST_symlink(self):
         ts_now = Timestamp.now()
@@ -1477,6 +1815,14 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
         version_obj_post_headers = self.app.call_list[1].headers
         for k, v in expected_hdrs.items():
             self.assertEqual(version_obj_post_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_post', 'handle_object', 'handle_post',
+            'handle_object', 'object_request'])
 
     def test_POST_unversioned_obj(self):
         self.app.register(
@@ -1510,6 +1856,13 @@ class ObjectVersioningTestDisabled(ObjectVersioningBaseTestCase):
         version_obj_post_headers = self.app.call_list[0].headers
         for k, v in expected_hdrs.items():
             self.assertEqual(version_obj_post_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_post',
+            'handle_object', 'object_request'])
 
 
 class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
@@ -1533,6 +1886,11 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
         self.assertNotIn('PUT', called_method)
         self.assertNotIn('GET', called_method)
         self.assertEqual(1, self.app.call_count)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', 'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'object_request',
+            'handle_object'])
 
     def test_put_delete_marker_no_object_success(self):
         ts_now = Timestamp.now()
@@ -1563,6 +1921,17 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
         self.assertEqual(['GET', 'PUT', 'DELETE'], [c.method for c in calls])
         self.assertEqual('application/x-deleted;swift_versions_deleted=1',
                          calls[1].headers.get('Content-Type'))
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', '_get_source_object', 'FakeSwift_1',
+            'SymlinkMiddleware_1', 'FakeSwift_2', 'SymlinkMiddleware_2',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_object', 'object_request'])
 
     def test_delete_marker_over_object_success(self):
         ts_now = Timestamp.now()
@@ -1602,6 +1971,20 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
             calls[1].path)
         self.assertEqual('application/x-deleted;swift_versions_deleted=1',
                          calls[2].headers.get('Content-Type'))
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'FakeSwift', 'SymlinkMiddleware', '_get_source_object',
+            'FakeSwift_1', 'SymlinkMiddleware_1', '_put_versioned_obj',
+            'FakeSwift_2', 'SymlinkMiddleware_2',
+            'FakeSwift_3', 'SymlinkMiddleware_3',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_object', 'handle_object',
+            'object_request'])
 
     def test_delete_marker_over_versioned_object_success(self):
         ts_now = Timestamp.now()
@@ -1636,6 +2019,17 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
             calls[1].path)
         self.assertEqual('application/x-deleted;swift_versions_deleted=1',
                          calls[1].headers.get('Content-Type'))
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', '_get_source_object', 'FakeSwift_1',
+            'SymlinkMiddleware_1', 'FakeSwift_2', 'SymlinkMiddleware_2',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_object', 'object_request'])
 
     def test_denied_DELETE_of_versioned_object(self):
         authorize_call = []
@@ -1653,6 +2047,14 @@ class ObjectVersioningTestDelete(ObjectVersioningBaseTestCase):
         self.assertEqual(status, '403 Forbidden')
         self.assertEqual(len(authorize_call), 1)
         self.assertEqual(('DELETE', '/v1/a/c/o'), authorize_call[0])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'object_request'])
 
     def test_DELETE_timestamp_set_by_object_versioning(self):
         # verify timestamps set by versioning
@@ -1734,6 +2136,24 @@ class ObjectVersioningTestCopy(ObjectVersioningBaseTestCase):
         symlink_put_headers = self.app.call_list[-1].headers
         for k, v in expected_headers.items():
             self.assertEqual(symlink_put_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, src_cont)',
+            '_get_info_from_caches(a, src_cont)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            '_get_source_object', '_get_info_from_memcache(a, c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'FakeSwift_1', 'SymlinkMiddleware_1', '_get_source_object',
+            'FakeSwift_2', 'SymlinkMiddleware_2',
+            '_put_versioned_obj_from_client', 'FakeSwift_3',
+            'SymlinkMiddleware_3', '_put_symlink_to_version',
+            'ObjectVersioningMiddleware_1', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'object_request', 'handle_get_head',
+            'handle_object', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_put', 'handle_object', 'object_request'])
 
     def test_COPY_overwrite_object(self):
         ts_now = Timestamp.now()
@@ -1787,6 +2207,26 @@ class ObjectVersioningTestCopy(ObjectVersioningBaseTestCase):
         symlink_put_headers = self.app.call_list[-1].headers
         for k, v in expected_headers.items():
             self.assertEqual(symlink_put_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, src_cont)',
+            '_get_info_from_caches(a, src_cont)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            '_get_source_object', '_get_info_from_memcache(a, c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'FakeSwift_1', 'SymlinkMiddleware_1', '_get_source_object',
+            'FakeSwift_2', 'SymlinkMiddleware_2', '_put_versioned_obj',
+            'FakeSwift_3', 'SymlinkMiddleware_3',
+            '_put_versioned_obj_from_client', 'FakeSwift_4',
+            'SymlinkMiddleware_4', '_put_symlink_to_version',
+            'ObjectVersioningMiddleware_1', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'object_request', 'handle_get_head',
+            'handle_object', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_object', 'handle_put', 'handle_object',
+            'object_request'])
 
     def test_COPY_overwrite_version_symlink(self):
         ts_now = Timestamp.now()
@@ -1834,6 +2274,23 @@ class ObjectVersioningTestCopy(ObjectVersioningBaseTestCase):
         symlink_put_headers = self.app.call_list[-1].headers
         for k, v in expected_headers.items():
             self.assertEqual(symlink_put_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, src_cont)',
+            '_get_info_from_caches(a, src_cont)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            '_get_source_object', '_get_info_from_memcache(a, c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift_1',
+            'SymlinkMiddleware_1', '_get_source_object', 'FakeSwift_2',
+            'SymlinkMiddleware_2', '_put_versioned_obj_from_client',
+            'FakeSwift_3', 'SymlinkMiddleware_3', '_put_symlink_to_version',
+            'ObjectVersioningMiddleware_1', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'object_request', 'handle_get_head',
+            'handle_object', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_put', 'handle_object', 'object_request'])
 
     def test_copy_new_version_different_account(self):
         ts_now = Timestamp.now()
@@ -1884,6 +2341,23 @@ class ObjectVersioningTestCopy(ObjectVersioningBaseTestCase):
         symlink_put_headers = self.app.call_list[-1].headers
         for k, v in expected_headers.items():
             self.assertEqual(symlink_put_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(src_acc, src_cont)',
+            '_get_info_from_caches(src_acc, src_cont)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            '_get_source_object', '_get_info_from_memcache(a, c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift_1',
+            'SymlinkMiddleware_1', '_get_source_object', 'FakeSwift_2',
+            'SymlinkMiddleware_2', '_put_versioned_obj_from_client',
+            'FakeSwift_3', 'SymlinkMiddleware_3', '_put_symlink_to_version',
+            'ObjectVersioningMiddleware_1', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'object_request', 'handle_get_head',
+            'handle_object', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_put', 'handle_object', 'object_request'])
 
     def test_copy_object_versioning_disabled(self):
         self.cache_version_off.set(get_cache_key('a', 'src_cont'),
@@ -1921,6 +2395,18 @@ class ObjectVersioningTestCopy(ObjectVersioningBaseTestCase):
         ])
         obj_put_headers = self.app.call_list[-1].headers
         self.assertNotIn(SYSMETA_VERSIONS_SYMLINK, obj_put_headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, src_cont)',
+            '_get_info_from_caches(a, src_cont)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            '_get_source_object', '_get_info_from_memcache(a, c)',
+            '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift_1',
+            'SymlinkMiddleware_1', 'ObjectVersioningMiddleware_1',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'object_request',
+            'handle_get_head', 'handle_object', 'handle_object',
+            'object_request'])
 
 
 class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
@@ -1935,6 +2421,13 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertEqual(status, '400 Bad Request')
         self.assertEqual(body, b'version-aware operations require'
                          b' that the container is versioned')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_container', 'object_request'])
 
     def test_PUT_version(self):
         timestamp = next(self.ts)
@@ -1967,6 +2460,15 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         }
         for k, v in symlink_expected_headers.items():
             self.assertEqual(obj_put_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            '_put_symlink_to_version', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter',
+            'handle_get_head_symlink', 'handle_object', 'handle_put',
+            'handle_object', 'object_request'])
 
     def test_PUT_version_with_non_empty_body(self):
         req = Request.blank(
@@ -1975,6 +2477,12 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
             params={'version-id': '1'})
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '400 Bad Request')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'object_request'])
 
         req = Request.blank(
             '/v1/a/c/o', method='PUT', body='foo',
@@ -2005,6 +2513,15 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '404 Not Found')
         self.assertIn(b'version does not exist', body)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'FakeSwift', 'SymlinkMiddleware',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'object_request'])
 
     def test_PUT_version_container_not_found(self):
         timestamp = next(self.ts)
@@ -2019,6 +2536,15 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertEqual(status, '500 Internal Error')
         self.assertIn(b'container does not exist', body)
         self.assertIn(b're-enable object versioning', body)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'object_request'])
 
     def test_PUT_version_invalid(self):
         invalid_versions = ('null', 'something', '-10')
@@ -2029,6 +2555,12 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
                 params={'version-id': invalid_versions})
             status, headers, body = self.call_ov(req)
             self.assertEqual(status, '400 Bad Request')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'object_request'])
 
     def test_POST_error(self):
         req = Request.blank(
@@ -2040,6 +2572,12 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
             params={'version-id': '1'})
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '400 Bad Request')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'object_request'])
 
     def test_GET_and_HEAD(self):
         self.app.register(
@@ -2065,6 +2603,13 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertIn(('X-Object-Version-Id', '0000000060.00000'),
                       headers)
         self.assertEqual(b'', body)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_get_head',
+            'handle_object', 'object_request'])
 
     def test_GET_404(self):
         self.app.register(
@@ -2079,6 +2624,13 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertEqual(status, '404 Not Found')
         self.assertNotIn(('X-Object-Version-Id', '0000000060.00000'),
                          headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_get_head',
+            'handle_object', 'object_request'])
 
     def test_HEAD(self):
         self.app.register(
@@ -2097,6 +2649,13 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertIn(('X-Object-Version-Id', '0000000060.00000'),
                       headers)
         self.assertIn(('X-Object-Meta-Foo', 'bar'), headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_get_head',
+            'handle_object', 'object_request'])
 
     def test_GET_null_id(self):
         self.app.register(
@@ -2124,6 +2683,13 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertEqual(2, len(self.app.calls))
         self.assertIn(('X-Object-Version-Id', 'null'), headers)
         self.assertEqual(b'', body)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_get_head',
+            'handle_object', 'object_request'])
 
     def test_GET_null_id_versioned_obj(self):
         self.app.register(
@@ -2143,6 +2709,13 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         # This will log a 499 but (at the moment, anyway)
         # we don't have a good way to avoid it
         self.expected_unread_requests[('GET', '/v1/a/c/o?version-id=null')] = 1
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_get_head',
+            'handle_object', 'object_request'])
 
     def test_GET_null_id_404(self):
         self.app.register(
@@ -2170,6 +2743,13 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertRequestEqual(req, self.authorized[0])
         self.assertEqual(2, len(self.app.calls))
         self.assertNotIn(('X-Object-Version-Id', 'null'), headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_get_head',
+            'handle_object', 'object_request'])
 
     def test_HEAD_null_id(self):
         self.app.register(
@@ -2191,6 +2771,11 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
             params={'version-id': 'null'})
         with self.assertRaises(KeyError):
             status, headers, body = self.call_ov(req)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'handle_get_head',
+            'handle_object', 'object_request'])
 
     def test_HEAD_delete_marker(self):
         self.app.register(
@@ -2211,6 +2796,13 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertEqual(len(self.authorized), 1)
         self.assertIn(('X-Object-Version-Id', '0000000060.00000'),
                       headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'handle_get_head',
+            'handle_object', 'object_request'])
 
     def test_DELETE_not_current_version(self):
         # This tests when version-id does not point to the
@@ -2242,6 +2834,14 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         calls = self.app.call_list
         self.assertIn('X-Newest', calls[0].headers)
         self.assertEqual('True', calls[0].headers['X-Newest'])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_object', 'object_request',
+            'handle_get_head_symlink', 'handle_object'])
 
     def test_DELETE_current_version(self):
         self.app.register('HEAD', '/v1/a/c/o', swob.HTTPOk, {
@@ -2270,6 +2870,15 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
             ('DELETE',
              self.build_versions_path(obj='o', version='9999999939.99999')),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'FakeSwift_2', 'SymlinkMiddleware_2',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_object', 'object_request'])
 
     def test_DELETE_current_version_is_delete_marker(self):
         self.app.register('HEAD', '/v1/a/c/o', swob.HTTPNotFound, {}, '')
@@ -2293,6 +2902,14 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
              '%s?version-id=0000000060.00000' % self.build_versions_path(
                  obj='o', version='9999999939.99999')),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'object_request'])
 
     def test_DELETE_current_obj_is_unversioned(self):
         self.app.register('HEAD', '/v1/a/c/o', swob.HTTPOk, {}, '')
@@ -2316,6 +2933,14 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
              '%s?version-id=0000000060.00000' % self.build_versions_path(
                  obj='o', version='9999999939.99999')),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'object_request'])
 
     def test_DELETE_null_version(self):
         self.app.register(
@@ -2329,6 +2954,13 @@ class ObjectVersioningTestVersionAPI(ObjectVersioningBaseTestCase):
         self.assertEqual(self.app.calls, [
             ('DELETE', '/v1/a/c/o?version-id=null'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter', 'object_request',
+            'handle_object'])
 
 
 class ObjectVersioningVersionAPIWhileDisabled(ObjectVersioningBaseTestCase):
@@ -2364,6 +2996,15 @@ class ObjectVersioningVersionAPIWhileDisabled(ObjectVersioningBaseTestCase):
         }
         for k, v in symlink_expected_headers.items():
             self.assertEqual(obj_put_headers[k], v)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            '_put_symlink_to_version', 'ObjectVersioningMiddleware',
+            'ServerSideCopyMiddleware', 'ListingFilter',
+            'handle_get_head_symlink', 'handle_object', 'handle_put',
+            'handle_object', 'object_request'])
 
     def test_POST_error_versioning_disabled(self):
         req = Request.blank(
@@ -2375,6 +3016,12 @@ class ObjectVersioningVersionAPIWhileDisabled(ObjectVersioningBaseTestCase):
             params={'version-id': '1'})
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '400 Bad Request')
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'object_request'])
 
     def test_DELETE_current_version(self):
         self.app.register('HEAD', '/v1/a/c/o', swob.HTTPOk, {
@@ -2402,6 +3049,15 @@ class ObjectVersioningVersionAPIWhileDisabled(ObjectVersioningBaseTestCase):
             ('DELETE',
              self.build_versions_path(obj='o', version='9999999939.99999')),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, \x00versions\x00c)',
+            '_get_info_from_caches(a, \x00versions\x00c)', 'FakeSwift',
+            'SymlinkMiddleware', 'FakeSwift_1', 'SymlinkMiddleware_1',
+            'FakeSwift_2', 'SymlinkMiddleware_2',
+            'ObjectVersioningMiddleware', 'ServerSideCopyMiddleware',
+            'ListingFilter', 'handle_get_head_symlink', 'handle_object',
+            'handle_object', 'handle_object', 'object_request'])
 
 
 class ObjectVersioningTestContainerOperations(ObjectVersioningBaseTestCase):
@@ -3347,20 +4003,28 @@ class ObjectVersioningTestAccountOperations(ObjectVersioningBaseTestCase):
             'last_modified': '1970-01-01T00:00:20.000000',
         }]
         self.assertEqual(expected, json.loads(body))
+        expected_spans = [
+            'FakeSwift', 'SymlinkMiddleware', 'FakeSwift_1',
+            'SymlinkMiddleware_1', 'ObjectVersioningMiddleware',
+            'account_request', 'ServerSideCopyMiddleware', 'ListingFilter']
+        self.assert_span_names(expected_spans)
 
         req.query_string = 'limit=1'
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '200 OK')
         self.assertEqual(1, len(json.loads(body)))
+        self.assert_span_names(expected_spans)
 
         req.query_string = 'limit=foo'
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '200 OK')
         self.assertEqual(2, len(json.loads(body)))
+        self.assert_span_names(expected_spans)
 
         req.query_string = 'limit=100000000000000000000000'
         status, headers, body = self.call_ov(req)
         self.assertEqual(status, '412 Precondition Failed')
+        self.assert_span_names(expected_spans)
 
     def test_list_containers_prefix(self):
         listing_body = [{
@@ -3407,6 +4071,10 @@ class ObjectVersioningTestAccountOperations(ObjectVersioningBaseTestCase):
             'last_modified': '1970-01-01T00:00:05.000000',
         }]
         self.assertEqual(expected, json.loads(body))
+        self.assert_span_names([
+            'FakeSwift', 'SymlinkMiddleware', 'FakeSwift_1',
+            'SymlinkMiddleware_1', 'ObjectVersioningMiddleware',
+            'account_request', 'ServerSideCopyMiddleware', 'ListingFilter'])
 
     def test_list_orphan_hidden_containers(self):
 
@@ -3503,6 +4171,10 @@ class ObjectVersioningTestAccountOperations(ObjectVersioningBaseTestCase):
             'last_modified': '1970-01-01T00:00:40.000000',
         }]
         self.assertEqual(expected, json.loads(body))
+        self.assert_span_names([
+            'FakeSwift', 'SymlinkMiddleware', 'FakeSwift_1',
+            'SymlinkMiddleware_1', 'ObjectVersioningMiddleware',
+            'account_request', 'ServerSideCopyMiddleware', 'ListingFilter'])
 
 
 if __name__ == '__main__':

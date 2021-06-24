@@ -146,6 +146,7 @@ from swift.common.utils import human_readable, split_path, config_true_value, \
 from swift.common.registry import register_swift_info
 from swift.common.wsgi import make_env, WSGIContext
 from swift.common.http import is_success, is_redirection, HTTP_NOT_FOUND
+from swift.common.trace import wsgi_trace
 from swift.common.swob import Response, HTTPMovedPermanently, HTTPNotFound, \
     Request, wsgi_quote, wsgi_to_str, str_to_wsgi
 from swift.common.middleware.tempurl import get_temp_url_info
@@ -519,6 +520,7 @@ class _StaticWebContext(WSGIContext):
             return self._listing(env, start_response, self.obj)
 
 
+@wsgi_trace
 class StaticWeb(object):
     """
     The Static Web WSGI middleware filter; serves container data as a static

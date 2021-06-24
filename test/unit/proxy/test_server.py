@@ -56,7 +56,8 @@ from test.unit import (
     connect_tcp, readuntil2crlfs, fake_http_connect, FakeRing,
     FakeMemcache, patch_policies, write_fake_ring, mocked_http_conn,
     DEFAULT_TEST_EC_TYPE, make_timestamp_iter, skip_if_no_xattrs,
-    FakeHTTPResponse, node_error_count, node_last_error, set_node_errors)
+    FakeHTTPResponse, node_error_count, node_last_error, set_node_errors,
+    activate_tracing)
 from test.unit.helpers import setup_servers, teardown_servers
 from swift.common.statsd_client import StatsdClient
 from swift.proxy import server as proxy_server
@@ -1341,6 +1342,85 @@ class TestProxyServer(unittest.TestCase):
         self.assertTrue(log_kwargs['exc_info'])
         self.assertIs(log_kwargs['exc_info'][1], expected_err)
         self.assertEqual(4, node_error_count(app, node))
+
+    def test_tracing_pulls_error_limited_nodes(self):
+        logger = debug_logger('test')
+        app = proxy_server.Application({},
+                                       account_ring=FakeRing(),
+                                       container_ring=FakeRing(),
+                                       logger=logger)
+        node = app.container_ring.get_part_nodes(0)[0]
+        req = Request.blank('/v1/a/c')
+        _, in_memory_spans = activate_tracing(req.environ)
+
+        # sanity check
+        req.get_response(app)
+        proxy_span = in_memory_spans.get_finished_spans()[-1]
+        self.assertEqual('Application', proxy_span.name)
+        expected_error_limited_data = {"error_suppression_limit": 10}
+        self.assertEqual(json.loads(proxy_span._attributes['error_limiting']),
+                         expected_error_limited_data)
+
+        # Because the last req actually failed all the nodes it attempt
+        # triggered an error_occured, so we should now find all 3 replicas
+        # the the error_limiting data, not error limited, but with their
+        # counters.
+        req = Request.blank('/v1/a/c')
+        _, in_memory_spans = activate_tracing(req.environ)
+        req.get_response(app)
+        proxy_span = in_memory_spans.get_finished_spans()[-1]
+        self.assertEqual('Application', proxy_span.name)
+        expected_error_limited_data = {
+            "error_suppression_limit": 10,
+            "10.0.0.1:1001/sdb": {
+                "errors": 1,
+                "last_error": mock.ANY},
+            "10.0.0.2:1002/sdc": {
+                "errors": 1, "last_error": mock.ANY},
+            "10.0.0.0:1000/sda": {
+                "errors": 1, "last_error": mock.ANY}}
+        self.assertEqual(json.loads(proxy_span._attributes['error_limiting']),
+                         expected_error_limited_data)
+
+        # our error suppression limit is 10, so we can run some more reqs,
+        # that request would've incremented them all again, but let's use
+        # error_occured in increment one again.
+        app.error_occurred(node, 'test msg')
+        req = Request.blank('/v1/a/c')
+        _, in_memory_spans = activate_tracing(req.environ)
+        req.get_response(app)
+        proxy_span = in_memory_spans.get_finished_spans()[-1]
+        self.assertEqual('Application', proxy_span.name)
+        expected_error_limited_data = {
+            "error_suppression_limit": 10,
+            "10.0.0.1:1001/sdb": {
+                "errors": 2,
+                "last_error": mock.ANY},
+            "10.0.0.2:1002/sdc": {
+                "errors": 2, "last_error": mock.ANY},
+            "10.0.0.0:1000/sda": {
+                "errors": 3, "last_error": mock.ANY}}
+        self.assertEqual(json.loads(proxy_span._attributes['error_limiting']),
+                         expected_error_limited_data)
+
+        # now let's just error limit a node
+        app.error_limit(node, "Error limited now!")
+        req = Request.blank('/v1/a/c')
+        _, in_memory_spans = activate_tracing(req.environ)
+        req.get_response(app)
+        proxy_span = in_memory_spans.get_finished_spans()[-1]
+        self.assertEqual('Application', proxy_span.name)
+        expected_error_limited_data = {
+            "error_suppression_limit": 10,
+            "10.0.0.1:1001/sdb": {
+                "errors": 3,
+                "last_error": mock.ANY},
+            "10.0.0.2:1002/sdc": {
+                "errors": 3, "last_error": mock.ANY},
+            "10.0.0.0:1000/sda": {
+                "errors": 11, "last_error": mock.ANY}}
+        self.assertEqual(json.loads(proxy_span._attributes['error_limiting']),
+                         expected_error_limited_data)
 
     def test_check_response_200(self):
         app = proxy_server.Application({},

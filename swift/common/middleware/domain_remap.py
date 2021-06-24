@@ -102,12 +102,14 @@ from swift.common.middleware import RewriteContext
 from swift.common.swob import Request, HTTPBadRequest, wsgi_quote
 from swift.common.utils import config_true_value, list_from_csv
 from swift.common.registry import register_swift_info
+from swift.common.trace import wsgi_trace
 
 
 class _DomainRemapContext(RewriteContext):
     base_re = r'^(https?://[^/]+)%s(.*)$'
 
 
+@wsgi_trace
 class DomainRemapMiddleware(object):
     """
     Domain Remap Middleware

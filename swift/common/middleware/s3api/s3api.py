@@ -153,6 +153,8 @@ from swift.common.request_helpers import append_log_info
 from swift.common.wsgi import PipelineWrapper, loadcontext, WSGIContext
 from swift.common.statsd_client import get_labeled_statsd_client
 
+from swift.common.trace import wsgi_trace, new_trace_span, trace_add, \
+    trace_exception, trace_function
 from swift.common.middleware import app_property
 from swift.common.middleware.s3api.exception import NotS3Request, \
     InvalidSubresource
@@ -200,6 +202,7 @@ WELL_KNOWN_CHECKSUM_HEADERS = (
 )
 
 
+@wsgi_trace
 class ListingEtagMiddleware(object):
     def __init__(self, app):
         self.app = app
@@ -284,6 +287,7 @@ class ListingEtagMiddleware(object):
         return [body]
 
 
+@wsgi_trace
 class S3ApiMiddleware(object):
     """S3Api: S3 compatibility middleware"""
     def __init__(self, app, wsgi_conf, *args, **kwargs):
@@ -431,30 +435,33 @@ class S3ApiMiddleware(object):
         origin = env.get('HTTP_ORIGIN')
         if self.conf.cors_preflight_allow_origin and \
                 self.is_s3_cors_preflight(env):
-            # I guess it's likely going to be an S3 request? *shrug*
-            if self.conf.cors_preflight_allow_origin != ['*'] and \
-                    origin not in self.conf.cors_preflight_allow_origin:
-                start_response('401 Unauthorized', [
+            with new_trace_span(env, "s3_cors_preflight"):
+                # I guess it's likely going to be an S3 request? *shrug*
+                if self.conf.cors_preflight_allow_origin != ['*'] and \
+                        origin not in self.conf.cors_preflight_allow_origin:
+                    start_response('401 Unauthorized', [
+                        ('Allow', 'GET, HEAD, PUT, POST, DELETE, OPTIONS'),
+                    ])
+                    return [b'']
+
+                headers = [
                     ('Allow', 'GET, HEAD, PUT, POST, DELETE, OPTIONS'),
-                ])
+                    ('Access-Control-Allow-Origin', origin),
+                    ('Access-Control-Allow-Methods',
+                     'GET, HEAD, PUT, POST, DELETE, OPTIONS'),
+                    ('Vary', 'Origin, Access-Control-Request-Headers'),
+                ]
+                acrh = set(list_from_csv(
+                    env.get(
+                        'HTTP_ACCESS_CONTROL_REQUEST_HEADERS', '').lower()))
+                if acrh:
+                    headers.append((
+                        'Access-Control-Allow-Headers',
+                        ', '.join(acrh)))
+
+                trace_add("resp_headers", headers, env)
+                start_response('200 OK', headers)
                 return [b'']
-
-            headers = [
-                ('Allow', 'GET, HEAD, PUT, POST, DELETE, OPTIONS'),
-                ('Access-Control-Allow-Origin', origin),
-                ('Access-Control-Allow-Methods',
-                 'GET, HEAD, PUT, POST, DELETE, OPTIONS'),
-                ('Vary', 'Origin, Access-Control-Request-Headers'),
-            ]
-            acrh = set(list_from_csv(
-                env.get('HTTP_ACCESS_CONTROL_REQUEST_HEADERS', '').lower()))
-            if acrh:
-                headers.append((
-                    'Access-Control-Allow-Headers',
-                    ', '.join(acrh)))
-
-            start_response('200 OK', headers)
-            return [b'']
 
         try:
             req_class = s3request.get_request_class(env, self.conf.s3_acl)
@@ -463,14 +470,17 @@ class S3ApiMiddleware(object):
         except NotS3Request:
             return self.app(env, start_response)
         except InvalidSubresource as e:
+            trace_exception(e, env)
             self.logger.debug(e.cause)
         except ErrorResponse as err_resp:
             self.logger.increment(err_resp.metric_name)
             append_log_info(env, 's3:err:%s' % err_resp.summary)
             if isinstance(err_resp, InternalError):
+                trace_exception(err_resp, env)
                 self.logger.exception(err_resp)
             resp = err_resp
         except Exception as e:
+            trace_exception(e, env)
             self.logger.exception(e)
             resp = InternalError(reason=str(e))
 
@@ -486,27 +496,33 @@ class S3ApiMiddleware(object):
 
         return resp(env, start_response)
 
+    @trace_function
     def handle_request(self, req):
+        trace_add('request_class', req.__class__.__name__, req.environ)
         self.logger.debug('Calling S3Api Middleware')
         try:
             controller = req.controller(self.app, self.conf, self.logger)
-        except S3NotImplemented:
-            # TODO: Probably we should distinct the error to log this warning
-            self.logger.warning('multipart: No SLO middleware in pipeline')
+        except S3NotImplemented as err:
+            trace_exception(err, req.environ)
+            # TODO: Probably we should distinct the error to log this
+            # warning
+            self.logger.warning(
+                'multipart: No SLO middleware in pipeline')
             raise
 
-        acl_handler = get_acl_handler(req.controller_name)(req, self.logger)
+        acl_handler = get_acl_handler(req.controller_name)(
+            req, self.logger)
         req.set_acl_handler(acl_handler)
 
         if hasattr(controller, req.method):
             handler = getattr(controller, req.method)
             if not getattr(handler, 'publicly_accessible', False):
-                raise MethodNotAllowed(req.method,
-                                       req.controller.resource_type())
+                raise MethodNotAllowed(
+                    req.method, req.controller.resource_type())
             res = handler(req)
         else:
-            raise MethodNotAllowed(req.method,
-                                   req.controller.resource_type())
+            raise MethodNotAllowed(
+                req.method, req.controller.resource_type())
 
         if req.policy_index is not None:
             res.headers.setdefault('X-Backend-Storage-Policy-Index',

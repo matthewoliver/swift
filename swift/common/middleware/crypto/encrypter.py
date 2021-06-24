@@ -19,6 +19,7 @@ from contextlib import contextmanager
 
 from swift.common.constraints import check_metadata
 from swift.common.http import is_success
+from swift.common.trace import wsgi_trace, trace_function
 from swift.common.middleware.crypto.crypto_utils import CryptoWSGIContext, \
     dump_crypto_meta, append_crypto_meta, Crypto
 from swift.common.request_helpers import get_object_transient_sysmeta, \
@@ -203,6 +204,7 @@ class EncrypterObjContext(CryptoWSGIContext):
         if error_response:
             raise error_response
 
+    @trace_function
     def encrypt_user_metadata(self, req, keys):
         """
         Encrypt user-metadata header values. Replace each x-object-meta-<key>
@@ -234,6 +236,7 @@ class EncrypterObjContext(CryptoWSGIContext):
                                      'key_id': keys['id']})
             req.headers[get_object_transient_sysmeta('crypto-meta')] = meta
 
+    @trace_function
     def handle_put(self, req, start_response):
         self._check_headers(req)
         keys = self.get_keys(req.environ, required=['object', 'container'])
@@ -263,6 +266,7 @@ class EncrypterObjContext(CryptoWSGIContext):
                        self._response_exc_info)
         return resp
 
+    @trace_function
     def handle_post(self, req, start_response):
         """
         Encrypt the new object headers with a new iv and the current crypto.
@@ -321,6 +325,7 @@ class EncrypterObjContext(CryptoWSGIContext):
             if old_etags:
                 req.headers[header_name] = old_etags
 
+    @trace_function
     def handle_get_or_head(self, req, start_response):
         with self._mask_conditional_etags(req, 'If-Match') as masked1:
             with self._mask_conditional_etags(req, 'If-None-Match') as masked2:
@@ -333,6 +338,7 @@ class EncrypterObjContext(CryptoWSGIContext):
         return resp
 
 
+@wsgi_trace
 class Encrypter(object):
     """Middleware for encrypting data and user metadata.
 

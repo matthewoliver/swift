@@ -127,6 +127,7 @@ from swift.common.request_helpers import copy_header_subset, remove_items, \
 from swift.common.wsgi import WSGIContext, make_subrequest
 import eventlet
 from swift.common.request_helpers import get_heartbeat_response_body
+from swift.common.trace import wsgi_trace, trace_function
 
 
 def _check_copy_from_header(req):
@@ -279,6 +280,7 @@ class ServerSideCopyWebContext(WSGIContext):
         return app_resp
 
 
+@wsgi_trace
 class ServerSideCopyMiddleware(object):
 
     def __init__(self, app, conf):
@@ -346,6 +348,7 @@ class ServerSideCopyMiddleware(object):
         del req.headers['Destination']
         return self.handle_PUT(req, start_response)
 
+    @trace_function
     def _get_source_object(self, ssc_ctx, source_path, req):
         source_req = req.copy_get()
 

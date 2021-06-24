@@ -24,6 +24,7 @@ from swift.common.swob import Request, date_header_format
 from swift.common.utils import Timestamp
 from test.unit import mock_timestamp_now, make_timestamp_iter
 from test.unit.common.middleware import helpers
+from test.unit import activate_tracing, TraceAssertMixin
 
 
 class FakeCache(object):
@@ -57,12 +58,13 @@ def local_tz(func):
     return wrapper
 
 
-class VersionedWritesBaseTestCase(unittest.TestCase):
+class VersionedWritesBaseTestCase(unittest.TestCase, TraceAssertMixin):
     def setUp(self):
         self.app = helpers.FakeSwift()
         conf = {'allow_versioned_writes': 'true'}
         self.vw = versioned_writes.legacy.VersionedWritesMiddleware(
             self.app, conf)
+        self.spans_in_memory = []
 
     def tearDown(self):
         self.assertEqual(self.app.unclosed_requests, {})
@@ -89,6 +91,7 @@ class VersionedWritesBaseTestCase(unittest.TestCase):
             status[0] = s
             headers[0] = h
 
+        _, self.spans_in_memory = activate_tracing(req.environ)
         body_iter = app(req.environ, start_response)
         with utils.closing_if_possible(body_iter):
             body = b''.join(body_iter)
@@ -96,11 +99,16 @@ class VersionedWritesBaseTestCase(unittest.TestCase):
         return status[0], headers[0], body
 
     def call_vw(self, req):
+        _, self.spans_in_memory = activate_tracing(req.environ)
         return self.call_app(req, app=self.vw)
 
     def assertRequestEqual(self, req, other):
         self.assertEqual(req.method, other.method)
         self.assertEqual(req.path, other.path)
+
+    def assert_span_names(self, expected_spans):
+        super(VersionedWritesBaseTestCase, self).assert_span_names(
+            self.spans_in_memory, expected_spans)
 
 
 class VersionedWritesTestCase(VersionedWritesBaseTestCase):
@@ -125,6 +133,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
                          'stack')
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_put_container_history_header(self):
         self.app.register('PUT', '/v1/a/c', swob.HTTPOk, {}, 'passed')
@@ -147,6 +156,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
                          req_headers['x-container-sysmeta-versions-mode'])
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_put_container_both_headers(self):
         req = Request.blank('/v1/a/c',
@@ -156,6 +166,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         status, headers, body = self.call_vw(req)
         self.assertEqual(status, '400 Bad Request')
         self.assertFalse(self.app.calls)
+        self.assert_span_names(['VersionedWritesMiddleware'])
 
     def test_container_allow_versioned_writes_false(self):
         self.vw.conf = {'allow_versioned_writes': 'false'}
@@ -181,6 +192,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
                                 environ={'REQUEST_METHOD': method})
             status, headers, body = self.call_vw(req)
             self.assertEqual(status, '200 OK')
+            self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def _test_removal(self, headers):
         self.app.register('POST', '/v1/a/c', swob.HTTPNoContent, {}, 'passed')
@@ -202,14 +214,17 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
             self.assertEqual('', req_headers[header])
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_remove_headers(self):
         self._test_removal({'X-Remove-Versions-Location': 'x'})
         self._test_removal({'X-Remove-History-Location': 'x'})
+        self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_empty_versions_location(self):
         self._test_removal({'X-Versions-Location': ''})
         self._test_removal({'X-History-Location': ''})
+        self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_remove_add_versions_precedence(self):
         self.app.register(
@@ -234,6 +249,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertNotIn('x-remove-versions-location', req_headers)
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def _test_blank_add_versions_precedence(self, blank_header, add_header):
         self.app.register(
@@ -265,6 +281,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertEqual('', req_headers['x-versions-location'])
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_blank_add_versions_precedence(self):
         self._test_blank_add_versions_precedence(
@@ -285,6 +302,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertIn(('X-Versions-Location', 'ver_cont'), headers)
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_head_container(self):
         self.app.register(
@@ -299,6 +317,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertIn(('X-History-Location', 'other_ver_cont'), headers)
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_get_head(self):
         self.app.register('GET', '/v1/a/c/o', swob.HTTPOk, {}, None)
@@ -318,6 +337,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertEqual(status, '200 OK')
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names(['FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_put_object_no_versioning(self):
         self.app.register(
@@ -332,6 +352,9 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertEqual(status, '200 OK')
         self.assertEqual(len(self.authorized), 1)
         self.assertRequestEqual(req, self.authorized[0])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_put_first_object_success(self):
         self.app.register(
@@ -356,6 +379,10 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertEqual(2, self.app.call_count)
         self.assertEqual(['VW', None], self.app.swift_sources)
         self.assertEqual({'fake_trans_id'}, set(self.app.txn_ids))
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'FakeSwift', '_get_source_object',
+            'FakeSwift_1', 'VersionedWritesMiddleware'])
 
     def test_put_versioned_object_including_url_encoded_name_success(self):
         self.app.register(
@@ -380,6 +407,10 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertEqual(2, self.app.call_count)
         self.assertEqual(['VW', None], self.app.swift_sources)
         self.assertEqual({'fake_trans_id'}, set(self.app.txn_ids))
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'FakeSwift',
+            '_get_source_object', 'FakeSwift_1', 'VersionedWritesMiddleware'])
 
     def test_put_object_no_versioning_with_container_config_true(self):
         # set False to versions_write and expect no GET occurred
@@ -397,6 +428,9 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertRequestEqual(req, self.authorized[0])
         called_method = [call.method for call in self.app.call_list]
         self.assertNotIn('GET', called_method)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_put_request_is_dlo_manifest_with_container_config_true(self):
         self.app.register(
@@ -426,6 +460,11 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         ], self.app.calls)
         self.assertIn('x-object-manifest',
                       self.app.call_list[2].headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'FakeSwift', '_get_source_object',
+            'FakeSwift_1', '_put_versioned_obj', 'FakeSwift_2',
+            'VersionedWritesMiddleware'])
 
     def test_put_version_is_dlo_manifest_with_container_config_true(self):
         self.app.register('GET', '/v1/a/c/o', swob.HTTPOk,
@@ -458,6 +497,11 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         ], self.app.calls)
         self.assertIn('x-object-manifest',
                       self.app.call_list[1].headers)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'FakeSwift', '_get_source_object',
+            'FakeSwift_1', '_put_versioned_obj', 'FakeSwift_2',
+            'VersionedWritesMiddleware'])
 
     def test_delete_object_no_versioning_with_container_config_true(self):
         # set False to versions_write obviously and expect no GET versioning
@@ -477,6 +521,9 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertNotIn('PUT', called_method)
         self.assertNotIn('GET', called_method)
         self.assertEqual(1, self.app.call_count)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', 'VersionedWritesMiddleware'])
 
     def test_new_version_success(self):
         self.app.register(
@@ -501,6 +548,11 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertRequestEqual(req, self.authorized[0])
         self.assertEqual(['VW', 'VW', None], self.app.swift_sources)
         self.assertEqual({'fake_trans_id'}, set(self.app.txn_ids))
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'FakeSwift', '_get_source_object',
+            'FakeSwift_1', '_put_versioned_obj', 'FakeSwift_2',
+            'VersionedWritesMiddleware'])
 
     def test_new_version_get_errors(self):
         # GET on source fails, expect client error response,
@@ -526,6 +578,10 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         status, headers, body = self.call_vw(req)
         self.assertEqual(status, '503 Service Unavailable')
         self.assertEqual(2, self.app.call_count)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'FakeSwift', '_get_source_object',
+            'VersionedWritesMiddleware'])
 
     def test_new_version_put_errors(self):
         # PUT of version fails, expect client error response
@@ -555,6 +611,10 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         status, headers, body = self.call_vw(req)
         self.assertEqual(status, '503 Service Unavailable')
         self.assertEqual(4, self.app.call_count)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'FakeSwift', '_get_source_object',
+            'FakeSwift_1', '_put_versioned_obj', 'VersionedWritesMiddleware'])
 
     @local_tz
     def test_new_version_sysmeta_precedence(self):
@@ -587,6 +647,11 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         method, path, req_headers = calls[1]
         self.assertEqual('PUT', method)
         self.assertEqual('/v1/a/ver_cont/001o/0000000000.00000', path)
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'FakeSwift', '_get_source_object',
+            'FakeSwift_1', '_put_versioned_obj', 'FakeSwift_2',
+            'VersionedWritesMiddleware'])
 
     def test_delete_no_versions_container_success(self):
         self.app.register(
@@ -615,6 +680,9 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
                 prefix_listing_prefix + 'marker=&reverse=on')),
             ('DELETE', '/v1/a/c/o'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', 'FakeSwift_1', 'VersionedWritesMiddleware'])
 
     def test_delete_first_object_success(self):
         self.app.register(
@@ -639,6 +707,9 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
                 prefix_listing_prefix + 'marker=&reverse=on')),
             ('DELETE', '/v1/a/c/o'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', 'FakeSwift_1', 'VersionedWritesMiddleware'])
 
     def test_delete_latest_version_no_marker_success(self):
         self.app.register(
@@ -690,6 +761,11 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/2'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', '_get_info_from_caches(a, c)', 'FakeSwift_1',
+            '_get_source_object', 'FakeSwift_2', '_put_versioned_obj',
+            'FakeSwift_3', 'VersionedWritesMiddleware'])
 
     def test_delete_latest_version_restores_marker_success(self):
         self.app.register(
@@ -735,6 +811,10 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertTrue(call.path.startswith('/v1/a/c/o'))
         # Since we're deleting the original, this *should* still be present:
         self.assertEqual('1', call.headers.get('X-If-Delete-At'))
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', '_get_info_from_caches(a, c)', 'FakeSwift_1',
+            'FakeSwift_2', 'VersionedWritesMiddleware'])
 
     def test_delete_latest_version_is_marker_success(self):
         # Test popping a delete marker off the stack. So, there's data in the
@@ -797,6 +877,12 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         for req_headers in self.app.headers[-2:]:
             self.assertNotIn('x-if-delete-at',
                              [h.lower() for h in req_headers])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', '_get_info_from_caches(a, c)', 'FakeSwift_1',
+            'FakeSwift_2', '_get_source_object', 'FakeSwift_3',
+            '_put_versioned_obj', 'FakeSwift_4', 'FakeSwift_5',
+            'VersionedWritesMiddleware'])
 
     def test_delete_latest_version_doubled_up_markers_success(self):
         self.app.register(
@@ -843,6 +929,10 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         call = calls.pop()
         self.assertTrue(call.path.startswith('/v1/a/ver_cont/001o/3'))
         self.assertNotIn('x-if-delete-at', [h.lower() for h in call.headers])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', '_get_info_from_caches(a, c)', 'FakeSwift_1',
+            'FakeSwift_2', 'VersionedWritesMiddleware'])
 
     def test_history_delete_marker_no_object_success(self):
         ts_now = Timestamp.now()
@@ -873,6 +963,10 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertEqual(['GET', 'PUT', 'DELETE'], [c.method for c in calls])
         self.assertEqual('application/x-deleted;swift_versions_deleted=1',
                          calls[1].headers.get('Content-Type'))
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'FakeSwift', '_get_source_object',
+            'FakeSwift_1', 'FakeSwift_2', 'VersionedWritesMiddleware'])
 
     def test_history_delete_marker_over_object_success(self):
         ts_now = Timestamp.now()
@@ -910,6 +1004,11 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
                          calls[1].path)
         self.assertEqual('application/x-deleted;swift_versions_deleted=1',
                          calls[2].headers.get('Content-Type'))
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'FakeSwift', '_get_source_object',
+            'FakeSwift_1', '_put_versioned_obj', 'FakeSwift_2', 'FakeSwift_3',
+            'VersionedWritesMiddleware'])
 
     def test_delete_single_version_success(self):
         # check that if the first listing page has just a single item then
@@ -952,6 +1051,11 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/1'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', '_get_info_from_caches(a, c)', 'FakeSwift_1',
+            '_get_source_object', 'FakeSwift_2', '_put_versioned_obj',
+            'FakeSwift_3', 'VersionedWritesMiddleware'])
 
     def test_DELETE_on_expired_versioned_object(self):
         self.app.register(
@@ -1004,6 +1108,12 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
             ('PUT', helpers.normalize_path('/v1/a/c/o')),
             ('DELETE', helpers.normalize_path('/v1/a/ver_cont/001o/1')),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', '_get_info_from_caches(a, c)', 'FakeSwift_1',
+            '_get_source_object', 'FakeSwift_2', '_get_source_object',
+            'FakeSwift_3', '_put_versioned_obj', 'FakeSwift_4',
+            'VersionedWritesMiddleware'])
 
     def test_denied_DELETE_of_versioned_object(self):
         authorize_call = []
@@ -1043,6 +1153,10 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
             ('GET', helpers.normalize_path(
                 prefix_listing_prefix + 'marker=&reverse=on')),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', '_get_info_from_caches(a, c)',
+            'VersionedWritesMiddleware'])
 
     def test_denied_PUT_of_versioned_object(self):
         authorize_call = []
@@ -1069,6 +1183,9 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertRequestEqual(expected_req, authorize_call[0])
 
         self.assertEqual(self.app.calls, [])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_caches(a, c)', 'VersionedWritesMiddleware'])
 
 
 class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
@@ -1131,6 +1248,11 @@ class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/2'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', 'FakeSwift_1', '_get_info_from_caches(a, c)',
+            'FakeSwift_2', '_get_source_object', 'FakeSwift_3',
+            '_put_versioned_obj', 'FakeSwift_4', 'VersionedWritesMiddleware'])
 
     def test_DELETE_on_expired_versioned_object(self):
         self.app.register(
@@ -1187,6 +1309,12 @@ class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/1'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', 'FakeSwift_1', '_get_info_from_caches(a, c)',
+            'FakeSwift_2', '_get_source_object', 'FakeSwift_3',
+            '_get_source_object', 'FakeSwift_4', '_put_versioned_obj',
+            'FakeSwift_5', 'VersionedWritesMiddleware'])
 
     def test_denied_DELETE_of_versioned_object(self):
         authorize_call = []
@@ -1235,6 +1363,10 @@ class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
             ('GET', helpers.normalize_path(
                 prefix_listing_prefix + 'marker=001o/2')),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', 'FakeSwift_1', '_get_info_from_caches(a, c)',
+            'VersionedWritesMiddleware'])
 
     def test_partially_upgraded_cluster(self):
         old_versions = [
@@ -1315,6 +1447,14 @@ class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/1'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', '_get_info_from_caches(a, c)', 'FakeSwift_1',
+            '_get_source_object', 'FakeSwift_2', '_get_source_object',
+            'FakeSwift_3', '_get_source_object', 'FakeSwift_4',
+            'FakeSwift_5', 'FakeSwift_6', 'FakeSwift_7', 'FakeSwift_8',
+            '_get_source_object', 'FakeSwift_9', '_put_versioned_obj',
+            'FakeSwift_10', 'VersionedWritesMiddleware'])
 
     def test_partially_upgraded_cluster_single_result_on_second_page(self):
         old_versions = [
@@ -1391,6 +1531,13 @@ class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/2'),
         ])
+        self.assert_span_names([
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            'FakeSwift', '_get_info_from_caches(a, c)', 'FakeSwift_1',
+            '_get_source_object', 'FakeSwift_2', '_get_source_object',
+            'FakeSwift_3', 'FakeSwift_4', 'FakeSwift_5', 'FakeSwift_6',
+            'FakeSwift_7', '_get_source_object', 'FakeSwift_8',
+            '_put_versioned_obj', 'FakeSwift_9', 'VersionedWritesMiddleware'])
 
 
 class VersionedWritesCopyingTestCase(VersionedWritesBaseTestCase):
@@ -1434,6 +1581,14 @@ class VersionedWritesCopyingTestCase(VersionedWritesBaseTestCase):
         self.assertEqual('/v1/a/tgt_cont/tgt_obj', self.authorized[2].path)
         # note the GET on tgt_cont/tgt_obj is pre-authed
         self.assertEqual(3, self.app.call_count, self.app.calls)
+        self.assert_span_names([
+            'FakeSwift', 'VersionedWritesMiddleware', '_get_source_object',
+            '_get_info_from_memcache(a, tgt_cont)',
+            '_get_info_from_caches(a, tgt_cont)',
+            '_get_info_from_caches(a, tgt_cont)',
+            'FakeSwift_1', '_get_source_object', 'FakeSwift_2',
+            'VersionedWritesMiddleware_1',
+            'ServerSideCopyMiddleware'])
 
     def test_copy_new_version(self):
         # existing object should be moved to versions container
@@ -1461,6 +1616,14 @@ class VersionedWritesCopyingTestCase(VersionedWritesBaseTestCase):
         self.assertEqual('PUT', self.authorized[1].method)
         self.assertEqual('/v1/a/tgt_cont/tgt_obj', self.authorized[1].path)
         self.assertEqual(4, self.app.call_count)
+        self.assert_span_names([
+            'FakeSwift', 'VersionedWritesMiddleware', '_get_source_object',
+            '_get_info_from_memcache(a, tgt_cont)',
+            '_get_info_from_caches(a, tgt_cont)',
+            '_get_info_from_caches(a, tgt_cont)',
+            'FakeSwift_1', '_get_source_object', 'FakeSwift_2',
+            '_put_versioned_obj', 'FakeSwift_3',
+            'VersionedWritesMiddleware_1', 'ServerSideCopyMiddleware'])
 
     def test_copy_new_version_x_timestamp(self):
         # existing object should be moved to versions container
@@ -1525,6 +1688,18 @@ class VersionedWritesCopyingTestCase(VersionedWritesBaseTestCase):
         self.assertEqual('PUT', self.authorized[1].method)
         self.assertEqual('/v1/tgt_a/tgt_cont/tgt_obj', self.authorized[1].path)
         self.assertEqual(4, self.app.call_count)
+        # hmm it's interesting below we don't get get_info_from_caches with
+        # src_a... is that a bug in tracing or maybe simply the source always
+        # goes to the backend? Would be interesting to see a full cluster
+        # trace of this, which would show us getting the source.
+        self.assert_span_names([
+            'FakeSwift', 'VersionedWritesMiddleware', '_get_source_object',
+            '_get_info_from_memcache(tgt_a, tgt_cont)',
+            '_get_info_from_caches(tgt_a, tgt_cont)',
+            '_get_info_from_caches(tgt_a, tgt_cont)',
+            'FakeSwift_1', '_get_source_object', 'FakeSwift_2',
+            '_put_versioned_obj', 'FakeSwift_3',
+            'VersionedWritesMiddleware_1', 'ServerSideCopyMiddleware'])
 
     def test_copy_object_no_versioning_with_container_config_true(self):
         # set False to versions_write obviously and expect no extra
@@ -1547,6 +1722,11 @@ class VersionedWritesCopyingTestCase(VersionedWritesBaseTestCase):
         self.assertEqual('PUT', self.authorized[1].method)
         self.assertEqual('/v1/a/tgt_cont/tgt_obj', self.authorized[1].path)
         self.assertEqual(2, self.app.call_count)
+        self.assert_span_names([
+            'FakeSwift', 'VersionedWritesMiddleware', '_get_source_object',
+            '_get_info_from_memcache(a, tgt_cont)',
+            '_get_info_from_caches(a, tgt_cont)', 'FakeSwift_1',
+            'VersionedWritesMiddleware_1', 'ServerSideCopyMiddleware'])
 
 
 class TestSwiftInfo(unittest.TestCase):

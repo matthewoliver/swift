@@ -33,7 +33,8 @@ from collections import defaultdict
 from contextlib import contextmanager
 from textwrap import dedent
 
-from eventlet import sleep, spawn, wsgi, Timeout, tpool, greenthread
+from eventlet import sleep, spawn, wsgi, Timeout, tpool, greenthread, \
+    greenpool
 from eventlet.green.http import client as http_client
 
 from swift import __version__ as swift_version
@@ -80,7 +81,7 @@ test_policies = [
 
 
 @contextmanager
-def fake_spawn():
+def fake_spawn(num=5):
     """
     Spawn and capture the result so we can later wait on it. This means we can
     test code executing in a greenthread but still wait() on the result to
@@ -89,13 +90,15 @@ def fake_spawn():
 
     greenlets = []
 
-    def _inner_fake_spawn(func, *a, **kw):
-        gt = greenthread.spawn(func, *a, **kw)
-        greenlets.append(gt)
-        return gt
+    class FakeTraceAwareGreenPile(object_server.TraceAwareGreenPile):
+        def spawn(self, func, *args, **kw):
+            gt = greenthread.spawn(func, *args, **kw)
+            greenlets.append(gt)
+            return gt
 
-    object_server.spawn = _inner_fake_spawn
-    with mock.patch('swift.obj.server.spawn', _inner_fake_spawn):
+    trace_aware_pile = FakeTraceAwareGreenPile(num)
+    with mock.patch('swift.obj.server.TraceAwareGreenPile',
+                    return_value=trace_aware_pile):
         try:
             yield
         finally:
@@ -6508,6 +6511,8 @@ class TestObjectController(BaseTestCase):
             given_args.extend(args)
             raise Exception('test')
 
+        req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={})
         orig_http_connect = object_server.http_connect
         try:
             object_server.http_connect = fake_http_connect
@@ -6515,53 +6520,37 @@ class TestObjectController(BaseTestCase):
                 'PUT', 'a', 'c', 'o', '127.0.0.1:1234', 1, 'sdc1',
                 {'x-timestamp': '1', 'x-out': 'set',
                  'X-Backend-Storage-Policy-Index': int(policy)}, 'sda1',
-                policy)
+                policy, req)
         finally:
             object_server.http_connect = orig_http_connect
         self.assertEqual(
             given_args,
-            ['127.0.0.1', '1234', 'sdc1', 1, 'PUT', '/a/c/o', {
+            ['127.0.0.1', '1234', 'sdc1', 1, 'PUT', '/a/c/o', HeaderKeyDict({
                 'x-timestamp': '1', 'x-out': 'set',
                 'user-agent': 'object-server %s' % os.getpid(),
-                'X-Backend-Storage-Policy-Index': int(policy)}])
+                'X-Backend-Storage-Policy-Index': int(policy)})])
 
     @patch_policies([StoragePolicy(0, 'zero', True),
                      StoragePolicy(1, 'one'),
                      StoragePolicy(37, 'fantastico')])
-    def test_updating_multiple_delete_at_container_servers(self):
+    @mock.patch('swift.obj.server.http_connect')
+    def test_updating_multiple_delete_at_container_servers(self, mocked_http):
         # update router post patch
         self.object_controller._diskfile_router = diskfile.DiskFileRouter(
             self.conf, self.object_controller.logger)
         policy = random.choice(list(POLICIES))
         self.object_controller.expirer_config.account_name = 'exp'
+        # mocked_http.status.return_value = 200
+
+        class MockOk(object):
+            status = 200
+
+            def read(self):
+                return b''
+
+        mocked_http.return_value.getresponse.return_value = MockOk()
 
         http_connect_args = []
-
-        def fake_http_connect(ipaddr, port, device, partition, method, path,
-                              headers=None, query_string=None, ssl=False):
-
-            class SuccessfulFakeConn(object):
-
-                @property
-                def status(self):
-                    return 200
-
-                def getresponse(self):
-                    return self
-
-                def read(self):
-                    return b''
-
-            captured_args = {'ipaddr': ipaddr, 'port': port,
-                             'device': device, 'partition': partition,
-                             'method': method, 'path': path, 'ssl': ssl,
-                             'headers': headers, 'query_string': query_string}
-
-            http_connect_args.append(
-                dict((k, v) for k, v in captured_args.items()
-                     if v is not None))
-
-            return SuccessfulFakeConn()
 
         req_headers = {
             'X-Timestamp': '12345',
@@ -6575,79 +6564,86 @@ class TestObjectController(BaseTestCase):
         }
         self._update_delete_at_headers(req_headers, node_count=2)
         req = Request.blank('/sda1/p/a/c/o', method='PUT', headers=req_headers)
-        with fake_spawn(), mock.patch.object(
-                object_server, 'http_connect', fake_http_connect):
+        with fake_spawn():
             resp = req.get_response(self.object_controller)
 
         self.assertEqual(resp.status_int, 201)
 
         http_connect_args.sort(key=operator.itemgetter('ipaddr'))
 
-        self.assertEqual(len(http_connect_args), 3)
-        self.assertEqual(
-            http_connect_args[0],
-            {'ipaddr': '1.2.3.4',
-             'port': '5',
-             'path': '/a/c/o',
-             'device': 'sdb1',
-             'partition': '20',
-             'method': 'PUT',
-             'ssl': False,
-             'headers': HeaderKeyDict({
-                 'x-content-type': 'application/burrito',
-                 'x-etag': 'd41d8cd98f00b204e9800998ecf8427e',
-                 'x-size': '0',
-                 'x-timestamp': utils.Timestamp('12345').internal,
-                 'referer': 'PUT http://localhost/sda1/p/a/c/o',
-                 'user-agent': 'object-server %d' % os.getpid(),
-                 'X-Backend-Storage-Policy-Index': int(policy),
-                 'x-trans-id': '-'})})
+        self.assertEqual(mocked_http.call_count, 3)
         expected_hosts = [h.split(':') for h in
                           req_headers['X-Delete-At-Host'].split(',')]
         expected_devs = [d for d in
                          req_headers['X-Delete-At-Device'].split(',')]
         self.assertEqual(
-            http_connect_args[1],
-            {'ipaddr': expected_hosts[0][0],
-             'port': expected_hosts[0][1],
-             'path': ('/exp/%s/9999999999-a/c/o' %
-                      req_headers['X-Delete-At-Container']),
-             'device': expected_devs[0],
-             'partition': req_headers['X-Delete-At-Partition'],
-             'method': 'PUT',
-             'ssl': False,
-             'headers': HeaderKeyDict({
-                 'x-content-type': 'text/plain;swift_expirer_bytes=0',
-                 'x-content-type-timestamp': utils.Timestamp('12345').internal,
-                 'x-etag': 'd41d8cd98f00b204e9800998ecf8427e',
-                 'x-size': '0',
-                 'x-timestamp': utils.Timestamp('12345').internal,
-                 'referer': 'PUT http://localhost/sda1/p/a/c/o',
-                 'user-agent': 'object-server %d' % os.getpid(),
-                 # system account storage policy is 0
-                 'X-Backend-Storage-Policy-Index': 0,
-                 'x-trans-id': '-'})})
+            mocked_http.call_args_list[0][0],
+            (
+                expected_hosts[0][0],  # host
+                expected_hosts[0][1],  # port
+                expected_devs[0],      # device
+                req_headers['X-Delete-At-Partition'],  # partition
+                'PUT',
+                ('/exp/%s/9999999999-a/c/o' %
+                 req_headers['X-Delete-At-Container']),  # path
+                {  # headers
+                    'X-Backend-Storage-Policy-Index': '0',
+                    'X-Timestamp': utils.Timestamp('12345').internal,
+                    'X-Trans-Id': '-',
+                    'Referer': 'PUT http://localhost/sda1/p/a/c/o',
+                    'X-Size': '0',
+                    'X-Content-Type': 'text/plain;swift_expirer_bytes=0',
+                    'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e',
+                    'X-Content-Type-Timestamp':
+                        utils.Timestamp('12345').internal,
+                    'User-Agent': 'object-server %d' % os.getpid()
+                }
+            ))
+
         self.assertEqual(
-            http_connect_args[2],
-            {'ipaddr': expected_hosts[1][0],
-             'port': expected_hosts[1][1],
-             'path': ('/exp/%s/9999999999-a/c/o' %
-                      req_headers['X-Delete-At-Container']),
-             'device': expected_devs[1],
-             'partition': req_headers['X-Delete-At-Partition'],
-             'method': 'PUT',
-             'ssl': False,
-             'headers': HeaderKeyDict({
-                 'x-content-type': 'text/plain;swift_expirer_bytes=0',
-                 'x-content-type-timestamp': utils.Timestamp('12345').internal,
-                 'x-etag': 'd41d8cd98f00b204e9800998ecf8427e',
-                 'x-size': '0',
-                 'x-timestamp': utils.Timestamp('12345').internal,
-                 'referer': 'PUT http://localhost/sda1/p/a/c/o',
-                 'user-agent': 'object-server %d' % os.getpid(),
-                 # system account storage policy is 0
-                 'X-Backend-Storage-Policy-Index': 0,
-                 'x-trans-id': '-'})})
+            mocked_http.call_args_list[1][0],
+            (
+                expected_hosts[1][0],  # host
+                expected_hosts[1][1],  # port
+                expected_devs[1],      # device
+                req_headers['X-Delete-At-Partition'],  # partition
+                'PUT',
+                ('/exp/%s/9999999999-a/c/o' %
+                 req_headers['X-Delete-At-Container']),  # path
+                {  # headers
+                    'X-Backend-Storage-Policy-Index': '0',
+                    'X-Timestamp': utils.Timestamp('12345').internal,
+                    'X-Trans-Id': '-',
+                    'Referer': 'PUT http://localhost/sda1/p/a/c/o',
+                    'X-Size': '0',
+                    'X-Content-Type': 'text/plain;swift_expirer_bytes=0',
+                    'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e',
+                    'X-Content-Type-Timestamp':
+                        utils.Timestamp('12345').internal,
+                    'User-Agent': 'object-server %d' % os.getpid()
+                }
+            ))
+
+        self.assertEqual(
+            mocked_http.call_args_list[2][0],
+            (
+                '1.2.3.4',      # host
+                '5',            # port
+                'sdb1',         # device
+                '20',           # partition
+                'PUT',
+                '/a/c/o',  # path
+                {  # headers
+                    'X-Size': '0',
+                    'X-Content-Type': 'application/burrito',
+                    'X-Timestamp': utils.Timestamp('12345').internal,
+                    'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e',
+                    'X-Trans-Id': '-',
+                    'Referer': 'PUT http://localhost/sda1/p/a/c/o',
+                    'X-Backend-Storage-Policy-Index': str(int(policy)),
+                    'User-Agent': 'object-server %d' % os.getpid()
+                }
+            ))
 
     @patch_policies([StoragePolicy(0, 'zero', True),
                      StoragePolicy(1, 'one'),
@@ -6695,6 +6691,7 @@ class TestObjectController(BaseTestCase):
                      'X-Container-Host': '1.2.3.4:5, 6.7.8.9:10',
                      'X-Container-Device': 'sdb1, sdf1'})
 
+        self.object_controller.env = req.environ
         with mock.patch.object(
                 object_server, 'http_connect', fake_http_connect):
             with fake_spawn():
@@ -6769,7 +6766,7 @@ class TestObjectController(BaseTestCase):
             '/sda1/p/a/c/o', method='PUT', body=b'', headers=req_headers)
         with mocked_http_conn(
                 500, 500, give_connect=capture_updates) as fake_conn:
-            with fake_spawn():
+            with fake_spawn(2):
                 resp = req.get_response(self.object_controller)
             self.assertEqual(201, resp.status_int, resp.body)
         with self.assertRaises(StopIteration):
@@ -6838,6 +6835,8 @@ class TestObjectController(BaseTestCase):
             raise Exception('test')
 
         timestamp = next(self.ts)
+        req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={})
         orig_http_connect = object_server.http_connect
         try:
             object_server.http_connect = fake_http_connect
@@ -6845,7 +6844,7 @@ class TestObjectController(BaseTestCase):
                 'PUT', 'a', 'c', 'o', '127.0.0.1:1234', 1, 'sdc1',
                 {'x-timestamp': timestamp.internal, 'x-out': 'set',
                  'X-Backend-Storage-Policy-Index': int(policy)},
-                'sda1', policy, db_state='unsharded')
+                'sda1', policy, db_state='unsharded', request=req)
         finally:
             object_server.http_connect = orig_http_connect
             utils.HASH_PATH_PREFIX = _prefix
@@ -6855,9 +6854,9 @@ class TestObjectController(BaseTestCase):
                 self.testdir, 'sda1', async_dir, 'a83',
                 '06fbf0b514e5199dfc4e00f42eb5ea83-%s' % timestamp.internal),
                 'rb')),
-            {'headers': {'x-timestamp': timestamp.internal, 'x-out': 'set',
-                         'user-agent': 'object-server %s' % os.getpid(),
-                         'X-Backend-Storage-Policy-Index': int(policy)},
+            {'headers': {'X-Timestamp': timestamp.internal, 'X-Out': 'set',
+                         'User-Agent': 'object-server %s' % os.getpid(),
+                         'X-Backend-Storage-Policy-Index': str(int(policy))},
              'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT',
              'db_state': 'unsharded'})
 
@@ -6887,23 +6886,26 @@ class TestObjectController(BaseTestCase):
             for status in (199, 300, 503):
                 timestamp = next(self.ts)
                 object_server.http_connect = fake_http_connect(status)
+                req = Request.blank('/a/c/o',
+                                    environ={'REQUEST_METHOD': 'PUT'},
+                                    headers={})
                 self.object_controller.async_update(
                     'PUT', 'a', 'c', 'o', '127.0.0.1:1234', 1, 'sdc1',
                     {'x-timestamp': timestamp.internal, 'x-out': str(status),
                      'X-Backend-Storage-Policy-Index': int(policy)},
-                    'sda1', policy, db_state='unsharded')
+                    'sda1', policy, db_state='unsharded', request=req)
                 async_dir = diskfile.get_async_dir(policy)
                 self.assertEqual(
                     pickle.load(open(os.path.join(
                         self.testdir, 'sda1', async_dir, 'a83',
                         '06fbf0b514e5199dfc4e00f42eb5ea83-%s' %
                         timestamp.internal), 'rb')),
-                    {'headers': {'x-timestamp': timestamp.internal,
-                                 'x-out': str(status),
-                                 'user-agent':
+                    {'headers': {'X-Timestamp': timestamp.internal,
+                                 'X-Out': str(status),
+                                 'User-Agent':
                                  'object-server %s' % os.getpid(),
                                  'X-Backend-Storage-Policy-Index':
-                                 int(policy)},
+                                 str(int(policy))},
                      'account': 'a', 'container': 'c', 'obj': 'o',
                      'op': 'PUT', 'db_state': 'unsharded'})
         finally:
@@ -6931,6 +6933,8 @@ class TestObjectController(BaseTestCase):
 
         orig_http_connect = object_server.http_connect
         try:
+            req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                                headers={})
             for status in (200, 299):
                 timestamp = next(self.ts)
                 object_server.http_connect = fake_http_connect(status)
@@ -6938,7 +6942,7 @@ class TestObjectController(BaseTestCase):
                     'PUT', 'a', 'c', 'o', '127.0.0.1:1234', 1, 'sdc1',
                     {'x-timestamp': timestamp.internal,
                      'x-out': str(status)},
-                    'sda1', 0)
+                    'sda1', 0, req)
                 self.assertFalse(
                     os.path.exists(os.path.join(
                         self.testdir, 'sda1', 'async_pending', 'a83',
@@ -6962,7 +6966,8 @@ class TestObjectController(BaseTestCase):
                     return sleep(1)
 
             return lambda *args: FakeConn()
-
+        req = Request.blank('/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
+                            headers={})
         orig_http_connect = object_server.http_connect
         try:
             for status in (200, 299):
@@ -6973,7 +6978,7 @@ class TestObjectController(BaseTestCase):
                     'PUT', 'a', 'c', 'o', '127.0.0.1:1234', 1, 'sdc1',
                     {'x-timestamp': timestamp.internal,
                      'x-out': str(status)},
-                    'sda1', policy)
+                    'sda1', policy, req)
                 async_dir = diskfile.get_async_dir(policy)
                 self.assertTrue(
                     os.path.exists(os.path.join(
@@ -7290,7 +7295,7 @@ class TestObjectController(BaseTestCase):
         saved_spawn_calls = []
         called_async_update_args = []
 
-        def local_fake_spawn(func, *a, **kw):
+        def local_fake_spawn(cls, func, *a, **kw):
             saved_spawn_calls.append((func, a, kw))
             return mock.MagicMock()
 
@@ -7310,7 +7315,8 @@ class TestObjectController(BaseTestCase):
                      'X-Container-Host': '1.2.3.4:5',
                      'X-Container-Device': 'sdb1',
                      'X-Container-Root-Db-State': 'unsharded'})
-        with mock.patch.object(object_server, 'spawn', local_fake_spawn), \
+        with mock.patch("swift.obj.server.TraceAwareGreenPile.spawn",
+                        local_fake_spawn), \
                 mock.patch.object(self.object_controller, 'async_update',
                                   local_fake_async_update):
             resp = req.get_response(self.object_controller)
@@ -7320,7 +7326,7 @@ class TestObjectController(BaseTestCase):
             self.assertFalse(len(called_async_update_args))
             # now do the work in greenthreads
             for func, a, kw in saved_spawn_calls:
-                gt = spawn(func, *a, **kw)
+                gt = greenthread.spawn(func, *a, **kw)
                 greenthreads.append(gt)
             # wait for the greenthreads to finish
             for gt in greenthreads:
@@ -7333,8 +7339,9 @@ class TestObjectController(BaseTestCase):
                        'Referer': 'PUT http://localhost/sda1/p/a/c/o',
                        'X-Backend-Storage-Policy-Index': '0',
                        'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e'}
+        # The last object is a request object, so using mock.ANY
         expected = [('PUT', 'a', 'c', 'o', '1.2.3.4:5', '20', 'sdb1',
-                     headers_out, 'sda1', POLICIES[0]),
+                     headers_out, 'sda1', POLICIES[0], mock.ANY),
                     {'logger_thread_locals': (None, None),
                      'container_path': None,
                      'db_state': 'unsharded', 'attempt_sync_update': True}]
@@ -7369,7 +7376,7 @@ class TestObjectController(BaseTestCase):
                      'X-Container-Partition': '20',
                      'X-Container-Host': '1.2.3.4:5',
                      'X-Container-Device': 'sdb1'})
-        with mock.patch.object(object_server, 'spawn',
+        with mock.patch.object(greenpool.GreenPool, 'spawn',
                                local_fake_spawn):
             with mock.patch.object(self.object_controller,
                                    'container_update_timeout',
@@ -7444,6 +7451,8 @@ class TestObjectController(BaseTestCase):
             self.assertEqual(expected_args, given_args)
 
         for method in ('PUT', 'POST', 'DELETE'):
+            # The last expected arg is the req that made it. Just making it
+            # mock.ANY
             expected_args = [
                 'DELETE', '.expiring_objects', '0000000000',
                 '0000000002-a/c/o', None, None,
@@ -7452,7 +7461,7 @@ class TestObjectController(BaseTestCase):
                     'x-timestamp': ts.internal,
                     'x-trans-id': '123',
                     'referer': '%s http://localhost/v1/a/c/o' % method}),
-                'sda1', policy]
+                'sda1', policy, mock.ANY]
             # async_update should be called by default...
             do_test(method, {}, expected_args)
             do_test(method, {'X-Backend-Clean-Expiring-Object-Queue': 'true'},
@@ -7493,7 +7502,7 @@ class TestObjectController(BaseTestCase):
                 'x-timestamp': ts.internal,
                 'x-trans-id': '1234',
                 'referer': 'PUT http://localhost/v1/a/c/o'}),
-            'sda1', policy])
+            'sda1', policy, req])
 
     def test_delete_at_cap(self):
         # Test how delete_at_update works when issued a delete for old
@@ -7529,7 +7538,7 @@ class TestObjectController(BaseTestCase):
                 'x-timestamp': utils.Timestamp('1').internal,
                 'x-trans-id': '1234',
                 'referer': 'PUT http://localhost/v1/a/c/o'}),
-            'sda1', policy])
+            'sda1', policy, req])
 
     def test_delete_at_update_put_with_info(self):
         # Keep next test,
@@ -7572,7 +7581,7 @@ class TestObjectController(BaseTestCase):
                     'x-timestamp': utils.Timestamp('1').internal,
                     'x-trans-id': '1234',
                     'referer': 'PUT http://localhost/v1/a/c/o'}),
-                'sda1', policy])
+                'sda1', policy, req])
 
     def test_delete_at_update_put_with_info_but_missing_container(self):
         # Same as previous test, test_delete_at_update_put_with_info, but just
@@ -7617,7 +7626,7 @@ class TestObjectController(BaseTestCase):
                     'x-timestamp': utils.Timestamp('1').internal,
                     'x-trans-id': '1234',
                     'referer': 'PUT http://localhost/v1/a/c/o'}),
-                'sda1', policy])
+                'sda1', policy, req])
 
     def test_delete_at_update_put_with_info_but_wrong_container(self):
         # Same as test_delete_at_update_put_with_info, but the
@@ -7671,7 +7680,7 @@ class TestObjectController(BaseTestCase):
                     'x-timestamp': utils.Timestamp('1').internal,
                     'x-trans-id': '1234',
                     'referer': 'PUT http://localhost/v1/a/c/o'}),
-                'sda1', policy])
+                'sda1', policy, req])
 
     def test_delete_at_update_put_with_info_but_missing_host(self):
         # Same as test_delete_at_update_put_with_info, but just
@@ -7742,7 +7751,7 @@ class TestObjectController(BaseTestCase):
                     'x-timestamp': utils.Timestamp('1').internal,
                     'x-trans-id': '1234',
                     'referer': 'PUT http://localhost/v1/a/c/o'}),
-                'sda1', policy])
+                'sda1', policy, req])
 
     def test_delete_at_update_delete(self):
         policy = random.choice(list(POLICIES))
@@ -7769,7 +7778,7 @@ class TestObjectController(BaseTestCase):
                     'x-timestamp': utils.Timestamp('1').internal,
                     'x-trans-id': '1234',
                     'referer': 'DELETE http://localhost/v1/a/c/o'}),
-                'sda1', policy])
+                'sda1', policy, req])
 
     def test_delete_backend_replication(self):
         # If X-Backend-Replication: True delete_at_update should completely

@@ -64,6 +64,8 @@ from swift.common.request_helpers import strip_sys_meta_prefix, \
     strip_object_transient_sysmeta_prefix, get_ip_port, get_user_meta_prefix, \
     get_sys_meta_prefix, is_use_replication_network
 from swift.common.storage_policy import POLICIES
+from swift.common.trace import new_trace_span, trace_exception, trace_add, \
+    get_trace_headers
 
 DEFAULT_RECHECK_ACCOUNT_EXISTENCE = 60  # seconds
 DEFAULT_RECHECK_CONTAINER_EXISTENCE = 60  # seconds
@@ -387,8 +389,10 @@ def get_object_info(env, app, path=None, swift_source=None):
     """
     (version, account, container, obj) = \
         split_path(path or env['PATH_INFO'], 4, 4, True)
-    info = _get_object_info(app, env, account, container, obj,
-                            swift_source=swift_source)
+    with new_trace_span(
+            env, "_get_object_info({})".format(path or env['PATH_INFO'])):
+        info = _get_object_info(app, env, account, container, obj,
+                                swift_source=swift_source)
     if info:
         info = deepcopy(info)
     else:
@@ -812,32 +816,34 @@ def _get_info_from_memcache(app, env, account, container=None):
       on cache hit, None on miss or if memcache is not in use; the second is
       cache state.
     """
-    memcache = cache_from_env(env, True)
-    if not memcache:
-        return None, 'disabled'
+    with new_trace_span(
+            env, "_get_info_from_memcache(%s, %s)" % (account, container)):
+        memcache = cache_from_env(env, True)
+        if not memcache:
+            return None, 'disabled'
 
-    try:
-        proxy_app = app._pipeline_final_app
-    except AttributeError:
-        # Only the middleware entry-points get a reference to the
-        # proxy-server app; if a middleware composes itself as multiple
-        # filters, we'll just have to choose a reasonable default
-        skip_chance = 0.0
-    else:
-        if container:
-            skip_chance = proxy_app.container_existence_skip_cache
+        try:
+            proxy_app = app._pipeline_final_app
+        except AttributeError:
+            # Only the middleware entry-points get a reference to the
+            # proxy-server app; if a middleware composes itself as multiple
+            # filters, we'll just have to choose a reasonable default
+            skip_chance = 0.0
         else:
-            skip_chance = proxy_app.account_existence_skip_cache
+            if container:
+                skip_chance = proxy_app.container_existence_skip_cache
+            else:
+                skip_chance = proxy_app.account_existence_skip_cache
 
-    cache_key = get_cache_key(account, container)
-    if skip_chance and random.random() < skip_chance:
-        info = None
-        cache_state = 'skip'
-    else:
-        info = memcache.get(cache_key)
-        cache_state = 'hit' if info else 'miss'
-    if info:
-        env.setdefault('swift.infocache', {})[cache_key] = info
+        cache_key = get_cache_key(account, container)
+        if skip_chance and random.random() < skip_chance:
+            info = None
+            cache_state = 'skip'
+        else:
+            info = memcache.get(cache_key)
+            cache_state = 'hit' if info else 'miss'
+        if info:
+            env.setdefault('swift.infocache', {})[cache_key] = info
     return info, cache_state
 
 
@@ -850,14 +856,15 @@ def _get_info_from_caches(app, env, account, container=None):
     :param  env: the environment used by the current request
     :returns: a tuple of (the cached info or None if not cached, cache state)
     """
-
-    info = _get_info_from_infocache(env, account, container)
-    if info:
-        cache_state = 'infocache_hit'
-    else:
-        info, cache_state = _get_info_from_memcache(
-            app, env, account, container)
-    return info, cache_state
+    with new_trace_span(
+            env, "_get_info_from_caches({}, {})".format(account, container)):
+        info = _get_info_from_infocache(env, account, container)
+        if info:
+            cache_state = 'infocache_hit'
+        else:
+            info, cache_state = _get_info_from_memcache(
+                app, env, account, container)
+        return info, cache_state
 
 
 def namespace_bounds_to_list(bounds):
@@ -1554,101 +1561,110 @@ class GetOrHeadHandler(GetterBase):
 
         req_headers = dict(self.backend_headers)
         ip, port = get_ip_port(node, req_headers)
-        start_node_timing = time.time()
-        try:
-            with ConnectionTimeout(self.app.conn_timeout):
-                conn = http_connect(
-                    ip, port, node['device'],
-                    self.partition, self.req.method, self.path,
-                    headers=req_headers,
-                    query_string=self.req.query_string)
-            self.app.set_node_timing(node, time.time() - start_node_timing)
+        with new_trace_span(
+                self.req.environ,
+                "_make_node_request -> ({}:{})".format(ip, port)):
+            req_headers.update(get_trace_headers(self.req.environ))
+            start_node_timing = time.time()
+            try:
+                with ConnectionTimeout(self.app.conn_timeout):
+                    conn = http_connect(
+                        ip, port, node['device'],
+                        self.partition, self.req.method, self.path,
+                        headers=req_headers,
+                        query_string=self.req.query_string)
+                self.app.set_node_timing(node, time.time() - start_node_timing)
 
-            with Timeout(self.node_timeout):
-                possible_source = conn.getresponse()
-                # See NOTE: swift_conn at top of file about this.
-                possible_source.swift_conn = conn
-        except (Exception, Timeout):
-            self.app.exception_occurred(
-                node, self.server_type,
-                'Trying to %(method)s %(path)s' %
-                {'method': self.req.method, 'path': self.req.path})
-            return False
+                with Timeout(self.node_timeout):
+                    possible_source = conn.getresponse()
+                    # See NOTE: swift_conn at top of file about this.
+                    possible_source.swift_conn = conn
+            except (Exception, Timeout) as ex:
+                msg = ('Trying to %(method)s %(path)s' %
+                       {'method': self.req.method, 'path': self.req.path})
+                self.app.exception_occurred(node, self.server_type, msg)
+                trace_exception(ex, self.req.environ)
+                trace_add('Error', msg, self.req.environ)
+                return False
 
-        src_headers = dict(
-            (k.lower(), v) for k, v in
-            possible_source.getheaders())
-        if is_good_source(possible_source.status, self.server_type):
-            # 404 if we know we don't have a synced copy
-            if not float(possible_source.getheader('X-PUT-Timestamp', 1)):
-                self.statuses.append(HTTP_NOT_FOUND)
-                self.reasons.append('')
-                self.bodies.append('')
-                self.source_headers.append([])
-                close_swift_conn(possible_source)
-            else:
-                if self.used_source_etag and \
-                        self.used_source_etag != normalize_etag(
-                            src_headers.get('etag', '')):
+            src_headers = dict(
+                (k.lower(), v) for k, v in
+                possible_source.getheaders())
+            if is_good_source(possible_source.status, self.server_type):
+                # 404 if we know we don't have a synced copy
+                if not float(possible_source.getheader('X-PUT-Timestamp', 1)):
                     self.statuses.append(HTTP_NOT_FOUND)
                     self.reasons.append('')
                     self.bodies.append('')
                     self.source_headers.append([])
+                    close_swift_conn(possible_source)
+                else:
+                    if self.used_source_etag and \
+                            self.used_source_etag != normalize_etag(
+                                src_headers.get('etag', '')):
+
+                        self.statuses.append(HTTP_NOT_FOUND)
+                        self.reasons.append('')
+                        self.bodies.append('')
+                        self.source_headers.append([])
+                        return False
+
+                    # a possible source should only be added as a valid source
+                    # if its timestamp is newer than previously found
+                    # tombstones
+                    ps_timestamp = Timestamp(
+                        src_headers.get('x-backend-data-timestamp') or
+                        src_headers.get('x-backend-timestamp') or
+                        src_headers.get('x-put-timestamp') or
+                        src_headers.get('x-timestamp') or
+                        Timestamp.zero())
+                    if ps_timestamp >= self.latest_404_timestamp:
+                        self.statuses.append(possible_source.status)
+                        self.reasons.append(possible_source.reason)
+                        self.bodies.append(None)
+                        self.source_headers.append(
+                            possible_source.getheaders())
+                        self.sources.append(
+                            GetterSource(self.app, possible_source, node))
+                        if not self.newest:  # one good source is enough
+                            return True
+            else:
+                if 'handoff_index' in node and \
+                        (is_server_error(possible_source.status) or
+                        possible_source.status == HTTP_NOT_FOUND) and \
+                        not Timestamp(src_headers.get('x-backend-timestamp',
+                                                    Timestamp.zero())):
+                    # throw out 5XX and 404s from handoff nodes unless the data
+                    # is really on disk and had been DELETEd
                     return False
 
-                # a possible source should only be added as a valid source
-                # if its timestamp is newer than previously found tombstones
-                ps_timestamp = Timestamp(
-                    src_headers.get('x-backend-data-timestamp') or
-                    src_headers.get('x-backend-timestamp') or
-                    src_headers.get('x-put-timestamp') or
-                    src_headers.get('x-timestamp') or
-                    Timestamp.zero())
-                if ps_timestamp >= self.latest_404_timestamp:
-                    self.statuses.append(possible_source.status)
-                    self.reasons.append(possible_source.reason)
-                    self.bodies.append(None)
-                    self.source_headers.append(possible_source.getheaders())
-                    self.sources.append(
-                        GetterSource(self.app, possible_source, node))
-                    if not self.newest:  # one good source is enough
-                        return True
-        else:
-            if 'handoff_index' in node and \
-                    (is_server_error(possible_source.status) or
-                     possible_source.status == HTTP_NOT_FOUND) and \
-                    not Timestamp(src_headers.get('x-backend-timestamp',
-                                                  Timestamp.zero())):
-                # throw out 5XX and 404s from handoff nodes unless the data is
-                # really on disk and had been DELETEd
-                return False
+                if self.rebalance_missing_suppression_count > 0 and \
+                        possible_source.status == HTTP_NOT_FOUND and \
+                        not Timestamp(src_headers.get('x-backend-timestamp',
+                                                    Timestamp.zero())):
+                    self.rebalance_missing_suppression_count -= 1
+                    return False
 
-            if self.rebalance_missing_suppression_count > 0 and \
-                    possible_source.status == HTTP_NOT_FOUND and \
-                    not Timestamp(src_headers.get('x-backend-timestamp',
-                                                  Timestamp.zero())):
-                self.rebalance_missing_suppression_count -= 1
-                return False
+                self.statuses.append(possible_source.status)
+                self.reasons.append(possible_source.reason)
+                self.bodies.append(possible_source.read())
+                self.source_headers.append(possible_source.getheaders())
 
-            self.statuses.append(possible_source.status)
-            self.reasons.append(possible_source.reason)
-            self.bodies.append(possible_source.read())
-            self.source_headers.append(possible_source.getheaders())
-
-            # if 404, record the timestamp. If a good source shows up, its
-            # timestamp will be compared to the latest 404.
-            # For now checking only on objects, but future work could include
-            # the same check for account and containers. See lp 1560574.
-            if self.server_type == 'Object' and \
-                    possible_source.status == HTTP_NOT_FOUND:
-                hdrs = HeaderKeyDict(possible_source.getheaders())
-                ts = Timestamp(hdrs.get('X-Backend-Timestamp',
-                                        Timestamp.zero()))
-                if ts > self.latest_404_timestamp:
-                    self.latest_404_timestamp = ts
-            self.app.check_response(node, self.server_type, possible_source,
-                                    self.req.method, self.path,
-                                    self.bodies[-1])
+                # if 404, record the timestamp. If a good source shows up, its
+                # timestamp will be compared to the latest 404.  For now
+                # checking only on objects, but future work could include the
+                # same check for account and containers. See lp 1560574.
+                if self.server_type == 'Object' and \
+                        possible_source.status == HTTP_NOT_FOUND:
+                    hdrs = HeaderKeyDict(possible_source.getheaders())
+                    ts = Timestamp(hdrs.get('X-Backend-Timestamp',
+                                            Timestamp.zero()))
+                    if ts > self.latest_404_timestamp:
+                        self.latest_404_timestamp = ts
+                self.app.check_response(node, self.server_type,
+                                        possible_source,
+                                        self.req.method, self.path,
+                                        self.bodies[-1])
         return False
 
     def _find_source(self):
@@ -1660,7 +1676,7 @@ class GetOrHeadHandler(GetterBase):
 
         nodes = GreenthreadSafeIterator(self.node_iter)
 
-        pile = GreenAsyncPile(self.concurrency)
+        pile = GreenAsyncPile(self.concurrency, self.req.environ)
 
         for node in nodes:
             pile.spawn(self._make_node_request, node,
@@ -1912,6 +1928,7 @@ class Controller(object):
         self.trans_id = '-'
         self._allowed_methods = None
         self._private_methods = None
+        self.env = None
 
     @property
     def logger(self):
@@ -2076,36 +2093,47 @@ class Controller(object):
         :returns: a swob.Response object, or None if no responses were received
         """
         self.logger.thread_locals = logger_thread_locals
-        if body:
-            if not isinstance(body, bytes):
-                raise TypeError('body must be bytes, not %s' % type(body))
-            headers['Content-Length'] = str(len(body))
-        for node in nodes:
-            try:
+        with new_trace_span(
+                self.env,
+                "_make_requests({}, {}, {})".format(part, method, path)):
+            if body:
+                if not isinstance(body, bytes):
+                    raise TypeError('body must be bytes, not %s' % type(body))
+                headers['Content-Length'] = str(len(body))
+            for node in nodes:
                 ip, port = get_ip_port(node, headers)
-                start_node_timing = time.time()
-                with ConnectionTimeout(self.app.conn_timeout):
-                    conn = http_connect(
-                        ip, port, node['device'], part, method, path,
-                        headers=headers, query_string=query)
-                    conn.node = node
-                self.app.set_node_timing(node, time.time() - start_node_timing)
-                if body:
-                    with Timeout(self.app.node_timeout):
-                        conn.send(body)
-                with Timeout(self.app.node_timeout):
-                    resp = conn.getresponse()
-                    if (self.app.check_response(node, self.server_type, resp,
-                                                method, path)
-                            and not is_informational(resp.status)):
-                        return resp, resp.read(), node
+                with new_trace_span(
+                        self.env,
+                        "_make_requests -> ({}:{})".format(ip, port)):
+                    try:
+                        headers.update(get_trace_headers(self.env))
+                        start_node_timing = time.time()
+                        with ConnectionTimeout(self.app.conn_timeout):
+                            conn = http_connect(
+                                ip, port, node['device'], part, method, path,
+                                headers=headers, query_string=query)
+                            conn.node = node
+                        self.app.set_node_timing(
+                            node, time.time() - start_node_timing)
+                        if body:
+                            with Timeout(self.app.node_timeout):
+                                conn.send(body)
+                        with Timeout(self.app.node_timeout):
+                            resp = conn.getresponse()
+                            if (self.app.check_response(
+                                    node, self.server_type, resp,
+                                    method, path)
+                                    and not is_informational(resp.status)):
+                                return resp, resp.read(), node
 
-            except (Exception, Timeout):
-                self.app.exception_occurred(
-                    node, self.server_type,
-                    'Trying to %(method)s %(path)s' %
-                    {'method': method, 'path': path})
-        return None, None, None
+                    except (Exception, Timeout) as ex:
+                        msg = 'Trying to %(method)s %(path)s' % {
+                            'method': method, 'path': path}
+                        trace_exception(ex, self.env)
+                        trace_add('exception_occurred', msg, self.env)
+                        self.app.exception_occurred(
+                            node, self.server_type, msg)
+            return None, None, None
 
     def _make_requests(self, req, ring, part, method, path, headers,
                        query_string='', node_count=None, node_iterator=None,

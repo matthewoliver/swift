@@ -19,6 +19,7 @@ import json
 from swift.common.constraints import valid_api_version, check_utf8
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_success
+from swift.common.trace import wsgi_trace, new_trace_span, trace_function
 from swift.common.middleware.crypto.crypto_utils import CryptoWSGIContext, \
     load_crypto_meta, extract_crypto_meta, Crypto
 from swift.common.exceptions import EncryptionException, UnknownSecretIdError
@@ -318,6 +319,7 @@ class DecrypterObjContext(BaseDecrypterContext):
                     body='Error decrypting object', content_type='text/plain')
         return crypto_meta
 
+    @trace_function
     def handle(self, req, start_response):
         app_resp = self._app_call(req.environ)
 
@@ -342,9 +344,10 @@ class DecrypterObjContext(BaseDecrypterContext):
                            self._response_exc_info)
             return app_resp
 
-        mod_resp_headers = self.decrypt_resp_headers(
-            put_keys, post_keys,
-            update_cors_exposed=bool(req.headers.get('origin')))
+        with new_trace_span(req.environ, 'decrypt_resp_headers'):
+            mod_resp_headers = self.decrypt_resp_headers(
+                put_keys, post_keys,
+                update_cors_exposed=bool(req.headers.get('origin')))
 
         if put_crypto_meta and req.method == 'GET' and \
                 is_success(self._get_status_int()):
@@ -383,6 +386,7 @@ class DecrypterContContext(BaseDecrypterContext):
         super(DecrypterContContext, self).__init__(
             decrypter, 'container', logger)
 
+    @trace_function
     def handle(self, req, start_response):
         app_resp = self._app_call(req.environ)
 
@@ -399,6 +403,7 @@ class DecrypterContContext(BaseDecrypterContext):
 
         return app_resp
 
+    @trace_function
     def process_json_resp(self, req, resp_iter):
         """
         Parses json body listing and decrypt encrypted entries. Updates
@@ -412,6 +417,7 @@ class DecrypterContContext(BaseDecrypterContext):
         self.update_content_length(len(new_body))
         return [new_body]
 
+    @trace_function
     def decrypt_obj_dict(self, req, obj_dict):
         if 'hash' in obj_dict:
             # each object's etag may have been encrypted with a different key
@@ -440,6 +446,7 @@ class DecrypterContContext(BaseDecrypterContext):
         return obj_dict
 
 
+@wsgi_trace
 class Decrypter(object):
     """Middleware for decrypting data and user metadata."""
 

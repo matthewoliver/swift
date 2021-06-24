@@ -20,6 +20,7 @@ import time
 from resource import getpagesize
 
 from swift import __version__ as swiftver
+from swift.common.trace import wsgi_trace
 from swift.common.constraints import check_mount
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import Request, Response
@@ -29,6 +30,7 @@ from swift.common.recon import RECON_OBJECT_FILE, RECON_CONTAINER_FILE, \
     DEFAULT_RECON_CACHE_PATH
 
 
+@wsgi_trace
 class ReconMiddleware(object):
     """
     Recon middleware used for monitoring.

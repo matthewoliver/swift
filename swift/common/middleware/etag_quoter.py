@@ -45,8 +45,10 @@ from swift.common.swob import Request
 from swift.common.utils import config_true_value
 from swift.common.registry import register_swift_info
 from swift.proxy.controllers.base import get_account_info, get_container_info
+from swift.common.trace import wsgi_trace
 
 
+@wsgi_trace
 class EtagQuoterMiddleware(object):
     def __init__(self, app, conf):
         self.app = app

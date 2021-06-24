@@ -30,9 +30,9 @@ If ``gatekeeper`` middleware is not configured in the pipeline then it will be
 automatically inserted close to the start of the pipeline by the proxy server.
 """
 
-
 from swift.common.swob import Request
 from swift.common.utils import get_logger, config_true_value
+from swift.common.trace import wsgi_trace
 from swift.common.request_helpers import (
     remove_items, get_sys_meta_prefix, OBJECT_TRANSIENT_SYSMETA_PREFIX
 )
@@ -67,6 +67,7 @@ def make_exclusion_test(exclusions):
     return test.match
 
 
+@wsgi_trace
 class GatekeeperMiddleware(object):
     def __init__(self, app, conf):
         self.app = app

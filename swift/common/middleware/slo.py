@@ -374,6 +374,7 @@ from swift.common.wsgi import WSGIContext, make_subrequest, make_env, \
 from swift.common.middleware.bulk import ACCEPTABLE_FORMATS, Bulk
 from swift.obj import expirer
 from swift.proxy.controllers.base import get_container_info
+from swift.common.trace import wsgi_trace, new_trace_span, trace_function
 
 
 DEFAULT_RATE_LIMIT_UNDER_SIZE = 1024 ** 2  # 1 MiB
@@ -648,6 +649,7 @@ class RespAttrs(object):
     :param slo_etag: the Etag of the SLO.
     :param slo_size: the size of the SLO.
     """
+
     def __init__(self, is_slo, timestamp, manifest_etag, slo_etag, slo_size):
         self.is_slo = bool(is_slo)
         self.timestamp = Timestamp(timestamp or Timestamp.zero())
@@ -733,6 +735,7 @@ class SloGetContext(WSGIContext):
         # we'll know more after we look at the response metadata
         self.segment_listing_needed = False
 
+    @trace_function
     def _fetch_sub_slo_segments(self, req, version, acc, con, obj):
         """
         Fetch the submanifest, parse it, and return it.
@@ -1111,6 +1114,7 @@ class SloGetContext(WSGIContext):
         )
         return resp(req.environ, start_response)
 
+    @trace_function
     def handle_slo_get_or_head(self, req, start_response):
         """
         Takes a request and a start_response callable and does the normal WSGI
@@ -1272,6 +1276,7 @@ class SloGetContext(WSGIContext):
         return segmented_iter
 
 
+@wsgi_trace
 class StaticLargeObject(object):
     """
     StaticLargeObject Middleware
@@ -1338,6 +1343,7 @@ class StaticLargeObject(object):
         """
         return SloGetContext(self).handle_slo_get_or_head(req, start_response)
 
+    @trace_function
     def handle_multipart_put(self, req, start_response):
         """
         Will handle the PUT of a SLO manifest.
@@ -1360,9 +1366,11 @@ class StaticLargeObject(object):
             if req.content_length > self.max_manifest_size:
                 raise HTTPRequestEntityTooLarge(
                     "Manifest File > %d bytes" % self.max_manifest_size)
-        parsed_data = parse_and_validate_input(
-            req.body_file.read(self.max_manifest_size),
-            wsgi_to_str(req.path))
+        with new_trace_span(
+                req.environ, 'parse_and_validate_input_timing'):
+            parsed_data = parse_and_validate_input(
+                req.body_file.read(self.max_manifest_size),
+                wsgi_to_str(req.path))
         problem_segments = []
 
         object_segments = [seg for seg in parsed_data if 'path' in seg]
@@ -1491,7 +1499,7 @@ class StaticLargeObject(object):
             last_yield_time = time.time()
             with StreamingPile(self.concurrency) as pile:
                 for obj_name, resp in pile.asyncstarmap(do_head, (
-                        (path, ) for path in path2indices)):
+                        (path,) for path in path2indices)):
                     now = time.time()
                     if heartbeat and (now - last_yield_time >
                                       self.yield_frequency):
@@ -1608,6 +1616,7 @@ class StaticLargeObject(object):
 
         return resp_iter()
 
+    @trace_function
     def get_segments_to_delete_iter(self, req):
         """
         A generator function to be used to delete all the segments and
@@ -1662,6 +1671,7 @@ class StaticLargeObject(object):
             else:
                 yield seg_data
 
+    @trace_function
     def get_slo_segments(self, obj_name, req):
         """
         Performs a :class:`~swift.common.swob.Request` and returns the SLO
@@ -1720,6 +1730,7 @@ class StaticLargeObject(object):
         else:
             raise HTTPServerError('Unable to load SLO manifest or segment.')
 
+    @trace_function
     def handle_async_delete(self, req):
         if not check_utf8(wsgi_to_str(req.path_info)):
             raise HTTPPreconditionFailed(
@@ -1795,6 +1806,7 @@ class StaticLargeObject(object):
         # Finally, delete the manifest
         return self.app
 
+    @trace_function
     def handle_multipart_delete(self, req):
         """
         Will delete all the segments in the SLO manifest and then, if
@@ -1821,6 +1833,7 @@ class StaticLargeObject(object):
             out_content_type=out_content_type)
         return resp
 
+    @trace_function
     def handle_container_listing(self, req, start_response):
         resp = req.get_response(self.app)
         if not resp.is_success or resp.content_type != 'application/json':

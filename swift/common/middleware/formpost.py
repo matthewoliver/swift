@@ -127,6 +127,7 @@ from time import time
 
 from urllib.parse import quote
 
+from swift.common.trace import wsgi_trace, trace_function
 from swift.common.constraints import valid_api_version
 from swift.common.exceptions import MimeInvalid
 from swift.common.middleware.tempurl import get_tempurl_keys_from_metadata
@@ -181,6 +182,7 @@ class _CappedFileLikeObject(InputProxy):
         return chunk
 
 
+@wsgi_trace
 class FormPost(object):
     """
     FormPost Middleware
@@ -248,6 +250,7 @@ class FormPost(object):
                     env, start_response)
         return self.app(env, start_response)
 
+    @trace_function
     def _translate_form(self, env, boundary):
         """
         Translates the form data into subrequests and issues a
@@ -339,6 +342,7 @@ class FormPost(object):
             [('Location', redirect), ('Content-Length', str(len(body)))])
         return '303 See Other', headers, body
 
+    @trace_function
     def _perform_subrequest(self, orig_env, attributes, fp, keys):
         """
         Performs the subrequest and returns the response.
@@ -426,6 +430,7 @@ class FormPost(object):
             body = b''.join(resp)
         return wsgi_ctx._response_status, wsgi_ctx._response_headers, body
 
+    @trace_function
     def _get_keys(self, env):
         """
         Returns the X-[Account|Container]-Meta-Temp-URL-Key[-2] header values

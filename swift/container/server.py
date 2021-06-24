@@ -54,6 +54,8 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, HTTPConflict, \
     HTTPInsufficientStorage, HTTPException, HTTPMovedPermanently, \
     wsgi_to_str, str_to_wsgi
 from swift.common.wsgi import run_wsgi
+from swift.common.trace import wsgi_trace, new_trace_span, \
+    get_trace_headers, trace_exception, trace_function
 
 
 def gen_resp_headers(info, is_deleted=False):
@@ -113,6 +115,7 @@ def get_obj_name_and_placement(req):
     return drive, part, account, container, obj
 
 
+@wsgi_trace
 class ContainerController(BaseStorageServer):
     """WSGI Controller for the container server."""
 
@@ -206,6 +209,7 @@ class ContainerController(BaseStorageServer):
         else:
             return int(policy)
 
+    @trace_function
     def account_update(self, req, account, container, broker):
         """
         Update the account server(s) with latest container info.
@@ -246,46 +250,53 @@ class ContainerController(BaseStorageServer):
         account_404s = 0
 
         for account_host, account_device in updates:
-            account_ip, account_port = account_host.rsplit(':', 1)
-            new_path = '/' + '/'.join([account, container])
-            info = broker.get_info()
-            account_headers = HeaderKeyDict({
-                'x-put-timestamp': info['put_timestamp'],
-                'x-delete-timestamp': info['delete_timestamp'],
-                'x-object-count': info['object_count'],
-                'x-bytes-used': info['bytes_used'],
-                'x-trans-id': req.headers.get('x-trans-id', '-'),
-                'X-Backend-Storage-Policy-Index': info['storage_policy_index'],
-                'user-agent': 'container-server %s' % os.getpid(),
-                'referer': req.as_referer()})
-            if req.headers.get('x-account-override-deleted', 'no').lower() == \
-                    'yes':
-                account_headers['x-account-override-deleted'] = 'yes'
-            try:
-                with ConnectionTimeout(self.conn_timeout):
-                    conn = http_connect(
-                        account_ip, account_port, account_device,
-                        account_partition, 'PUT', new_path, account_headers)
-                with Timeout(self.node_timeout):
-                    account_response = conn.getresponse()
-                    account_response.read()
-                    if account_response.status == HTTP_NOT_FOUND:
-                        account_404s += 1
-                    elif not is_success(account_response.status):
-                        self.logger.error(
-                            'ERROR Account update failed '
-                            'with %(ip)s:%(port)s/%(device)s (will retry '
-                            'later): Response %(status)s %(reason)s',
-                            {'ip': account_ip, 'port': account_port,
-                             'device': account_device,
-                             'status': account_response.status,
-                             'reason': account_response.reason})
-            except (Exception, Timeout):
-                self.logger.exception(
-                    'ERROR account update failed with '
-                    '%(ip)s:%(port)s/%(device)s (will retry later)',
-                    {'ip': account_ip, 'port': account_port,
-                     'device': account_device})
+            with new_trace_span(
+                    req.environ,
+                    'account_update -> ({})'.format(':'.join(account_host))):
+                account_ip, account_port = account_host.rsplit(':', 1)
+                new_path = '/' + '/'.join([account, container])
+                info = broker.get_info()
+                account_headers = HeaderKeyDict({
+                    'x-put-timestamp': info['put_timestamp'],
+                    'x-delete-timestamp': info['delete_timestamp'],
+                    'x-object-count': info['object_count'],
+                    'x-bytes-used': info['bytes_used'],
+                    'x-trans-id': req.headers.get('x-trans-id', '-'),
+                    'X-Backend-Storage-Policy-Index':
+                        info['storage_policy_index'],
+                    'user-agent': 'container-server %s' % os.getpid(),
+                    'referer': req.as_referer()})
+                if req.headers.get(
+                        'x-account-override-deleted', 'no').lower() == 'yes':
+                    account_headers['x-account-override-deleted'] = 'yes'
+                account_headers.update(get_trace_headers(req.environ))
+                try:
+                    with ConnectionTimeout(self.conn_timeout):
+                        conn = http_connect(
+                            account_ip, account_port, account_device,
+                            account_partition, 'PUT', new_path,
+                            account_headers)
+                    with Timeout(self.node_timeout):
+                        account_response = conn.getresponse()
+                        account_response.read()
+                        if account_response.status == HTTP_NOT_FOUND:
+                            account_404s += 1
+                        elif not is_success(account_response.status):
+                            self.logger.error(
+                                'ERROR Account update failed '
+                                'with %(ip)s:%(port)s/%(device)s (will retry '
+                                'later): Response %(status)s %(reason)s',
+                                {'ip': account_ip, 'port': account_port,
+                                 'device': account_device,
+                                 'status': account_response.status,
+                                 'reason': account_response.reason})
+                except (Exception, Timeout) as ex:
+                    msg = ('ERROR account update failed with '
+                           '%(ip)s:%(port)s/%(device)s (will retry later)' %
+                           {'ip': account_ip, 'port': account_port,
+                            'device': account_device})
+                    self.logger.exception(msg)
+                    trace_exception(ex, req.environ)
         if updates and account_404s == len(updates):
             return HTTPNotFound(req=req)
         else:
@@ -298,6 +309,7 @@ class ContainerController(BaseStorageServer):
             self.logger.exception('Failed to update sync_store %s during %s' %
                                   (broker.db_file, method))
 
+    @trace_function
     def _redirect_to_shard(self, req, broker, obj_name):
         """
         If the request indicates that it can accept a redirection, look for a
@@ -351,6 +363,7 @@ class ContainerController(BaseStorageServer):
             drive_root, self.fallocate_reserve, self.fallocate_is_percent)
 
     @public
+    @trace_function
     @timing_stats()
     def DELETE(self, req):
         """Handle HTTP DELETE request."""
@@ -396,6 +409,7 @@ class ContainerController(BaseStorageServer):
                 return HTTPNoContent(request=req)
             return HTTPNotFound()
 
+    @trace_function
     def _update_or_create(self, req, broker, timestamp, new_container_policy,
                           requested_policy_index):
         """
@@ -468,6 +482,7 @@ class ContainerController(BaseStorageServer):
             raise HTTPNotFound()
         return created
 
+    @trace_function
     def _update_metadata(self, req, broker, req_timestamp, method):
         metadata = {
             wsgi_to_str(key): (wsgi_to_str(value), req_timestamp.internal)
@@ -484,6 +499,7 @@ class ContainerController(BaseStorageServer):
             self._update_sync_store(broker, method)
 
     @public
+    @trace_function
     @timing_stats()
     def PUT(self, req):
         """Handle HTTP PUT request."""
@@ -586,6 +602,7 @@ class ContainerController(BaseStorageServer):
         return self._create_ok_resp(req, broker, created)
 
     @public
+    @trace_function
     @timing_stats(sample_rate=0.1)
     def HEAD(self, req):
         """Handle HTTP HEAD request."""
@@ -652,6 +669,7 @@ class ContainerController(BaseStorageServer):
         return response
 
     @public
+    @trace_function
     @timing_stats()
     def GET(self, req):
         """
@@ -771,6 +789,7 @@ class ContainerController(BaseStorageServer):
             return self.GET_object(req, broker, container, params, info,
                                    is_deleted, out_content_type)
 
+    @trace_function
     @timing_stats()
     def GET_shard(self, req, broker, container, params, info,
                   is_deleted, out_content_type):
@@ -861,6 +880,7 @@ class ContainerController(BaseStorageServer):
                                          resp_headers, broker.metadata,
                                          container, listing)
 
+    @trace_function
     @timing_stats()
     def GET_object(self, req, broker, container, params, info,
                    is_deleted, out_content_type):
@@ -906,6 +926,7 @@ class ContainerController(BaseStorageServer):
                                          resp_headers, broker.metadata,
                                          container, listing)
 
+    @trace_function
     def _create_GET_response(self, req, out_content_type, info, resp_headers,
                              metadata, container, listing):
         for key, (value, _timestamp) in metadata.items():
@@ -928,6 +949,7 @@ class ContainerController(BaseStorageServer):
         return ret
 
     @public
+    @trace_function
     @replication
     @timing_stats(sample_rate=0.01)
     def REPLICATE(self, req):
@@ -951,6 +973,7 @@ class ContainerController(BaseStorageServer):
         return ret
 
     @public
+    @trace_function
     @timing_stats()
     def UPDATE(self, req):
         """
@@ -977,6 +1000,7 @@ class ContainerController(BaseStorageServer):
         return HTTPAccepted(request=req)
 
     @public
+    @trace_function
     @timing_stats()
     def POST(self, req):
         """

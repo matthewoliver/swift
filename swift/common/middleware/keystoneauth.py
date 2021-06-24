@@ -20,6 +20,7 @@ from swift.common.swob import HTTPNotFound, HTTPForbidden, HTTPUnauthorized
 from swift.common.utils import config_read_reseller_options, list_from_csv
 from swift.proxy.controllers.base import get_account_info
 import functools
+from swift.common.trace import wsgi_trace
 
 PROJECT_DOMAIN_ID_HEADER = 'x-account-project-domain-id'
 PROJECT_DOMAIN_ID_SYSMETA_HEADER = \
@@ -28,6 +29,7 @@ PROJECT_DOMAIN_ID_SYSMETA_HEADER = \
 UNKNOWN_ID = '_unknown'
 
 
+@wsgi_trace
 class KeystoneAuth(object):
     """Swift middleware to Keystone authorization system.
 

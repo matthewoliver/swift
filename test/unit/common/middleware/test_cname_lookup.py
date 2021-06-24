@@ -27,6 +27,7 @@ else:  # executed if the try has no errors
 from swift.common import registry
 from swift.common.middleware import cname_lookup
 from swift.common.swob import Request, HTTPMovedPermanently
+from test.unit import activate_tracing, TraceAssertMixin
 
 
 class FakeApp(object):
@@ -47,7 +48,7 @@ def start_response(*args):
     pass
 
 
-class TestCNAMELookup(unittest.TestCase):
+class TestCNAMELookup(unittest.TestCase, TraceAssertMixin):
 
     @unittest.skipIf(skip, "can't import dnspython")
     def setUp(self):
@@ -57,51 +58,84 @@ class TestCNAMELookup(unittest.TestCase):
     def test_pass_ip_addresses(self):
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': '10.134.23.198'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, [b'FAKE APP'])
+        self.assert_span_names(
+            in_memory,
+            ['CNAMELookupMiddleware'])
 
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'fc00:7ea1:f155::6321:8841'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, [b'FAKE APP'])
+        self.assert_span_names(
+            in_memory,
+            ['CNAMELookupMiddleware'])
 
     @mock.patch('swift.common.middleware.cname_lookup.lookup_cname',
                 new=lambda d, r: (0, d))
     def test_passthrough(self):
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'foo.example.com'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
+        self.assert_span_names(
+            in_memory,
+            ['CNAMELookupMiddleware'])
         self.assertEqual(resp, [b'FAKE APP'])
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'foo.example.com:8080'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, [b'FAKE APP'])
+        self.assert_span_names(
+            in_memory,
+            ['CNAMELookupMiddleware'])
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET',
                                           'SERVER_NAME': 'foo.example.com'},
                             headers={'Host': None})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, [b'FAKE APP'])
+        self.assert_span_names(
+            in_memory,
+            ['CNAMELookupMiddleware'])
 
     @mock.patch('swift.common.middleware.cname_lookup.lookup_cname',
                 new=lambda d, r: (0, '%s.example.com' % d))
     def test_good_lookup(self):
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'mysite.com'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
+        self.assert_span_names(
+            in_memory,
+            ['lookup_cname', 'CNAMELookupMiddleware'])
         self.assertEqual(resp, [b'FAKE APP'])
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'mysite.com:8080'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, [b'FAKE APP'])
+        self.assert_span_names(
+            in_memory,
+            ['lookup_cname', 'CNAMELookupMiddleware'])
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET',
                                           'SERVER_NAME': 'mysite.com'},
                             headers={'Host': None})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, [b'FAKE APP'])
+        self.assert_span_names(
+            in_memory,
+            ['lookup_cname', 'CNAMELookupMiddleware'])
 
     def test_lookup_chain_too_long(self):
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'mysite.com'})
+        _, in_memory = activate_tracing(req.environ)
 
         def my_lookup(d, r):
             if d == 'mysite.com':
@@ -116,27 +150,38 @@ class TestCNAMELookup(unittest.TestCase):
                         new=my_lookup):
             resp = self.app(req.environ, start_response)
             self.assertEqual(resp, [b'CNAME lookup failed after 2 tries'])
+        self.assert_span_names(
+            in_memory,
+            ['lookup_cname'] * 2 + ['CNAMELookupMiddleware'])
 
     @mock.patch('swift.common.middleware.cname_lookup.lookup_cname',
                 new=lambda d, r: (0, 'some.invalid.site.com'))
     def test_lookup_chain_bad_target(self):
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'mysite.com'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp,
                          [b'CNAME lookup failed to resolve to a valid domain'])
+        self.assert_span_names(
+            in_memory,
+            ['lookup_cname'] * 2 + ['CNAMELookupMiddleware'])
 
     @mock.patch('swift.common.middleware.cname_lookup.lookup_cname',
                 new=lambda d, r: (0, None))
     def test_something_weird(self):
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'mysite.com'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp,
                          [b'CNAME lookup failed to resolve to a valid domain'])
+        self.assert_span_names(
+            in_memory,
+            ['lookup_cname', 'CNAMELookupMiddleware'])
 
     @mock.patch('swift.common.middleware.cname_lookup.lookup_cname',
-                new=lambda d, r: (0, '%s.example.com' % d))
+                new=lambda d, r: (1, '%s.example.com' % d))
     def test_with_memcache(self):
         class memcache_stub(object):
             def __init__(self):
@@ -151,13 +196,23 @@ class TestCNAMELookup(unittest.TestCase):
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET',
                                           'swift.cache': memcache},
                             headers={'Host': 'mysite.com'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, [b'FAKE APP'])
+        self.assert_span_names(
+            in_memory,
+            ['lookup_cname', 'CNAMELookupMiddleware'])
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET',
                                           'swift.cache': memcache},
                             headers={'Host': 'mysite.com'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, [b'FAKE APP'])
+        # This time we avoid the lookup_cname_time because we've pulled the
+        # result from memcache.
+        self.assert_span_names(
+            in_memory,
+            ['CNAMELookupMiddleware'])
 
     def test_caching(self):
         fail_to_resolve = [b'CNAME lookup failed to resolve to a valid domain']
@@ -186,6 +241,7 @@ class TestCNAMELookup(unittest.TestCase):
             req = Request.blank('/', environ={'REQUEST_METHOD': 'GET',
                                               'swift.cache': memcache},
                                 headers={'Host': 'mysite2.com'})
+            _, in_memory = activate_tracing(req.environ)
             resp = self.app(req.environ, start_response)
             self.assertEqual(resp, [b'FAKE APP'])
             self.assertEqual(m.call_count, 1)
@@ -193,10 +249,14 @@ class TestCNAMELookup(unittest.TestCase):
                              'c.example.com')
             self.assertIsInstance(req.environ['HTTP_HOST'], str)
             self.assertEqual(req.environ['HTTP_HOST'], 'c.example.com')
+            self.assert_span_names(
+                in_memory,
+                ['lookup_cname', 'CNAMELookupMiddleware'])
 
             req = Request.blank('/', environ={'REQUEST_METHOD': 'GET',
                                               'swift.cache': memcache},
                                 headers={'Host': 'mysite2.com'})
+            _, in_memory = activate_tracing(req.environ)
             resp = self.app(req.environ, start_response)
             self.assertEqual(resp, [b'FAKE APP'])
             self.assertEqual(m.call_count, 1)
@@ -204,6 +264,11 @@ class TestCNAMELookup(unittest.TestCase):
                              'c.example.com')
             self.assertIsInstance(req.environ['HTTP_HOST'], str)
             self.assertEqual(req.environ['HTTP_HOST'], 'c.example.com')
+            # This time we avoid the lookup_cname_time because we've pulled the
+            # result from memcache.
+            self.assert_span_names(
+                in_memory,
+                ['CNAMELookupMiddleware'])
 
         for exc, num in ((dns.resolver.NXDOMAIN(), 3),
                          (dns.resolver.NoAnswer(), 4)):
@@ -212,45 +277,69 @@ class TestCNAMELookup(unittest.TestCase):
                 req = Request.blank('/', environ={'REQUEST_METHOD': 'GET',
                                                   'swift.cache': memcache},
                                     headers={'Host': 'mysite%d.com' % num})
+                _, in_memory = activate_tracing(req.environ)
                 resp = self.app(req.environ, start_response)
                 self.assertEqual(resp, fail_to_resolve)
                 self.assertEqual(m.call_count, 1)
                 self.assertEqual(memcache.cache.get('cname-mysite3.com'),
                                  False)
+                self.assert_span_names(
+                    in_memory,
+                    ['lookup_cname', 'CNAMELookupMiddleware'])
                 req = Request.blank('/', environ={'REQUEST_METHOD': 'GET',
                                                   'swift.cache': memcache},
                                     headers={'Host': 'mysite%d.com' % num})
+                _, in_memory = activate_tracing(req.environ)
                 resp = self.app(req.environ, start_response)
                 self.assertEqual(resp, fail_to_resolve)
                 self.assertEqual(m.call_count, 1)
                 self.assertEqual(
                     memcache.cache.get('cname-mysite%d.com' % num), False)
+                # This time we avoid the lookup_cname_time because we've
+                # pulled even the error result from memcache.
+                self.assert_span_names(
+                    in_memory,
+                    ['CNAMELookupMiddleware'])
 
         with mock.patch(dns_module) as m:
             m.side_effect = dns.exception.DNSException()
             req = Request.blank('/', environ={'REQUEST_METHOD': 'GET',
                                               'swift.cache': memcache},
                                 headers={'Host': 'mysite5.com'})
+            _, in_memory = activate_tracing(req.environ)
             resp = self.app(req.environ, start_response)
             self.assertEqual(resp, fail_to_resolve)
             self.assertEqual(m.call_count, 1)
             self.assertFalse('cname-mysite5.com' in memcache.cache)
+            self.assert_span_names(
+                in_memory,
+                ['lookup_cname', 'CNAMELookupMiddleware'])
             req = Request.blank('/', environ={'REQUEST_METHOD': 'GET',
                                               'swift.cache': memcache},
                                 headers={'Host': 'mysite5.com'})
+            _, in_memory = activate_tracing(req.environ)
             resp = self.app(req.environ, start_response)
             self.assertEqual(resp, fail_to_resolve)
             self.assertEqual(m.call_count, 2)
             self.assertFalse('cname-mysite5.com' in memcache.cache)
+            # Calling out for a cname_lookup again because we don't cache
+            # a dns module exceptions, we'll just try again.
+            self.assert_span_names(
+                in_memory,
+                ['lookup_cname', 'CNAMELookupMiddleware'])
 
     @mock.patch('swift.common.middleware.cname_lookup.lookup_cname',
                 new=lambda d, r: (0, 'c.aexample.com'))
     def test_cname_matching_ending_not_domain(self):
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'foo.com'})
+        _, in_memory = activate_tracing(req.environ)
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp,
                          [b'CNAME lookup failed to resolve to a valid domain'])
+        self.assert_span_names(
+            in_memory,
+            ['lookup_cname'] * 2 + ['CNAMELookupMiddleware'])
 
     @mock.patch('swift.common.middleware.cname_lookup.lookup_cname',
                 new=lambda d, r: (0, None))
@@ -260,8 +349,12 @@ class TestCNAMELookup(unittest.TestCase):
                                                   'lookup_depth': 2})
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'c.a.example.com'})
+        _, in_memory = activate_tracing(req.environ)
         resp = app(req.environ, start_response)
         self.assertEqual(resp, [b'FAKE APP'])
+        self.assert_span_names(
+            in_memory,
+            ['CNAMELookupMiddleware'])
 
     def test_storage_domains_conf_format(self):
         conf = {'storage_domain': 'foo.com'}
@@ -289,21 +382,27 @@ class TestCNAMELookup(unittest.TestCase):
                 'lookup_depth': 2}
         app = cname_lookup.CNAMELookupMiddleware(FakeApp(), conf)
 
-        def do_test(lookup_back):
+        def do_test(lookup_back, cname_spans):
             req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                                 headers={'Host': 'c.a.example.com'})
+            _, in_memory = activate_tracing(req.environ)
             module = 'swift.common.middleware.cname_lookup.lookup_cname'
             with mock.patch(module, lambda d, r: (0, lookup_back)):
-                return app(req.environ, start_response)
+                resp = app(req.environ, start_response)
+            self.assert_span_names(
+                in_memory,
+                ['lookup_cname'] * cname_spans +
+                ['CNAMELookupMiddleware'])
+            return resp
 
-        resp = do_test('c.storage1.com')
+        resp = do_test('c.storage1.com', 1)
         self.assertEqual(resp, [b'FAKE APP'])
 
-        resp = do_test('c.storage2.com')
+        resp = do_test('c.storage2.com', 1)
         self.assertEqual(resp, [b'FAKE APP'])
 
         bad_domain = [b'CNAME lookup failed to resolve to a valid domain']
-        resp = do_test('c.badtest.com')
+        resp = do_test('c.badtest.com', 2)
         self.assertEqual(resp, bad_domain)
 
     def test_host_is_storage_domain(self):
@@ -311,21 +410,27 @@ class TestCNAMELookup(unittest.TestCase):
                 'lookup_depth': 2}
         app = cname_lookup.CNAMELookupMiddleware(FakeApp(), conf)
 
-        def do_test(host):
+        def do_test(host, cname_spans):
             with mock.patch.object(
                 app.resolver, 'query',
                 side_effect=dns.exception.DNSException,
             ) as mock_lookup:
                 req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                                     headers={'Host': host})
-                return app(req.environ, start_response), mock_lookup
+                _, in_memory = activate_tracing(req.environ)
+                resp = app(req.environ, start_response)
+                self.assert_span_names(
+                    in_memory,
+                    ['lookup_cname'] * cname_spans +
+                    ['CNAMELookupMiddleware'])
+                return resp, mock_lookup
 
         bad_domain = [b'CNAME lookup failed to resolve to a valid domain']
-        resp, mock_lookup = do_test('c.badtest.com')
+        resp, mock_lookup = do_test('c.badtest.com', 1)
         self.assertEqual(resp, bad_domain)
         self.assertEqual(1, len(mock_lookup.mock_calls))
 
-        resp, mock_lookup = do_test('storage.example.com')
+        resp, mock_lookup = do_test('storage.example.com', 0)
         self.assertEqual(resp, [b'FAKE APP'])
         self.assertEqual(0, len(mock_lookup.mock_calls))
 
@@ -336,10 +441,14 @@ class TestCNAMELookup(unittest.TestCase):
 
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'},
                             headers={'Host': 'mysite.com'})
+        _, in_memory = activate_tracing(req.environ)
         module = 'swift.common.middleware.cname_lookup.lookup_cname'
         with mock.patch(module, lambda d, r: (0, 'example.com')):
             resp = app(req.environ, start_response)
             self.assertEqual(resp, [b'FAKE APP'])
+        self.assert_span_names(
+            in_memory,
+            ['lookup_cname', 'CNAMELookupMiddleware'])
 
     def test_redirect(self):
         app = cname_lookup.CNAMELookupMiddleware(RedirectSlashApp(), {})
@@ -348,10 +457,14 @@ class TestCNAMELookup(unittest.TestCase):
         with mock.patch(module, lambda d, r: (0, 'cont.acct.example.com')):
             req = Request.blank('/test', environ={'REQUEST_METHOD': 'GET'},
                                 headers={'Host': 'mysite.com'})
+            _, in_memory = activate_tracing(req.environ)
             resp = req.get_response(app)
             self.assertEqual(resp.status_int, 301)
             self.assertEqual(resp.headers.get('Location'),
                              'http://mysite.com/test/')
+        self.assert_span_names(
+            in_memory,
+            ['lookup_cname', 'CNAMELookupMiddleware'])
 
     def test_configured_nameservers(self):
         class MockedResolver(object):

@@ -23,8 +23,10 @@ from swift.common.utils import (
     config_true_value, get_logger, streq_const_time)
 from swift.proxy.controllers.base import get_container_info
 from swift.common.registry import register_swift_info
+from swift.common.trace import wsgi_trace
 
 
+@wsgi_trace
 class ContainerSync(object):
     """
     WSGI middleware that validates an incoming container sync request

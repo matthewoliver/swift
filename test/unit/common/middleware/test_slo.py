@@ -35,6 +35,8 @@ from swift.common.utils import quote, closing_if_possible, close_if_possible, \
     parse_content_type, iter_multipart_mime_documents, parse_mime_headers, \
     Timestamp, md5, normalize_delete_at_timestamp
 from test.unit.common.middleware.helpers import FakeSwift
+from test.unit import activate_tracing, clear_tracing, TraceAssertMixin
+from swift.common.trace import wsgi_trace
 
 
 test_xml_data = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -61,7 +63,7 @@ def md5hex(s):
     return md5(s, usedforsecurity=False).hexdigest()
 
 
-class SloTestCase(unittest.TestCase):
+class SloTestCase(unittest.TestCase, TraceAssertMixin):
 
     def setUp(self):
         self.app = FakeSwift()
@@ -90,8 +92,25 @@ class SloTestCase(unittest.TestCase):
                 body += chunk
         return status[0], headers[0], body
 
-    def call_slo(self, req, **kwargs):
-        return self.call_app(req, app=self.slo, **kwargs)
+    def call_slo(self, req, expected_spans=None, skip_span=False, **kwargs):
+        _, in_memory = activate_tracing(req.environ)
+        status, headers, body = self.call_app(req, app=self.slo, **kwargs)
+        if expected_spans is None:
+            expected_spans = ['FakeSwift', 'StaticLargeObject']
+            if 'X-Static-Large-Object' in headers:
+                expected_spans.append('get_slo_segments')
+            if req.method in ['GET', 'HEAD']:
+                expected_spans.append('handle_slo_get_or_head')
+            elif req.method == 'PUT':
+                expected_spans[0] = 'handle_multipart_put'
+            elif req.method == 'DELETE':
+                expected_spans.extend(
+                    ['get_segments_to_delete_iter', 'handle_delete_iter',
+                     'handle_multipart_delete'])
+        if not skip_span:
+            self.assert_span_names(in_memory, expected_spans)
+        clear_tracing(req.environ)
+        return status, headers, body
 
 
 class TestSloMiddleware(SloTestCase):
@@ -106,17 +125,25 @@ class TestSloMiddleware(SloTestCase):
 
     def test_handle_multipart_no_obj(self):
         req = Request.blank('/')
+        _, in_memory = activate_tracing(req.environ)
         resp_iter = self.slo(req.environ, fake_start_response)
         self.assertEqual(self.app.calls, [('GET', '/')])
         self.assertEqual(b''.join(resp_iter), b'passed')
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'StaticLargeObject'])
 
     def test_slo_header_assigned(self):
         req = Request.blank(
             '/v1/a/c/o', headers={'x-static-large-object': "true"},
             environ={'REQUEST_METHOD': 'PUT'})
+        _, in_memory = activate_tracing(req.environ)
         resp = b''.join(self.slo(req.environ, fake_start_response))
         self.assertTrue(
             resp.startswith(b'X-Static-Large-Object is a reserved header'))
+        self.assert_span_names(
+            in_memory,
+            ['StaticLargeObject'])
 
     def test_slo_PUT_env_override(self):
         path = '/v1/a/c/o'
@@ -130,6 +157,7 @@ class TestSloMiddleware(SloTestCase):
             path, headers={'x-static-large-object': "true"},
             environ={'REQUEST_METHOD': 'PUT', 'swift.slo_override': True},
             body=body)
+        _, in_memory = activate_tracing(req.environ)
         self.app.register('PUT', path, swob.HTTPCreated, {})
         resp_iter = self.slo(req.environ, start_response)
         self.assertEqual(b'', b''.join(resp_iter))
@@ -142,6 +170,9 @@ class TestSloMiddleware(SloTestCase):
         ], self.app.calls_with_headers)
         self.assertEqual(body, self.app.uploaded[path][1])
         self.assertEqual(resp_status[0], '201 Created')
+        self.assert_span_names(
+            in_memory,
+            ['FakeSwift', 'StaticLargeObject'])
 
     def _put_bogus_slo(self, manifest_text,
                        manifest_path='/v1/a/c/the-manifest'):
@@ -332,7 +363,9 @@ class TestSloMiddleware(SloTestCase):
              'Content-Length': len(listing_json)},
             listing_json)
         req = Request.blank('/v1/a/c', method='GET')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=['FakeSwift', 'StaticLargeObject',
+                                 'handle_container_listing'])
         self.assertEqual(json.loads(body), [{
             "slo_etag": '"dc9947c2b53a3f55fe20c1394268e216"',
             "hash": "8de7b0b1551660da51d8d96a53b85531; this=that",
@@ -424,18 +457,24 @@ class TestSloPutManifest(SloTestCase):
     def test_put_manifest_too_quick_fail(self):
         req = Request.blank('/v1/a/c/o?multipart-manifest=put', method='PUT')
         req.content_length = self.slo.max_manifest_size + 1
-        status, headers, body = self.call_slo(req)
+        expected_spans = ['handle_multipart_put', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '413 Request Entity Too Large')
-
+        expected_spans = ['parse_and_validate_input_timing',
+                          'handle_multipart_put', 'StaticLargeObject']
         with patch.object(self.slo, 'max_manifest_segments', 0):
             req = Request.blank('/v1/a/c/o?multipart-manifest=put',
                                 method='PUT', body=test_json_data)
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
             self.assertEqual(status, '413 Request Entity Too Large')
 
         req = Request.blank('/v1/a/c/o?multipart-manifest=put', method='PUT',
                             headers={'X-Copy-From': 'lala'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = ['handle_multipart_put', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '405 Method Not Allowed')
 
         # we already validated that there are enough path segments in __call__
@@ -467,7 +506,12 @@ class TestSloPutManifest(SloTestCase):
             # Sanity
             self.assertNotIn(h, req.headers)
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         gen_etag = '"' + md5hex('etagoftheobjectsegment') + '"'
         self.assertIn(('Etag', gen_etag), headers)
         self.assertIn('X-Static-Large-Object', req.headers)
@@ -508,7 +552,13 @@ class TestSloPutManifest(SloTestCase):
             environ={'REQUEST_METHOD': 'PUT'}, headers={'Accept': 'test'},
             body=test_json_data)
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'StaticLargeObject',
+            'handle_multipart_put', 'FakeSwift',
+            'StaticLargeObject_1', 'handle_slo_get_or_head', 'FakeSwift_1',
+            'StaticLargeObject_2', 'handle_slo_get_or_head', 'FakeSwift_2']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual('202 Accepted', status)
         headers_found = [h.lower() for h, v in headers]
         self.assertNotIn('etag', headers_found)
@@ -540,7 +590,13 @@ class TestSloPutManifest(SloTestCase):
             environ={'REQUEST_METHOD': 'PUT'}, headers={'Accept': 'test'},
             body=test_json_data)
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'StaticLargeObject',
+            'handle_multipart_put', 'FakeSwift',
+            'StaticLargeObject_1', 'handle_slo_get_or_head', 'FakeSwift_1',
+            'StaticLargeObject_2', 'handle_slo_get_or_head', 'FakeSwift_2']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual('202 Accepted', status)
         headers_found = [h.lower() for h, v in headers]
         self.assertNotIn('etag', headers_found)
@@ -573,7 +629,13 @@ class TestSloPutManifest(SloTestCase):
             headers={'Accept': 'application/json'},
             body=test_json_data)
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'StaticLargeObject',
+            'handle_multipart_put', 'FakeSwift',
+            'StaticLargeObject_1', 'handle_slo_get_or_head', 'FakeSwift_1',
+            'StaticLargeObject_2', 'handle_slo_get_or_head', 'FakeSwift_2']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual('202 Accepted', status)
         headers_found = [h.lower() for h, v in headers]
         self.assertNotIn('etag', headers_found)
@@ -606,7 +668,13 @@ class TestSloPutManifest(SloTestCase):
             environ={'REQUEST_METHOD': 'PUT'}, headers={'Accept': 'test'},
             body=test_json_data)
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'StaticLargeObject',
+            'handle_multipart_put', 'FakeSwift',
+            'StaticLargeObject_1', 'handle_slo_get_or_head', 'FakeSwift_1',
+            'StaticLargeObject_2', 'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual('202 Accepted', status)
         headers_found = [h.lower() for h, v in headers]
         self.assertNotIn('etag', headers_found)
@@ -647,7 +715,13 @@ class TestSloPutManifest(SloTestCase):
             headers={'Accept': 'application/json'},
             body=test_json_data)
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'StaticLargeObject',
+            'handle_multipart_put', 'FakeSwift',
+            'StaticLargeObject_1', 'handle_slo_get_or_head', 'FakeSwift_1',
+            'StaticLargeObject_2', 'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual('202 Accepted', status)
         headers_found = [h.lower() for h, v in headers]
         self.assertNotIn('etag', headers_found)
@@ -686,7 +760,13 @@ class TestSloPutManifest(SloTestCase):
             headers={'Accept': 'application/json', 'ETag': 'bad etag'},
             body=test_json_data)
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'StaticLargeObject',
+            'handle_multipart_put', 'FakeSwift',
+            'StaticLargeObject_1', 'handle_slo_get_or_head', 'FakeSwift_1',
+            'StaticLargeObject_2', 'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual('202 Accepted', status)
         headers_found = [h.lower() for h, v in headers]
         self.assertNotIn('etag', headers_found)
@@ -741,7 +821,11 @@ class TestSloPutManifest(SloTestCase):
                                       'size_bytes': 100}]).encode('ascii')
         req = Request.blank('/v1/a/c/o?multipart-manifest=put',
                             method='PUT', body=test_json_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '400 Bad Request')
 
     def test_handle_multipart_put_allow_empty_last_segment(self):
@@ -753,7 +837,13 @@ class TestSloPutManifest(SloTestCase):
                                       'size_bytes': 0}]).encode('ascii')
         req = Request.blank('/v1/AUTH_test/c/man?multipart-manifest=put',
                             method='PUT', body=test_json_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject_2', 'handle_slo_get_or_head',
+            'FakeSwift_2', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '201 Created')
 
     def test_handle_multipart_put_invalid_data(self):
@@ -788,7 +878,11 @@ class TestSloPutManifest(SloTestCase):
             environ={'REQUEST_METHOD': 'PUT'}, headers={'Accept': 'test'},
             body=test_json_data)
         self.assertNotIn('X-Static-Large-Object', req.headers)
-        self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject']
+        self.call_slo(req, expected_spans=expected_spans)
         self.assertIn('X-Static-Large-Object', req.headers)
         self.assertEqual(req.environ['PATH_INFO'], '/v1/AUTH_test/c/man')
         self.assertIn(('HEAD', '/v1/AUTH_test/cont/object\xe2\x99\xa1'),
@@ -809,7 +903,7 @@ class TestSloPutManifest(SloTestCase):
         req = Request.blank(
             '/test_good/AUTH_test/c/man?multipart-manifest=put',
             environ={'REQUEST_METHOD': 'PUT'}, body=bad_data)
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(req, skip_span=True)
         self.assertEqual(status, '400 Bad Request')
         self.assertIn(b'invalid size_bytes', body)
 
@@ -834,13 +928,13 @@ class TestSloPutManifest(SloTestCase):
             req = Request.blank(
                 '/v1/AUTH_test/c/man?multipart-manifest=put',
                 environ={'REQUEST_METHOD': 'PUT'}, body=bad_data)
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(req, skip_span=True)
             self.assertEqual(status, '400 Bad Request')
 
         req = Request.blank(
             '/v1/AUTH_test/c/man?multipart-manifest=put',
             environ={'REQUEST_METHOD': 'PUT'}, body=None)
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(req, skip_span=True)
         self.assertEqual(status, '411 Length Required')
 
     def test_handle_multipart_put_check_data(self):
@@ -850,7 +944,13 @@ class TestSloPutManifest(SloTestCase):
         req = Request.blank(
             '/v1/AUTH_test/checktest/man_3?multipart-manifest=put',
             environ={'REQUEST_METHOD': 'PUT'}, body=good_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject_2', 'handle_slo_get_or_head',
+            'FakeSwift_2', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(self.app.call_count, 3)
 
         # go behind SLO's back and see what actually got stored
@@ -881,7 +981,15 @@ class TestSloPutManifest(SloTestCase):
             headers={'Accept': 'application/json'},
             body=bad_data)
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject_2', 'handle_slo_get_or_head',
+            'FakeSwift_2', 'StaticLargeObject_3', 'handle_slo_get_or_head',
+            'FakeSwift_3', 'FakeSwift_4', 'StaticLargeObject_4',
+            'handle_slo_get_or_head', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(self.app.call_count, 5)
         errors = json.loads(body)['Errors']
 
@@ -902,7 +1010,13 @@ class TestSloPutManifest(SloTestCase):
         req = Request.blank(
             '/v1/AUTH_test/checktest/man_3?multipart-manifest=put',
             environ={'REQUEST_METHOD': 'PUT'}, body=good_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject_2', 'handle_slo_get_or_head',
+            'FakeSwift_2', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(self.app.call_count, 3)
 
         # Check that we still populated the manifest properly from our HEADs
@@ -923,7 +1037,13 @@ class TestSloPutManifest(SloTestCase):
                                       'size_bytes': 100}]).encode('ascii')
         req = Request.blank('/v1/AUTH_test/c/o?multipart-manifest=put',
                             method='PUT', body=test_json_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject_2', 'handle_slo_get_or_head',
+            'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '400 Bad Request')
         self.assertIn(b'Too small; each segment must be at least 1 byte', body)
 
@@ -939,7 +1059,13 @@ class TestSloPutManifest(SloTestCase):
                                       'size_bytes': 100}]).encode('ascii')
         req = Request.blank('/v1/AUTH_test/c/o?multipart-manifest=put',
                             method='PUT', body=test_json_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject_2', 'handle_slo_get_or_head',
+            'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '400 Bad Request')
         self.assertIn(b'at least 1 byte', body)
         self.assertIn(b'Etag Mismatch', body)
@@ -953,7 +1079,13 @@ class TestSloPutManifest(SloTestCase):
         req = Request.blank(
             '/v1/AUTH_test/checktest/man_3?multipart-manifest=put',
             environ={'REQUEST_METHOD': 'PUT'}, body=good_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject_2', 'handle_slo_get_or_head',
+            'FakeSwift_2', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(self.app.call_count, 3)
 
         # Check that we still populated the manifest properly from our HEADs
@@ -978,7 +1110,13 @@ class TestSloPutManifest(SloTestCase):
             environ={'REQUEST_METHOD': 'PUT',
                      'swift.callback.slo_manifest_hook': data_inserter},
             body=good_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject_2', 'handle_slo_get_or_head',
+            'FakeSwift_2', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(self.app.call_count, 3)
 
         # Check that we still populated the manifest properly from our HEADs
@@ -1011,7 +1149,13 @@ class TestSloPutManifest(SloTestCase):
             environ={'REQUEST_METHOD': 'PUT',
                      'swift.callback.slo_manifest_hook': complainer},
             body=good_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject_2', 'handle_slo_get_or_head',
+            'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(self.app.call_count, 2)
         self.assertEqual(status, '400 Bad Request')
         body = body.split(b'\n')
@@ -1025,7 +1169,12 @@ class TestSloPutManifest(SloTestCase):
         req = Request.blank(
             '/v1/AUTH_test/checktest/man_3?multipart-manifest=put',
             environ={'REQUEST_METHOD': 'PUT'}, body=bad_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual('400 Bad Request', status)
         self.assertIn(b"Unsatisfiable Range", body)
 
@@ -1037,7 +1186,12 @@ class TestSloPutManifest(SloTestCase):
             '/v1/AUTH_test/c/man?multipart-manifest=put',
             environ={'REQUEST_METHOD': 'PUT'}, headers={'If-None-Match': '*'},
             body=test_json_data)
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(('201 Created', b''), (status, body))
         self.assertEqual([
             ('HEAD', '/v1/AUTH_test/cont/object'),
@@ -1066,7 +1220,14 @@ class TestSloPutManifest(SloTestCase):
             '/v1/AUTH_test/checktest/man_3?multipart-manifest=put',
             environ={'REQUEST_METHOD': 'PUT'}, body=good_data,
             headers={override_header: 'my custom etag'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'parse_and_validate_input_timing', 'handle_multipart_put',
+            'FakeSwift', 'StaticLargeObject_1', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'StaticLargeObject_2', 'handle_slo_get_or_head',
+            'FakeSwift_2', 'StaticLargeObject_3', 'handle_slo_get_or_head',
+            'FakeSwift_3', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(('201 Created', b''), (status, body))
         expected_etag = '"%s"' % md5hex(
             'ab:1-1;b:0-0;aetagoftheobjectsegment:10-40;')
@@ -1301,7 +1462,10 @@ class TestSloDeleteManifest(SloTestCase):
             b'/v1/AUTH_test/deltest/man\xff\xfe?multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=[
+                'StaticLargeObject', 'get_segments_to_delete_iter',
+                'handle_delete_iter', 'handle_multipart_delete'])
         self.assertEqual(status, '200 OK')
         resp_data = json.loads(body)
         self.assertEqual(resp_data['Response Status'],
@@ -1312,7 +1476,12 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/AUTH_test/deltest/man_404?multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'get_segments_to_delete_iter',
+            'handle_delete_iter', 'handle_multipart_delete',
+            'get_slo_segments']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         resp_data = json.loads(body)
         self.assertEqual(
             self.app.calls,
@@ -1329,7 +1498,15 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/AUTH_test/deltest/man?multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift_1', 'handle_delete.do_delete', 'FakeSwift_2',
+            'handle_delete.do_delete', '_process_delete', '_process_delete',
+            'FakeSwift_3', 'handle_delete.do_delete', '_process_delete',
+            'get_segments_to_delete_iter', 'handle_delete_iter',
+            'handle_multipart_delete', 'StaticLargeObject', 'FakeSwift',
+            'get_slo_segments']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         resp_data = json.loads(body)
         self.assertEqual(
             set(self.app.calls),
@@ -1346,7 +1523,16 @@ class TestSloDeleteManifest(SloTestCase):
         req = Request.blank(
             '/v1/AUTH_test/deltest/man-all-there?multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE'})
-        self.call_slo(req)
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'FakeSwift_1',
+            'handle_delete.do_delete', 'FakeSwift_2',
+            'handle_delete.do_delete', 'FakeSwift_3',
+            'handle_delete.do_delete', 'get_segments_to_delete_iter',
+            'handle_delete_iter', 'handle_multipart_delete',
+            'get_slo_segments', '_process_delete', '_process_delete',
+            '_process_delete']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(set(self.app.calls), set([
             ('GET',
              '/v1/AUTH_test/deltest/man-all-there?multipart-manifest=get'),
@@ -1361,7 +1547,15 @@ class TestSloDeleteManifest(SloTestCase):
         req = Request.blank(
             '/v1/AUTH_test/deltest/man-all-there?multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE'})
-        self.call_slo(req)
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'FakeSwift_1', 'FakeSwift_2',
+            'handle_delete.do_delete', 'FakeSwift_3',
+            'handle_delete.do_delete', 'FakeSwift_4',
+            'handle_delete.do_delete', 'get_segments_to_delete_iter',
+            'handle_delete_iter', 'handle_multipart_delete',
+            'get_slo_segments', '_process_delete', '_process_delete',
+            '_process_delete']
+        self.call_slo(req, expected_spans=expected_spans)
         self.assertEqual(self.app.calls_with_headers[:2], [
             ('GET',
              '/v1/AUTH_test/deltest/man-all-there?multipart-manifest=get',
@@ -1391,7 +1585,13 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/%s/deltest/man-all-there?'
             'multipart-manifest=delete' % wsgi_acct,
             environ={'REQUEST_METHOD': 'DELETE'})
-        status, _, body = self.call_slo(req)
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'FakeSwift_1', 'FakeSwift_2',
+            'FakeSwift_3', 'get_segments_to_delete_iter', 'handle_delete_iter',
+            'handle_multipart_delete', 'get_slo_segments', '_process_delete',
+            '_process_delete', '_process_delete', 'handle_delete.do_delete',
+            'handle_delete.do_delete', 'handle_delete.do_delete']
+        status, _, body = self.call_slo(req, expected_spans=expected_spans)
         self.assertEqual('200 OK', status)
         lines = body.split(b'\n')
         for l in lines:
@@ -1416,7 +1616,19 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/AUTH_test/deltest/manifest-with-submanifest?' +
             'multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE'})
-        self.call_slo(req)
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'handle_delete.do_delete',
+            'FakeSwift_1', 'FakeSwift_2', 'FakeSwift_3',
+            'handle_delete.do_delete', 'FakeSwift_4',
+            'handle_delete.do_delete', 'FakeSwift_5',
+            'handle_delete.do_delete', 'FakeSwift_6',
+            'handle_delete.do_delete', 'FakeSwift_7',
+            'handle_delete.do_delete', 'get_segments_to_delete_iter',
+            'handle_delete_iter', 'handle_multipart_delete',
+            'get_slo_segments', 'get_slo_segments', '_process_delete',
+            '_process_delete', '_process_delete', '_process_delete',
+            '_process_delete', '_process_delete']
+        self.call_slo(req, expected_spans=expected_spans)
         self.assertEqual(
             set(self.app.calls),
             {('GET', '/v1/AUTH_test/deltest/' +
@@ -1436,8 +1648,13 @@ class TestSloDeleteManifest(SloTestCase):
             'multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'get_segments_to_delete_iter',
+            'handle_delete_iter', 'handle_multipart_delete',
+            'get_slo_segments']
         with patch.object(self.slo, 'max_manifest_segments', 1):
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
         self.assertEqual(status, '200 OK')
         resp_data = json.loads(body)
         self.assertEqual(resp_data['Response Status'], '400 Bad Request')
@@ -1450,7 +1667,16 @@ class TestSloDeleteManifest(SloTestCase):
             '?multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'FakeSwift_1', 'FakeSwift_2',
+            'handle_delete.do_delete', 'FakeSwift_3',
+            'handle_delete.do_delete', 'FakeSwift_4',
+            'handle_delete.do_delete', 'get_segments_to_delete_iter',
+            'handle_delete_iter', 'handle_multipart_delete',
+            'get_slo_segments', 'get_slo_segments', '_process_delete',
+            '_process_delete', '_process_delete']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         resp_data = json.loads(body)
         self.assertEqual(set(self.app.calls), {
             ('GET', '/v1/AUTH_test/deltest/' +
@@ -1477,7 +1703,16 @@ class TestSloDeleteManifest(SloTestCase):
              '?multipart-manifest=delete'),
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'FakeSwift_1', 'FakeSwift_2',
+            'handle_delete.do_delete', 'FakeSwift_3',
+            'handle_delete.do_delete', 'FakeSwift_4',
+            'handle_delete.do_delete', 'get_segments_to_delete_iter',
+            'handle_delete_iter', 'handle_multipart_delete',
+            'get_slo_segments', 'get_slo_segments', '_process_delete',
+            '_process_delete', '_process_delete']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '200 OK')
         resp_data = json.loads(body)
         self.assertEqual(resp_data['Response Status'], '400 Bad Request')
@@ -1494,7 +1729,16 @@ class TestSloDeleteManifest(SloTestCase):
              '?multipart-manifest=delete'),
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'FakeSwift_1', 'FakeSwift_2',
+            'handle_delete.do_delete', 'FakeSwift_3',
+            'handle_delete.do_delete', 'FakeSwift_4',
+            'handle_delete.do_delete', 'get_segments_to_delete_iter',
+            'handle_delete_iter', 'handle_multipart_delete',
+            'get_slo_segments', 'get_slo_segments', '_process_delete',
+            '_process_delete', '_process_delete']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '200 OK')
         resp_data = json.loads(body)
         self.assertEqual(resp_data['Response Status'], '400 Bad Request')
@@ -1507,7 +1751,12 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/AUTH_test/deltest/a_1?multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'get_segments_to_delete_iter',
+            'handle_delete_iter', 'handle_multipart_delete',
+            'get_slo_segments']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         resp_data = json.loads(body)
         self.assertEqual(
             self.app.calls,
@@ -1525,7 +1774,12 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/AUTH_test/deltest/manifest-badjson?multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'get_segments_to_delete_iter',
+            'handle_delete_iter', 'handle_multipart_delete',
+            'get_slo_segments']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         resp_data = json.loads(body)
         self.assertEqual(self.app.calls,
                          [('GET', '/v1/AUTH_test/deltest/' +
@@ -1544,7 +1798,15 @@ class TestSloDeleteManifest(SloTestCase):
             '?multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'FakeSwift_1', 'FakeSwift_2',
+            'handle_delete.do_delete', 'FakeSwift_3',
+            'handle_delete.do_delete', 'handle_delete.do_delete',
+            'get_segments_to_delete_iter', 'handle_delete_iter',
+            'handle_multipart_delete', 'get_slo_segments', '_process_delete',
+            '_process_delete', '_process_delete']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         resp_data = json.loads(body)
         self.assertEqual(
             set(self.app.calls),
@@ -1566,7 +1828,15 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/AUTH_test/deltest/man-all-there?multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE', 'CONTENT_TYPE': 'foo/bar'},
             headers={'Accept': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'FakeSwift_1', 'FakeSwift_2',
+            'handle_delete.do_delete', 'FakeSwift_3',
+            'handle_delete.do_delete', 'handle_delete.do_delete',
+            'get_segments_to_delete_iter', 'handle_delete_iter',
+            'handle_multipart_delete', 'get_slo_segments', '_process_delete',
+            '_process_delete', '_process_delete']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         resp_data = json.loads(body)
@@ -1585,7 +1855,11 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/AUTH_test/deltest/man_404?async=t&multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'get_slo_segments', 'handle_async_delete',
+            'handle_multipart_delete', 'StaticLargeObject']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual('404 Not Found', status)
         self.assertEqual(
             self.app.calls,
@@ -1599,7 +1873,15 @@ class TestSloDeleteManifest(SloTestCase):
             'multipart-manifest=delete&async=on&heartbeat=on',
             environ={'REQUEST_METHOD': 'DELETE'},
             headers={'Accept': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'FakeSwift_1', 'FakeSwift_2',
+            'handle_delete.do_delete', 'FakeSwift_3',
+            'handle_delete.do_delete', 'handle_delete.do_delete',
+            'get_segments_to_delete_iter', 'handle_delete_iter',
+            'handle_multipart_delete', 'get_slo_segments', '_process_delete',
+            '_process_delete', '_process_delete']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         resp_data = json.loads(body)
@@ -1624,8 +1906,13 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/AUTH_test/deltest/man-all-there'
             '?async=true&multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE'})
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift', 'FakeSwift_1', 'FakeSwift_2',
+            'get_slo_segments', 'handle_async_delete',
+            'handle_multipart_delete']
         with patch('swift.common.utils.Timestamp.now', return_value=now):
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
         self.assertEqual('204 No Content', status)
         self.assertEqual(b'', body)
         self.assertEqual(self.app.calls, [
@@ -1684,8 +1971,23 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/%s/deltest/man-all-there?'
             'async=1&multipart-manifest=delete&heartbeat=1' % wsgi_acct,
             environ={'REQUEST_METHOD': 'DELETE', 'swift.authorize': authorize})
+        # We are also getting spans while attempting to get info from mem/info
+        # caches
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift',
+            '_get_info_from_memcache(AUTH_test-unïcode, deltest)',
+            '_get_info_from_caches(AUTH_test-unïcode, deltest)',
+            '_get_info_from_memcache(AUTH_test-unïcode, None)',
+            '_get_info_from_caches(AUTH_test-unïcode, None)',
+            'FakeSwift_1', 'FakeSwift_2',
+            '_get_info_from_memcache(AUTH_test-unïcode, ☃)',
+            '_get_info_from_caches(AUTH_test-unïcode, ☃)',
+            '_get_info_from_caches(AUTH_test-unïcode, None)',
+            'FakeSwift_3', 'FakeSwift_4', 'FakeSwift_5', 'get_slo_segments',
+            'handle_async_delete', 'handle_multipart_delete']
         with patch('swift.common.utils.Timestamp.now', return_value=now):
-            status, _, body = self.call_slo(req)
+            status, _, body = self.call_slo(
+                req, expected_spans=expected_spans)
         # Every async delete should only need to make 3 requests during the
         # client request/response cycle, so no need to support heart-beating
         self.assertEqual('204 No Content', status)
@@ -1760,8 +2062,20 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/%s/\xe2\x98\x83/same-container?'
             'async=yes&multipart-manifest=delete' % wsgi_acct,
             environ={'REQUEST_METHOD': 'DELETE', 'swift.authorize': authorize})
+        # We are also getting spans while attempting to get info from mem/info
+        # caches
+        expected_spans = [
+            'StaticLargeObject', 'FakeSwift',
+            '_get_info_from_memcache(AUTH_test-unïcode, ☃)',
+            '_get_info_from_caches(AUTH_test-unïcode, ☃)',
+            '_get_info_from_memcache(AUTH_test-unïcode, None)',
+            '_get_info_from_caches(AUTH_test-unïcode, None)',
+            'FakeSwift_1', 'FakeSwift_2', 'FakeSwift_3', 'FakeSwift_4',
+            'get_slo_segments', 'handle_async_delete',
+            'handle_multipart_delete']
         with patch('swift.common.utils.Timestamp.now', return_value=now):
-            status, _, body = self.call_slo(req)
+            status, _, body = self.call_slo(
+                req, expected_spans=expected_spans)
         self.assertEqual('204 No Content', status)
         self.assertEqual(b'', body)
 
@@ -1845,7 +2159,10 @@ class TestSloDeleteManifest(SloTestCase):
             '/v1/AUTH_test/deltest/manifest-with-submanifest' +
             '?async=on&multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE'})
-        status, _, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'get_slo_segments', 'handle_async_delete',
+            'handle_multipart_delete', 'StaticLargeObject']
+        status, _, body = self.call_slo(req, expected_spans=expected_spans)
         self.assertEqual('400 Bad Request', status)
         self.assertEqual(b'No segments may be large objects.', body)
         self.assertEqual(self.app.calls, [
@@ -1865,7 +2182,10 @@ class TestSloDeleteManifest(SloTestCase):
         req = Request.blank(
             '/v1/AUTH_test/deltest/man?async=on&multipart-manifest=delete',
             environ={'REQUEST_METHOD': 'DELETE'})
-        status, _, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'get_slo_segments', 'handle_async_delete',
+            'handle_multipart_delete', 'StaticLargeObject']
+        status, _, body = self.call_slo(req, expected_spans=expected_spans)
         self.assertEqual('400 Bad Request', status)
         expected = b'All segments must be in one container. Found segments in '
         self.assertEqual(expected, body[:len(expected)])
@@ -1882,6 +2202,9 @@ class SloGETorHEADTestCase(SloTestCase):
     respond to HEAD requests.
     """
 
+    slo_etag = md5hex("seg01-hashseg02-hash")
+    expected_spans = ['FakeSwift', 'FakeSwift_1', 'StaticLargeObject',
+                      'handle_slo_get_or_head', 'get_or_head_response']
     modern_manifest_headers = True
 
     def maybe_add_modern_manifest_headers(self, headers, manifest):
@@ -1920,14 +2243,15 @@ class SloGETorHEADTestCase(SloTestCase):
         self.assertEqual(self.app.unread_requests,
                          self.expected_unread_requests)
 
-    def call_slo(self, req):
+    def call_slo(self, req, expected_spans=None, skip_span=False):
         # all the tests that inhert from this class were part of a major test
         # refactor in an effort to normalize and strengthen assertions; in
         # general it would probably be reasonable for call_app to return a
         # HeaderKeyDict but at the time was considered unrelated to the
         # GETorHEAD TestCase refactor
         status, raw_headers, body = super(
-            SloGETorHEADTestCase, self).call_slo(req)
+            SloGETorHEADTestCase, self).call_slo(
+                req, expected_spans=expected_spans, skip_span=skip_span)
         headers = HeaderKeyDict(raw_headers)
         self.assertEqual(
             len(raw_headers), len(headers),
@@ -2276,6 +2600,8 @@ class SloGETorHEADTestCase(SloTestCase):
 
 class TestSloHeadOldManifest(SloGETorHEADTestCase):
 
+    expected_spans = ['FakeSwift', 'FakeSwift_1', 'StaticLargeObject',
+                      'handle_slo_get_or_head']
     modern_manifest_headers = False
 
     def setUp(self):
@@ -2293,7 +2619,8 @@ class TestSloHeadOldManifest(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/headtest/man',
             environ={'REQUEST_METHOD': 'HEAD'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=self.expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Etag'], '"%s"' % self.slo_etag)
@@ -2312,7 +2639,10 @@ class TestSloHeadOldManifest(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/headtest/man?multipart-manifest=get',
             environ={'REQUEST_METHOD': 'HEAD'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Etag'], self.manifest_json_etag)
@@ -2340,7 +2670,8 @@ class TestSloHeadOldManifest(SloGETorHEADTestCase):
         self._setup_manifest('zero-byte', _single_segment_manifest)
         req = Request.blank('/v1/AUTH_test/c/manifest-zero-byte',
                             method='HEAD')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=self.expected_spans)
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Etag'],
                          '"%s"' % self.manifest_zero_byte_slo_etag)
@@ -2361,7 +2692,8 @@ class TestSloHeadOldManifest(SloGETorHEADTestCase):
             '/v1/AUTH_test/headtest/man',
             environ={'REQUEST_METHOD': 'HEAD'},
             headers={'If-None-Match': self.slo_etag})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=self.expected_spans)
         self.assertEqual(status, '304 Not Modified')
         self.assertEqual(headers['Etag'], '"%s"' % self.slo_etag)
         self.assertEqual(headers['Content-Length'], '0')
@@ -2380,7 +2712,8 @@ class TestSloHeadOldManifest(SloGETorHEADTestCase):
             '/v1/AUTH_test/headtest/man',
             environ={'REQUEST_METHOD': 'HEAD'},
             headers={'If-Match': 'zzz'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=self.expected_spans)
         self.assertEqual(status, '412 Precondition Failed')
         self.assertEqual(headers['Etag'], '"%s"' % self.slo_etag)
         self.assertEqual(headers['Content-Length'], '0')
@@ -2401,7 +2734,8 @@ class TestSloHeadOldManifest(SloGETorHEADTestCase):
             headers={
                 'If-None-Match': 'bespoke',
                 'X-Backend-Etag-Is-At': 'X-Object-Sysmeta-Artisanal-Etag'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=self.expected_spans)
         self.assertEqual(status, '304 Not Modified')
         # We *are not* responsible for replacing the etag; whoever set
         # x-backend-etag-is-at is responsible
@@ -2424,7 +2758,8 @@ class TestSloHeadOldManifest(SloGETorHEADTestCase):
             headers={
                 'If-Match': self.slo_etag,
                 'X-Backend-Etag-Is-At': 'X-Object-Sysmeta-Artisanal-Etag'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=self.expected_spans)
         self.assertEqual(status, '412 Precondition Failed')
         # We *are not* responsible for replacing the etag; whoever set
         # x-backend-etag-is-at is responsible
@@ -2444,7 +2779,8 @@ class TestSloHeadOldManifest(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'HEAD'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=self.expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Content-Length'], '50')
@@ -2470,6 +2806,8 @@ class TestSloHeadManifest(TestSloHeadOldManifest):
     """
     Exercise manifests written after we added etag/size SLO Sysmeta
     """
+    expected_spans = ['FakeSwift', 'StaticLargeObject',
+                      'handle_slo_get_or_head']
 
     modern_manifest_headers = True
 
@@ -2529,7 +2867,10 @@ class TestSloGetRawManifest(SloGETorHEADTestCase):
             '?multipart-manifest=get&format=raw',
             environ={'REQUEST_METHOD': 'GET',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         expected_body = json.dumps([
             {'etag': md5hex('foo'), 'size_bytes': '100',
@@ -2567,7 +2908,10 @@ class TestSloGetRawManifest(SloGETorHEADTestCase):
             '?multipart-manifest=get&format=raw',
             environ={'REQUEST_METHOD': 'GET',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         # raw format should return the actual manifest object content-type
@@ -2616,7 +2960,10 @@ class TestSloGetManifests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-bc?multipart-manifest=get',
             environ={'REQUEST_METHOD': 'GET',
                      'HTTP_ACCEPT': 'application/json'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Content-Type'],
@@ -2649,7 +2996,13 @@ class TestSloGetManifests(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-bc',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
+        headers = HeaderKeyDict(headers)
 
         manifest_etag = md5hex(md5hex("b" * 10) + md5hex("c" * 15))
         self.assertEqual(status, '200 OK')
@@ -2680,7 +3033,15 @@ class TestSloGetManifests(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-aabbccdd',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'FakeSwift_2',
+            'FakeSwift_3', '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', '_requests_to_bytes_iter',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
+        headers = HeaderKeyDict(headers)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(int(headers['Content-Length']),
@@ -2729,11 +3090,27 @@ class TestSloGetManifests(SloGETorHEADTestCase):
             sleeps.append(duration)
             the_time[0] += duration
 
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'FakeSwift_2',
+            'FakeSwift_3', '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'FakeSwift_6',
+            '_requests_to_bytes_iter', 'FakeSwift_7',
+            '_requests_to_bytes_iter', 'FakeSwift_8',
+            '_requests_to_bytes_iter', 'FakeSwift_9',
+            '_requests_to_bytes_iter', 'FakeSwift_10',
+            '_requests_to_bytes_iter', 'FakeSwift_11',
+            '_requests_to_bytes_iter', 'FakeSwift_12',
+            '_requests_to_bytes_iter', '_requests_to_bytes_iter',
+            'SegmentedIterable']
+
         with patch('time.time', mock_time), \
                 patch('eventlet.sleep', mock_sleep), \
                 patch.object(self.slo, 'rate_limit_under_size', 999999999), \
                 patch.object(self.slo, 'rate_limit_after_segment', 0):
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')  # sanity check
         self.assertEqual(sleeps, [1.0] * 11)
@@ -2745,7 +3122,8 @@ class TestSloGetManifests(SloGETorHEADTestCase):
                 patch('eventlet.sleep', mock_sleep), \
                 patch.object(self.slo, 'rate_limit_under_size', 999999999), \
                 patch.object(self.slo, 'rate_limit_after_segment', 4):
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')  # sanity check
         self.assertEqual(sleeps, [1.0] * 7)
@@ -2756,7 +3134,8 @@ class TestSloGetManifests(SloGETorHEADTestCase):
                 patch('eventlet.sleep', mock_sleep), \
                 patch.object(self.slo, 'rate_limit_under_size', 35), \
                 patch.object(self.slo, 'rate_limit_after_segment', 0):
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')  # sanity check
         self.assertEqual(sleeps, [1.0] * 5)
@@ -2768,7 +3147,8 @@ class TestSloGetManifests(SloGETorHEADTestCase):
                 patch('eventlet.sleep', mock_sleep), \
                 patch.object(self.slo, 'rate_limit_under_size', 36), \
                 patch.object(self.slo, 'rate_limit_after_segment', 0):
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')  # sanity check
         self.assertEqual(sleeps, [1.0] * 6)
@@ -2777,7 +3157,15 @@ class TestSloGetManifests(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Content-Length'], '50')
@@ -2802,7 +3190,14 @@ class TestSloGetManifests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=3-17'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Content-Length'], '15')
@@ -2847,7 +3242,15 @@ class TestSloGetManifests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=3-17,20-24,35-999999'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'FakeSwift_2', '_fetch_sub_slo_segments',
+            'FakeSwift_3', '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Etag'],
@@ -2927,7 +3330,15 @@ class TestSloGetManifests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=3-17,-21'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'FakeSwift_2', '_fetch_sub_slo_segments',
+            'FakeSwift_3', '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Etag'],
@@ -3011,7 +3422,15 @@ class TestSloGetOldManifests(TestSloGetManifests):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd-alt',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'FakeSwift_1', '_fetch_sub_slo_segments',
+            'FakeSwift_2', '_requests_to_bytes_iter', 'StaticLargeObject',
+            'handle_slo_get_or_head', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Content-Length'], '50')
@@ -3081,7 +3500,15 @@ class TestOldSwiftWithRanges(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=0-999999999'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Etag'],
@@ -3108,7 +3535,12 @@ class TestOldSwiftWithRanges(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/big_manifest',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=100000-199999'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'FakeSwift_2', '_requests_to_bytes_iter',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Etag'],
@@ -3148,7 +3580,11 @@ class TestOldSwiftWithRanges(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/big_manifest',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=100000-199999'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '503 Service Unavailable')
         self.assertNotIn('X-Static-Large-Object', headers)
@@ -3171,7 +3607,11 @@ class TestOldSwiftWithRanges(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/big_manifest',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=100000-199999'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '503 Service Unavailable')
         self.assertNotIn('X-Static-Large-Object', headers)
@@ -3193,7 +3633,11 @@ class TestOldSwiftWithRanges(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/big_manifest',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=100000-199999'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '416 Requested Range Not Satisfiable')
         self.assertNotIn('X-Static-Large-Object', headers)
@@ -3220,7 +3664,11 @@ class TestOldSwiftWithRanges(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/big_manifest',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=100000-199999'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')  # NOT 416 or 206!
         self.assertNotIn('X-Static-Large-Object', headers)
@@ -3245,7 +3693,11 @@ class TestOldSwiftWithRanges(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/big_manifest',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=100000-199999'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '404 Not Found')
         self.assertNotIn('X-Static-Large-Object', headers)
@@ -3261,22 +3713,35 @@ class TestOldSwiftWithRanges(SloGETorHEADTestCase):
         # Content-Range headers, but if somehow someone sneaks an invalid one
         # in there, we'll ignore it, when sniffing a 206 manifest response.
 
-        def content_range_breaker_factory(app):
-            def content_range_breaker(env, start_response):
+        @wsgi_trace
+        class ContentRangeBreaker(object):
+            def __init__(self, app):
+                self.next_app = app
+
+            def __call__(self, env, start_response):
                 req = swob.Request(env)
-                resp = req.get_response(app)
+                resp = req.get_response(self.next_app)
                 resp.headers['Content-Range'] = 'triscuits'
                 return resp(env, start_response)
-            return content_range_breaker
 
         self.slo = slo.filter_factory({})(
-            content_range_breaker_factory(self.app))
+            ContentRangeBreaker(self.app))
 
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=0-999999999'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'ContentRangeBreaker', 'FakeSwift_1', 'ContentRangeBreaker_1',
+            'FakeSwift_2', 'ContentRangeBreaker_2',
+            '_fetch_sub_slo_segments', 'FakeSwift_3', 'ContentRangeBreaker_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4', 'ContentRangeBreaker_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5', 'ContentRangeBreaker_5',
+            '_requests_to_bytes_iter', 'FakeSwift_6', 'ContentRangeBreaker_6',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(
@@ -3308,7 +3773,15 @@ class TestOldSwiftWithRanges(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd-ranges',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=0-999999999'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(req,
+                                              expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Content-Length'], '32')
@@ -3364,7 +3837,13 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=5-29'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'FakeSwift_2', '_fetch_sub_slo_segments',
+            'FakeSwift_3', '_requests_to_bytes_iter',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Content-Length'], '25')
@@ -3390,7 +3869,12 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=0-0'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Content-Length'], '1')
@@ -3409,7 +3893,13 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=25-30'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'FakeSwift_2', '_fetch_sub_slo_segments',
+            'FakeSwift_3', '_requests_to_bytes_iter',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Content-Length'], '6')
         self.assertEqual(headers['Content-Range'], 'bytes 25-30/50')
@@ -3429,7 +3919,12 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=45-55'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Content-Length'], '5')
@@ -3446,7 +3941,11 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=100-200'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '416 Requested Range Not Satisfiable')
 
     def test_get_segment_with_non_ascii_path(self):
@@ -3474,7 +3973,11 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
         req = Request.blank(
             str_to_wsgi('/v1/AUTH_test/ünicode/manifest'),
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '200 OK')
         self.assertEqual(body, segment_body)
 
@@ -3482,7 +3985,15 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd-ranges',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Content-Length'], '32')
@@ -3525,7 +4036,20 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd-subranges',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_fetch_sub_slo_segments', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'FakeSwift_6',
+            '_requests_to_bytes_iter', 'FakeSwift_7',
+            '_requests_to_bytes_iter', 'FakeSwift_8',
+            '_requests_to_bytes_iter', 'FakeSwift_9',
+            '_requests_to_bytes_iter', 'FakeSwift_10',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Content-Length'], '17')
@@ -3569,7 +4093,15 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd-ranges',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=7-26'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'FakeSwift_2', '_fetch_sub_slo_segments',
+            'FakeSwift_3', '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Content-Length'], '20')
@@ -3605,7 +4137,18 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd-subranges',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=4-12'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'FakeSwift_2', '_fetch_sub_slo_segments',
+            'FakeSwift_3', '_fetch_sub_slo_segments', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'FakeSwift_6',
+            '_requests_to_bytes_iter', 'FakeSwift_7',
+            '_requests_to_bytes_iter', 'FakeSwift_8',
+            '_requests_to_bytes_iter',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Content-Length'], '9')
@@ -3641,6 +4184,56 @@ class TestSloRangeRequests(SloGETorHEADTestCase):
         self.assertEqual(self.app.swift_sources[1:],
                          ['SLO'] * (len(self.app.swift_sources) - 1))
 
+    def test_old_swift_range_get_includes_whole_range_manifest(self):
+        self.app.can_ignore_range = False
+        # If the first range GET results in retrieval of the entire manifest
+        # body (and not because of X-Backend-Ignore-Range-If-Metadata-Present,
+        # but because the requested range happened to be sufficient which we
+        # detected by looking at the Content-Range response header), then we
+        # should not go make a second, non-ranged request just to retrieve the
+        # same bytes again.
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-abcd-ranges',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=0-999999999'})
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
+        headers = HeaderKeyDict(headers)
+
+        self.assertEqual(status, '206 Partial Content')
+        self.assertEqual(headers['Content-Length'], '32')
+        self.assertEqual(headers['Content-Type'], 'application/json')
+        self.assertEqual(body, b'aaaaaaaaccccccccbbbbbbbbdddddddd')
+
+        self.assertEqual(
+            self.app.calls,
+            [('GET', '/v1/AUTH_test/gettest/manifest-abcd-ranges'),
+             ('GET', '/v1/AUTH_test/gettest/manifest-bc-ranges'),
+             ('GET', '/v1/AUTH_test/gettest/a_5?multipart-manifest=get'),
+             ('GET', '/v1/AUTH_test/gettest/c_15?multipart-manifest=get'),
+             ('GET', '/v1/AUTH_test/gettest/b_10?multipart-manifest=get'),
+             ('GET', '/v1/AUTH_test/gettest/d_20?multipart-manifest=get')])
+
+        ranges = [c[2].get('Range') for c in self.app.calls_with_headers]
+        self.assertEqual(ranges, [
+            'bytes=0-999999999',
+            None,
+            'bytes=0-3,1-',
+            'bytes=0-3,11-',
+            'bytes=4-7,2-5',
+            'bytes=0-3,8-11'])
+        # we set swift.source for everything but the first request
+        self.assertIsNone(self.app.swift_sources[0])
+        self.assertEqual(self.app.swift_sources[1:],
+                         ['SLO'] * (len(self.app.swift_sources) - 1))
+
 
 class TestSloRangeRequestsOldManifest(TestSloRangeRequests):
 
@@ -3650,6 +4243,7 @@ class TestSloRangeRequestsOldManifest(TestSloRangeRequests):
 class TestSloErrors(SloGETorHEADTestCase):
 
     modern_manifest_headers = True
+    extra_spans = []
 
     def setUp(self):
         super(TestSloErrors, self).setUp()
@@ -3708,7 +4302,10 @@ class TestSloErrors(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-badjson',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         # This often (usually?) happens because of an incomplete read -- the
         # proxy app started getting a large manifest and sending it back to
@@ -3869,7 +4466,29 @@ class TestSloErrors(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/man1',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'FakeSwift_2',
+            '_fetch_sub_slo_segments', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_fetch_sub_slo_segments', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'FakeSwift_6',
+            '_fetch_sub_slo_segments', 'FakeSwift_7',
+            '_requests_to_bytes_iter', 'FakeSwift_8',
+            '_fetch_sub_slo_segments', 'FakeSwift_9',
+            '_requests_to_bytes_iter', 'FakeSwift_10',
+            '_fetch_sub_slo_segments', 'FakeSwift_11',
+            '_requests_to_bytes_iter', 'FakeSwift_12',
+            '_fetch_sub_slo_segments', 'FakeSwift_13',
+            '_requests_to_bytes_iter', 'FakeSwift_14',
+            '_fetch_sub_slo_segments', 'FakeSwift_15',
+            '_requests_to_bytes_iter', 'FakeSwift_16',
+            '_fetch_sub_slo_segments', 'FakeSwift_17',
+            '_requests_to_bytes_iter', 'FakeSwift_18',
+            '_fetch_sub_slo_segments', 'FakeSwift_19',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         # we don't know at header-sending time that things are going to go
         # wrong, so we end up with a 200 and a truncated body
@@ -3948,7 +4567,29 @@ class TestSloErrors(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/man1',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'FakeSwift_2',
+            '_fetch_sub_slo_segments', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_fetch_sub_slo_segments', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'FakeSwift_6',
+            '_fetch_sub_slo_segments', 'FakeSwift_7',
+            '_requests_to_bytes_iter', 'FakeSwift_8',
+            '_fetch_sub_slo_segments', 'FakeSwift_9',
+            '_requests_to_bytes_iter', 'FakeSwift_10',
+            '_fetch_sub_slo_segments', 'FakeSwift_11',
+            '_requests_to_bytes_iter', 'FakeSwift_12',
+            '_fetch_sub_slo_segments', 'FakeSwift_13',
+            '_requests_to_bytes_iter', 'FakeSwift_14',
+            '_fetch_sub_slo_segments', 'FakeSwift_15',
+            '_requests_to_bytes_iter', 'FakeSwift_16',
+            '_fetch_sub_slo_segments', 'FakeSwift_17',
+            '_requests_to_bytes_iter', 'FakeSwift_18',
+            '_fetch_sub_slo_segments', 'FakeSwift_19',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(body, (b'body10body09body08body07body06'
@@ -4019,7 +4660,19 @@ class TestSloErrors(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/man1',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_fetch_sub_slo_segments', 'FakeSwift_3',
+            '_fetch_sub_slo_segments', 'FakeSwift_4',
+            '_fetch_sub_slo_segments', 'FakeSwift_5',
+            '_fetch_sub_slo_segments', 'FakeSwift_6',
+            '_fetch_sub_slo_segments', 'FakeSwift_7',
+            '_fetch_sub_slo_segments', 'FakeSwift_8',
+            '_fetch_sub_slo_segments', 'FakeSwift_9',
+            '_fetch_sub_slo_segments', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '409 Conflict')
         self.assertNotIn('Etag', headers)
@@ -4049,7 +4702,14 @@ class TestSloErrors(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(b"aaaaabbbbbbbbbb", body)
@@ -4072,7 +4732,12 @@ class TestSloErrors(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual("200 OK", status)
         self.assertEqual(b"aaaaa", body)
@@ -4106,7 +4771,11 @@ class TestSloErrors(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-manifest-a',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('409 Conflict', status)
         self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
@@ -4127,7 +4796,12 @@ class TestSloErrors(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('200 OK', status)
         self.assertEqual(body, b'aaaaa')
@@ -4152,7 +4826,12 @@ class TestSloErrors(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-a-b-badetag-c',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('200 OK', status)
         self.assertEqual(headers['Etag'], '"%s"' %
@@ -4187,7 +4866,12 @@ class TestSloErrors(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-a-b-badsize-c',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('200 OK', status)
         self.assertEqual(body, b'aaaaa')
@@ -4220,7 +4904,12 @@ class TestSloErrors(SloGETorHEADTestCase):
                          'content_type': 'text/plain', 'bytes': '15'}]))
 
         req = Request.blank('/v1/AUTH_test/gettest/manifest')
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('200 OK', status)
         self.assertEqual(body, (b'b' * 10 + b'x' * 5))
@@ -4251,7 +4940,12 @@ class TestSloErrors(SloGETorHEADTestCase):
                          'content_type': 'text/plain', 'bytes': '15'}]))
 
         req = Request.blank('/v1/AUTH_test/gettest/manifest')
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('200 OK', status)
         self.assertEqual(body, (b'b' * 10 + b'a' * 4))
@@ -4262,8 +4956,20 @@ class TestSloErrors(SloGETorHEADTestCase):
         ])
 
     def test_first_segment_mismatched_etag(self):
+        self.app.register('GET', '/v1/AUTH_test/gettest/manifest-badetag',
+                          swob.HTTPOk, {'Content-Type': 'application/json',
+                                        'X-Static-Large-Object': 'true'},
+                          json.dumps([{'name': '/gettest/a_5',
+                                       'hash': 'wrong!',
+                                       'content_type': 'text/plain',
+                                       'bytes': '5'}]))
+
         req = Request.blank('/v1/AUTH_test/gettest/manifest-badetag')
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('409 Conflict', status)
         self.assertNotIn('Etag', headers)
@@ -4287,7 +4993,10 @@ class TestSloErrors(SloGETorHEADTestCase):
     def test_head_does_not_validate_first_segment_mismatched_etag(self):
         req = Request.blank('/v1/AUTH_test/gettest/manifest-badetag',
                             method='HEAD')
-        status, headers, body = self.call_slo(req)
+        expected_spans = ['FakeSwift', 'StaticLargeObject',
+                          'handle_slo_get_or_head'] + self.extra_spans
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Etag'],
                          '"%s"' % self.manifest_badetag_slo_etag)
@@ -4307,7 +5016,11 @@ class TestSloErrors(SloGETorHEADTestCase):
     def test_first_segment_mismatched_size(self):
         req = Request.blank('/v1/AUTH_test/gettest/manifest-badsize',
                             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('409 Conflict', status)
         self.assertNotIn('Etag', headers)
@@ -4331,7 +5044,10 @@ class TestSloErrors(SloGETorHEADTestCase):
     def test_head_does_not_validate_first_segment_mismatched_size(self):
         req = Request.blank('/v1/AUTH_test/gettest/manifest-badsize',
                             method='HEAD')
-        status, headers, body = self.call_slo(req)
+        expected_spans = ['FakeSwift', 'StaticLargeObject',
+                          'handle_slo_get_or_head'] + self.extra_spans
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Etag'],
                          '"%s"' % self.manifest_badsize_slo_etag)
@@ -4360,7 +5076,14 @@ class TestSloErrors(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'})
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
@@ -4391,7 +5114,11 @@ class TestSloErrors(SloGETorHEADTestCase):
 
         req = Request.blank('/v1/AUTH_test/gettest/manifest-not-exists',
                             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('409 Conflict', status)
         self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
@@ -4415,7 +5142,11 @@ class TestSloErrors(SloGETorHEADTestCase):
 
         req = Request.blank('/v1/AUTH_test/gettest/manifest-not-avail',
                             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('503 Service Unavailable', status)
         self.assertEqual(self.slo.logger.get_lines_for_level('error'), [
@@ -4430,6 +5161,7 @@ class TestSloErrors(SloGETorHEADTestCase):
 class TestSloErrorsOldManifests(TestSloErrors):
 
     modern_manifest_headers = False
+    extra_spans = ['FakeSwift_1']
 
 
 class TestSloDataSegments(SloGETorHEADTestCase):
@@ -4465,7 +5197,11 @@ class TestSloDataSegments(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-single-preamble',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('200 OK', status)
         self.assertEqual(body, b'preambleaaaaa')
@@ -4498,7 +5234,11 @@ class TestSloDataSegments(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-single-postamble',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('200 OK', status)
         self.assertEqual(body, b'aaaaapostamble')
@@ -4536,7 +5276,11 @@ class TestSloDataSegments(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-single-prepostamble',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('200 OK', status)
         self.assertEqual(body, b'preambleaaaaapostamble')
@@ -4548,7 +5292,11 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-single-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=0-7'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'preamble')
@@ -4558,7 +5306,8 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-single-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=1-5'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'reamb')
@@ -4568,7 +5317,8 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-single-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=13-21'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'postamble')
@@ -4578,7 +5328,12 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-single-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=4-16'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'mbleaaaaapost')
@@ -4588,7 +5343,8 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-single-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=1-8'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'reamblea')
@@ -4598,7 +5354,8 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-single-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=12-16'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'apost')
@@ -4651,7 +5408,12 @@ class TestSloDataSegments(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
             environ={'REQUEST_METHOD': 'GET'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_requests_to_bytes_iter', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('200 OK', status)
         self.assertEqual(body, b'ABCDEFaaaaa123456GHIJKLbbbbbbbbbb7890@#')
@@ -4663,7 +5425,12 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=5-33'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', 'FakeSwift_2', '_requests_to_bytes_iter',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'Faaaaa123456GHIJKLbbbbbbbbbb7')
@@ -4673,7 +5440,11 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=17-22'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'GHIJKL')
@@ -4683,7 +5454,8 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=11-16'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'123456')
@@ -4693,7 +5465,8 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=12-15'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'2345')
@@ -4703,7 +5476,8 @@ class TestSloDataSegments(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=12-18'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual('206 Partial Content', status)
         self.assertEqual(body, b'23456GH')
@@ -4712,6 +5486,7 @@ class TestSloDataSegments(SloGETorHEADTestCase):
 class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
 
     modern_manifest_headers = False
+    skip_span_check = True
 
     def setUp(self):
         super(TestSloConditionalGetOldManifest, self).setUp()
@@ -4758,7 +5533,17 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             headers={'If-None-Match': self.manifest_abcd_slo_etag})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head']
+        if self.modern_manifest_headers:
+            expected_spans.extend([
+                'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+                '_requests_to_bytes_iter', 'FakeSwift_3',
+                '_requests_to_bytes_iter', 'FakeSwift_4',
+                '_requests_to_bytes_iter', 'FakeSwift_5',
+                '_requests_to_bytes_iter', 'SegmentedIterable'])
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check, expected_spans=expected_spans)
 
         self.assertEqual(status, '304 Not Modified')
         self.assertEqual('"%s"' % self.manifest_abcd_slo_etag, headers['Etag'])
@@ -4793,7 +5578,16 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             headers={'If-None-Match': "not-%s" % self.manifest_abcd_slo_etag})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'FakeSwift_1', '_fetch_sub_slo_segments',
+            'FakeSwift_2', '_requests_to_bytes_iter', 'StaticLargeObject',
+            'handle_slo_get_or_head',
+            'FakeSwift_3', '_requests_to_bytes_iter',
+            'FakeSwift_4', '_requests_to_bytes_iter',
+            'FakeSwift_5', '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans,
+            skip_span=self.skip_span_check)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual('"%s"' % self.manifest_abcd_slo_etag, headers['Etag'])
@@ -4817,7 +5611,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             headers={'If-None-Match': self.manifest_abcd_json_md5})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual('"%s"' % self.manifest_abcd_slo_etag, headers['Etag'])
@@ -4846,7 +5641,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             '/v1/AUTH_test/c/manifest-alt',
             headers={'If-None-Match': '"alt-etag-1"'})
         update_etag_is_at_header(req, 'X-Object-Sysmeta-Alt-Etag')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
 
         self.assertEqual(status, '304 Not Modified')
         # N.B. Etag-Is-At only effects conditional matching, not response Etag
@@ -4887,7 +5683,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/c/manifest-alt',
             headers={'If-None-Match': self.manifest_alt_slo_etag})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
 
         self.assertEqual(status, '304 Not Modified')
         self.assertEqual('"%s"' % self.manifest_alt_slo_etag, headers['Etag'])
@@ -4927,7 +5724,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
         # not modified (see test_if_none_match_matches_no_alternate_etag), but
         # here we provide alt-tag so it doesn't match so the request is success
         update_etag_is_at_header(req, 'X-Object-Sysmeta-Alt-Etag')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
 
         self.assertEqual(status, '200 OK')
         # N.B. Etag-Is-At only effects conditional matching, not response Etag
@@ -4955,7 +5753,16 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'If-Match': self.manifest_abcd_slo_etag})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_1', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_requests_to_bytes_iter', 'FakeSwift_3',
+            '_requests_to_bytes_iter', 'FakeSwift_4',
+            '_requests_to_bytes_iter', 'FakeSwift_5',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans,
+            skip_span=self.skip_span_check)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual('"%s"' % self.manifest_abcd_slo_etag, headers['Etag'])
@@ -4983,7 +5790,11 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             headers={'If-Match': 'not-%s' % self.manifest_abcd_json_md5})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check,
+            expected_spans=expected_spans)
 
         self.assertEqual(status, '412 Precondition Failed')
         self.assertEqual('"%s"' % self.manifest_abcd_slo_etag, headers['Etag'])
@@ -5020,7 +5831,11 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd',
             headers={'If-Match': self.manifest_abcd_json_md5})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check,
+            expected_spans=expected_spans)
 
         self.assertEqual(status, '412 Precondition Failed')
         self.assertEqual('"%s"' % self.manifest_abcd_slo_etag, headers['Etag'])
@@ -5050,7 +5865,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             '/v1/AUTH_test/c/manifest-alt',
             headers={'If-Match': '"alt-etag-1"'})
         update_etag_is_at_header(req, 'X-Object-Sysmeta-Alt-Etag')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual(self.manifest_alt_slo_size,
@@ -5076,7 +5892,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             '/v1/AUTH_test/c/manifest-alt',
             headers={'If-Match': self.manifest_alt_slo_etag})
         update_etag_is_at_header(req, 'X-Object-Sysmeta-Alt-Etag')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
 
         self.assertEqual(status, '412 Precondition Failed')
         # N.B. Etag-Is-At only effects conditional matching, not response Etag
@@ -5349,7 +6166,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             '/v1/AUTH_test/c/manifest-alt',
             headers={'If-Match': 'alt-object-etag'})
         update_etag_is_at_header(req, 'X-Object-Sysmeta-Alt-Etag')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
 
         expected_app_calls = [('GET', '/v1/AUTH_test/c/manifest-alt')]
         # first request asks for match on alt-etag
@@ -5402,7 +6220,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             '/v1/AUTH_test/c/manifest-alt',
             headers={'If-Match': md5hex('alt_1' * 5)})
         update_etag_is_at_header(req, 'X-Object-Sysmeta-Alt-Etag')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
 
         expected_app_calls = [('GET', '/v1/AUTH_test/c/manifest-alt')]
         # first request asks for (mis)match on alt-etag
@@ -5451,7 +6270,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             environ={'REQUEST_METHOD': 'GET'},
             headers={'If-Match': self.manifest_abcd_slo_etag,
                      'Range': 'bytes=3-6'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertIn('bytes 3-6/50', headers['Content-Range'])
@@ -5483,7 +6303,16 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             headers={'If-Match': self.manifest_abcd_slo_etag,
                      'Range': 'bytes=3-6'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift',
+            'FakeSwift_1',
+            'FakeSwift_2', '_fetch_sub_slo_segments',
+            'FakeSwift_3', '_requests_to_bytes_iter',
+            'StaticLargeObject', 'handle_slo_get_or_head',
+            'FakeSwift_4', '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans,
+            skip_span=self.skip_span_check)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual('"%s"' % self.manifest_abcd_slo_etag, headers['Etag'])
@@ -5509,7 +6338,16 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-abcd',
             environ={'REQUEST_METHOD': 'GET'},
             headers={'Range': 'bytes=20-'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift',
+            'FakeSwift_1',
+            'FakeSwift_2', '_fetch_sub_slo_segments',
+            'FakeSwift_3', '_requests_to_bytes_iter',
+            'StaticLargeObject', 'handle_slo_get_or_head',
+            '_requests_to_bytes_iter', 'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans,
+            skip_span=self.skip_span_check)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(body, b'ccccccccccdddddddddddddddddddd')
@@ -5520,7 +6358,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             environ={'REQUEST_METHOD': 'GET'},
             headers={'If-Modified-Since': 'Wed, 12 Feb 2014 22:24:52 GMT',
                      'If-Unmodified-Since': 'Thu, 13 Feb 2014 23:25:53 GMT'})
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Etag'], '"%s"' % self.manifest_abcd_slo_etag)
         self.assertEqual(int(headers['Content-Length']),
@@ -5552,7 +6391,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             headers={
                 'If-Modified-Since': 'Fri, 01 Feb 2012 20:38:36 GMT',
             })
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
         # oh it's *definately* been modified since then!
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['X-Static-Large-Object'], 'true')
@@ -5576,7 +6416,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             headers={
                 'If-Modified-Since': 'Mon, 23 Oct 2023 10:05:32 GMT',
             })
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
         # nope, that was the last time it was changed
         self.assertEqual(status, '304 Not Modified')
         self.assertEqual(headers['X-Static-Large-Object'], 'true')
@@ -5612,7 +6453,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             headers={
                 'If-Modified-Since': last_modified,
             })
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
         # nope, that was the last time it was changed
         self.assertEqual(status, '304 Not Modified')
         self.assertEqual(headers['X-Static-Large-Object'], 'true')
@@ -5646,7 +6488,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             headers={
                 'If-Unmodified-Since': 'Fri, 01 Feb 2012 20:38:36 GMT',
             })
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
         # oh it's *definately* been modified since then!
         self.assertEqual(status, '412 Precondition Failed')
         self.assertEqual(headers['X-Static-Large-Object'], 'true')
@@ -5680,7 +6523,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             headers={
                 'If-Unmodified-Since': 'Mon, 23 Oct 2023 10:05:32 GMT',
             })
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['X-Static-Large-Object'], 'true')
         self.assertEqual(headers['Etag'],
@@ -5705,7 +6549,8 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
             headers={
                 'If-Unmodified-Since': last_modified,
             })
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=self.skip_span_check)
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['X-Static-Large-Object'], 'true')
         self.assertEqual(headers['Etag'],
@@ -5726,6 +6571,7 @@ class TestSloConditionalGetOldManifest(SloGETorHEADTestCase):
 class TestSloConditionalGetNewManifest(TestSloConditionalGetOldManifest):
 
     modern_manifest_headers = True
+    skip_span_check = True
 
 
 class TestPartNumber(SloGETorHEADTestCase):
@@ -5764,7 +6610,10 @@ class TestPartNumber(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-bc?part-number=1',
             environ={'REQUEST_METHOD': 'HEAD'})
-        status, headers, body = self.call_slo(req)
+        expected_spans = ['FakeSwift', 'FakeSwift_1', 'StaticLargeObject',
+                          'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         expected_calls = [
             ('HEAD', '/v1/AUTH_test/gettest/manifest-bc?part-number=1'),
             ('GET', '/v1/AUTH_test/gettest/manifest-bc?part-number=1')
@@ -5799,8 +6648,11 @@ class TestPartNumber(SloGETorHEADTestCase):
             env['PATH_INFO'] += 'fest-bc'
             return orig_call(app, env, start_response)
 
+        expected_spans = ['FakeSwift', 'FakeSwift_1', 'StaticLargeObject',
+                          'handle_slo_get_or_head']
         with patch.object(FakeSwift, '__call__', pseudo_middleware):
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
 
         # pseudo-middleware gets the original path for the refetch
         self.assertEqual([('HEAD', '/v1/AUTH_test/gettest/mani'),
@@ -5832,8 +6684,11 @@ class TestPartNumber(SloGETorHEADTestCase):
             env['PATH_INFO'] += ''
             return orig_call(app, env, start_response)
 
+        expected_spans = ['FakeSwift', 'StaticLargeObject',
+                          'handle_slo_get_or_head']
         with patch.object(FakeSwift, '__call__', pseudo_middleware):
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
 
         self.assertEqual(status, '200 OK')
         self.assertEqual([('GET',
@@ -5847,8 +6702,10 @@ class TestPartNumber(SloGETorHEADTestCase):
             headers={'X-Delete-At': t}
         )
 
+        expected_spans = ['FakeSwift', 'StaticLargeObject']
         with patch.object(FakeSwift, '__call__', pseudo_middleware):
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
 
         self.assertEqual(status, '202 Accepted')
 
@@ -5857,8 +6714,11 @@ class TestPartNumber(SloGETorHEADTestCase):
             environ={'REQUEST_METHOD': 'HEAD'},
             headers={'x-open-expired': 'true'})
 
+        expected_spans = ['FakeSwift', 'FakeSwift_1', 'StaticLargeObject',
+                          'handle_slo_get_or_head']
         with patch.object(FakeSwift, '__call__', pseudo_middleware):
-            status, headers, body = self.call_slo(req)
+            status, headers, body = self.call_slo(
+                req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['X-Static-Large-Object'], 'true')
@@ -5871,7 +6731,12 @@ class TestPartNumber(SloGETorHEADTestCase):
         # part number 1 is b_10
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-bc?part-number=1')
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'FakeSwift_1', '_requests_to_bytes_iter',
+            'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         expected_calls = [
             ('GET', '/v1/AUTH_test/gettest/manifest-bc?part-number=1'),
             ('GET', '/v1/AUTH_test/gettest/b_10?multipart-manifest=get')
@@ -5897,7 +6762,8 @@ class TestPartNumber(SloGETorHEADTestCase):
         ]
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-bc?part-number=2')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Etag'], '"%s"' % self.manifest_bc_slo_etag)
@@ -5915,7 +6781,8 @@ class TestPartNumber(SloGETorHEADTestCase):
         self.app.clear_calls()
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-single-segment?part-number=1')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Etag'], '"%s"' %
                          self.manifest_single_segment_slo_etag)
@@ -5937,7 +6804,12 @@ class TestPartNumber(SloGETorHEADTestCase):
     def test_get_part_number_sub_slo(self):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd?part-number=3')
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'FakeSwift_1', '_requests_to_bytes_iter',
+            'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         expected_calls = [
             ('GET', '/v1/AUTH_test/gettest/manifest-abcd?part-number=3'),
             ('GET', '/v1/AUTH_test/gettest/d_20?multipart-manifest=get')
@@ -5958,7 +6830,11 @@ class TestPartNumber(SloGETorHEADTestCase):
         self.app.clear_calls()
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd?part-number=2')
-        status, headers, body = self.call_slo(req)
+        expected_spans += [
+            '_fetch_sub_slo_segments', 'FakeSwift_2', 'FakeSwift_3',
+            '_requests_to_bytes_iter']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         expected_calls = [
             ('GET', '/v1/AUTH_test/gettest/manifest-abcd?part-number=2'),
             ('GET', '/v1/AUTH_test/gettest/manifest-bc'),
@@ -5981,7 +6857,12 @@ class TestPartNumber(SloGETorHEADTestCase):
     def test_get_part_number_large_manifest(self):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcdefghijkl?part-number=10')
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'FakeSwift_1', '_requests_to_bytes_iter',
+            'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         expected_calls = [
             ('GET', '/v1/AUTH_test/gettest/manifest-abcdefghijkl?'
                     'part-number=10'),
@@ -6004,7 +6885,12 @@ class TestPartNumber(SloGETorHEADTestCase):
     def test_part_number_with_range_segments(self):
         req = Request.blank('/v1/AUTH_test/gettest/manifest-bc-ranges',
                             params={'part-number': 1})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'FakeSwift_1', '_requests_to_bytes_iter',
+            'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Etag'], '"%s"' %
                          self.manifest_bc_ranges_slo_etag)
@@ -6030,7 +6916,14 @@ class TestPartNumber(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd-subranges?part-number=3')
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'FakeSwift_1', '_requests_to_bytes_iter',
+            'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable', '_fetch_sub_slo_segments', 'FakeSwift_2',
+            '_fetch_sub_slo_segments', 'FakeSwift_3', 'FakeSwift_4',
+            '_requests_to_bytes_iter']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         expected_calls = [
             ('GET', '/v1/AUTH_test/gettest/manifest-abcd-subranges?'
                     'part-number=3'),
@@ -6058,7 +6951,12 @@ class TestPartNumber(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-aabbccdd?part-number=3',
             environ={'REQUEST_METHOD': 'GET'})
 
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'FakeSwift_1', '_requests_to_bytes_iter',
+            'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         expected_calls = [
             ('GET', '/v1/AUTH_test/gettest/manifest-aabbccdd?part-number=3'),
             ('GET', '/v1/AUTH_test/gettest/b_10?multipart-manifest=get')
@@ -6133,7 +7031,8 @@ class TestPartNumber(SloGETorHEADTestCase):
             '/v1/AUTH_test/gettest/manifest-zero-byte?'
             'partNumber=%s' % part_num,
             method='HEAD')
-        status, headers, body = self.call_slo(req)
+        status, headers, body = self.call_slo(
+            req, skip_span=True)
         self.assertEqual(status, '200 OK')
         self.assertEqual(headers['Etag'],
                          '"%s"' % self.manifest_zero_byte_slo_etag)
@@ -6282,7 +7181,10 @@ class TestPartNumber(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-bc?part-number=4')
         req.method = 'HEAD'
-        status, headers, body = self.call_slo(req)
+        expected_spans = ['FakeSwift', 'FakeSwift_1', 'StaticLargeObject',
+                          'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '416 Requested Range Not Satisfiable')
         self.assertEqual(headers['Content-Range'],
                          'bytes */%d' % self.manifest_bc_slo_size)
@@ -6306,7 +7208,12 @@ class TestPartNumber(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-bc?part-number=2')
         self.slo.max_manifest_segments = 1
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'FakeSwift_1', '_requests_to_bytes_iter',
+            'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Etag'], '"%s"' % self.manifest_bc_slo_etag)
         self.assertEqual(headers['X-Manifest-Etag'], self.manifest_bc_json_md5)
@@ -6412,7 +7319,10 @@ class TestPartNumber(SloGETorHEADTestCase):
                      'part-number=6'),
             ('GET', '/v1/AUTH_test/gettest/manifest-abcd-subranges?'
                     'part-number=6')]
-        status, headers, body = self.call_slo(req)
+        expected_spans = ['FakeSwift', 'FakeSwift_1', 'StaticLargeObject',
+                          'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '416 Requested Range Not Satisfiable')
         self.assertEqual(headers['Content-Range'],
                          'bytes */%d' % self.manifest_abcd_subranges_slo_size)
@@ -6448,7 +7358,10 @@ class TestPartNumber(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/gettest/manifest-abcd-subranges',
             method='HEAD', params={'part-number': 2})
-        status, headers, body = self.call_slo(req)
+        expected_spans = ['FakeSwift', 'FakeSwift_1', 'StaticLargeObject',
+                          'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
 
         # Range header can be ignored in a HEAD request
         self.assertEqual(status, '206 Partial Content')
@@ -6471,7 +7384,10 @@ class TestPartNumber(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/c/manifest-data',
             method='HEAD', params={'part-number': 1})
-        status, headers, body = self.call_slo(req)
+        expected_spans = ['FakeSwift', 'FakeSwift_1', 'StaticLargeObject',
+                          'handle_slo_get_or_head']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Etag'],
                          '"%s"' % self.manifest_data_slo_etag)
@@ -6489,7 +7405,11 @@ class TestPartNumber(SloGETorHEADTestCase):
         req = Request.blank(
             '/v1/AUTH_test/c/manifest-data',
             params={'part-number': 3})
-        status, headers, body = self.call_slo(req)
+        expected_spans = [
+            'FakeSwift', 'StaticLargeObject', 'handle_slo_get_or_head',
+            'SegmentedIterable']
+        status, headers, body = self.call_slo(
+            req, expected_spans=expected_spans)
         self.assertEqual(status, '206 Partial Content')
         self.assertEqual(headers['Etag'],
                          '"%s"' % self.manifest_data_slo_etag)

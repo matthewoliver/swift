@@ -34,7 +34,7 @@ from urllib.parse import quote, parse_qsl
 from email.parser import BytesFeedParser as EmailFeedParser
 
 import swift
-from swift.common import utils, swob, exceptions
+from swift.common import utils, swob, exceptions, trace
 from swift.common.exceptions import ChunkWriteTimeout, ShortReadError, \
     ChunkReadTimeout, RangeAlreadyComplete
 from swift.common.utils import Timestamp, list_from_csv, md5, FileLikeIter, \
@@ -55,7 +55,7 @@ from test.unit import (
     DEFAULT_TEST_EC_TYPE, encode_frag_archive_bodies, make_ec_object_stub,
     fake_ec_node_response, StubResponse, mocked_http_conn,
     quiet_eventlet_exceptions, FakeSource, make_timestamp_iter, FakeMemcache,
-    node_error_count, node_error_counts)
+    node_error_count, node_error_counts, activate_tracing, TraceAssertMixin)
 
 
 def unchunk_body(chunked_body):
@@ -94,6 +94,7 @@ def set_http_connect(*args, **kwargs):
         swift.proxy.controllers.container.http_connect = old_connect
 
 
+@trace.wsgi_trace
 class PatchedObjControllerApp(proxy_server.Application):
     """
     This patch is just a hook over the proxy server's __call__ to ensure
@@ -164,7 +165,7 @@ def make_footers_callback(body=None):
     return footers_callback
 
 
-class BaseObjectControllerMixin(object):
+class BaseObjectControllerMixin(TraceAssertMixin):
     def fake_container_info(self, extra_info=None):
         container_info = {
             'status': 200,
@@ -450,18 +451,32 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         controller = self.controller_cls(
             self.app, 'a', 'c', 'o')
         req = swift.common.swob.Request.blank('/v1/a/c/o')
+        _, in_memory_spans = activate_tracing(req.environ)
         self.app.conn_timeout = 0.05
         with set_http_connect(slow_connect=True):
             nodes = [dict(ip='', port='', device='')]
             res = controller._connect_put_node(nodes, '', req, {}, ('', ''))
         self.assertIsNone(res)
+        expected_spans = []
+        self.assert_span_names(in_memory_spans, expected_spans)
 
     def test_DELETE_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        _, in_memory_spans = activate_tracing(req.environ)
         codes = [204] * self.replicas()
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', '_get_update_target', '_delete_object']
+        for i in range(self.replicas()):
+            expected_spans.extend([
+                '_make_requests -> (10.0.0.{}:{})'.format(i, 1000 + i),
+                '_make_requests(0, DELETE, /a/c/o)',
+            ])
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans)
 
     def test_object_DELETE_backend_update_container_ip_default(self):
         self.policy.object_ring = FakeRing(separate_replication=True)
@@ -554,11 +569,22 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         if self.replicas() == 1:
             return
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        _, in_memory_spans = activate_tracing(req.environ)
         codes = [404] + [204] * (self.replicas() - 1)
         random.shuffle(codes)
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', '_get_update_target', '_delete_object']
+        for i in range(self.replicas()):
+            expected_spans.extend([
+                '_make_requests -> (10.0.0.{}:{})'.format(i, 1000 + i),
+                '_make_requests(0, DELETE, /a/c/o)',
+            ])
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans)
 
     def test_DELETE_one_found(self):
         # Obviously this test doesn't work if we're testing 1 replica.
@@ -566,28 +592,61 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         if self.replicas() == 1:
             return
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        _, in_memory_spans = activate_tracing(req.environ)
         codes = [404] * (self.replicas() - 1) + [204]
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', '_get_update_target', '_delete_object']
+        for i in range(self.replicas()):
+            expected_spans.extend([
+                '_make_requests -> (10.0.0.{}:{})'.format(i, 1000 + i),
+                '_make_requests(0, DELETE, /a/c/o)',
+            ])
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans)
 
     def test_DELETE_mostly_found(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        _, in_memory_spans = activate_tracing(req.environ)
         mostly_204s = [204] * self.quorum()
         codes = mostly_204s + [404] * (self.replicas() - len(mostly_204s))
         self.assertEqual(len(codes), self.replicas())
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', '_get_update_target', '_delete_object']
+        for i in range(self.replicas()):
+            expected_spans.extend([
+                '_make_requests -> (10.0.0.{}:{})'.format(i, 1000 + i),
+                '_make_requests(0, DELETE, /a/c/o)',
+            ])
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans)
 
     def test_DELETE_mostly_not_found(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        _, in_memory_spans = activate_tracing(req.environ)
         mostly_404s = [404] * self.quorum()
         codes = mostly_404s + [204] * (self.replicas() - len(mostly_404s))
         self.assertEqual(len(codes), self.replicas())
         with set_http_connect(*codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 404)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', '_get_update_target', '_delete_object']
+        for i in range(self.replicas()):
+            expected_spans.extend([
+                '_make_requests -> (10.0.0.{}:{})'.format(i, 1000 + i),
+                '_make_requests(0, DELETE, /a/c/o)',
+            ])
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans)
 
     def test_DELETE_insufficient_found_plus_404_507(self):
         # one less 204 than a quorum...
@@ -681,9 +740,20 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         self.obj_ring.set_replicas(4)
 
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        _, in_memory_spans = activate_tracing(req.environ)
         with set_http_connect(404, 204, 404, 204):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', '_get_update_target', '_delete_object']
+        for i in range(self.replicas()):
+            expected_spans.extend([
+                '_make_requests -> (10.0.0.{}:{})'.format(i, 1000 + i),
+                '_make_requests(0, DELETE, /a/c/o)',
+            ])
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans)
 
     def test_DELETE_half_not_found_headers_and_body(self):
         # Transformed responses have bogus bodies and headers, so make sure we
@@ -695,19 +765,43 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
         headers = [{}, {}, {'Pick-Me': 'yes'}, {'Pick-Me': 'yes'}]
 
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        _, in_memory_spans = activate_tracing(req.environ)
         with set_http_connect(*status_codes, body_iter=bodies,
                               headers=headers):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
         self.assertEqual(resp.headers.get('Pick-Me'), 'yes')
         self.assertEqual(resp.body, b'')
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', '_get_update_target', '_delete_object']
+        for i in range(self.replicas()):
+            expected_spans.extend([
+                '_make_requests -> (10.0.0.{}:{})'.format(i, 1000 + i),
+                '_make_requests(0, DELETE, /a/c/o)',
+            ])
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans)
 
     def test_DELETE_handoff(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
+        _, in_memory_spans = activate_tracing(req.environ)
         codes = [204] * self.replicas()
         with set_http_connect(507, *codes):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 204)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', '_get_update_target', '_delete_object']
+        for i in range(self.replicas() + 1):
+            expected_spans.extend([
+                '_make_requests -> (10.0.0.{}:{})'.format(i, 1000 + i),
+                '_make_requests(0, DELETE, /a/c/o)',
+            ])
+        # take off the last _make_request
+        expected_spans = expected_spans[:-1]
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans)
 
     def test_DELETE_limits_expirer_queue_updates(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='DELETE')
@@ -1078,10 +1172,17 @@ class CommonObjectControllerMixin(BaseObjectControllerMixin):
 
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='HEAD')
+        _, in_memory_spans = activate_tracing(req.environ)
         with set_http_connect(200):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
         self.assertIn('Accept-Ranges', resp.headers)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            '_make_node_request -> (10.0.0.x:100x)', 'PatchedObjControllerApp',
+            'Application', 'GETorHEAD']
+        self.assert_span_names(in_memory_spans, expected_spans,
+                               fuzzy_make_node_request=True)
 
     def test_HEAD_x_newest(self):
         if self.is_ec:
@@ -1629,6 +1730,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
 
     def test_PUT_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o', method='PUT')
+        _, in_memory_spans = activate_tracing(req.environ)
         req.headers['content-length'] = '0'
         with mocked_http_conn(201, 201, 201) as mock_conn:
             resp = req.get_response(self.app)
@@ -1638,6 +1740,18 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         self.assertEqual(3, len(timestamps))
         self.assertEqual(1, len(set(timestamps)))
         self.assert_valid_timestamp(timestamps[0])
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            '_connect_put_node -> (10.0.0.0:1000)',
+            '_connect_put_node -> (10.0.0.1:1001)',
+            '_connect_put_node -> (10.0.0.2:1002)',
+            '_get_put_connections', '_check_failure_put_connections',
+            '_transfer_data', '_get_put_responses', '_store_object',
+            'PatchedObjControllerApp', 'Application',
+            '_get_update_target', '_update_content_type',
+            '_check_failure_put_connections', '_transfer_data',
+            '_get_put_responses', '_store_object']
+        self.assert_span_names(in_memory_spans, expected_spans)
 
     def test_PUT_error_with_footers(self):
         footers_callback = make_footers_callback(b'')
@@ -2117,6 +2231,7 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
 
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
+        _, in_memory_spans = activate_tracing(req.environ)
         with mocked_http_conn(
                 200, headers={'Connection': 'close'}) as mock_conn:
             resp = req.get_response(self.app)
@@ -2126,10 +2241,17 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         self.assertEqual('GET', mock_conn.requests[0]['method'])
         timestamp = mock_conn.requests[0]['headers'].get('X-Timestamp')
         self.assert_valid_timestamp(timestamp)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            '_make_node_request -> (10.0.0.x:100x)',
+            'PatchedObjControllerApp', 'Application', 'GETorHEAD']
+        self.assert_span_names(in_memory_spans, expected_spans,
+                               fuzzy_make_node_request=True)
 
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
         req.method = 'HEAD'
+        _, in_memory_spans = activate_tracing(req.environ)
         with mocked_http_conn(
                 200, headers={'Connection': 'close'}) as mock_conn:
             resp = req.get_response(self.app)
@@ -2139,6 +2261,12 @@ class TestReplicatedObjController(CommonObjectControllerMixin,
         self.assertEqual('HEAD', mock_conn.requests[0]['method'])
         timestamp = mock_conn.requests[0]['headers'].get('X-Timestamp')
         self.assert_valid_timestamp(timestamp)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            '_make_node_request -> (10.0.0.x:100x)',
+            'PatchedObjControllerApp', 'Application', 'GETorHEAD']
+        self.assert_span_names(in_memory_spans, expected_spans,
+                               fuzzy_make_node_request=True)
 
     def test_GET_slow_read(self):
         self.app.recoverable_node_timeout = 0.01
@@ -3535,6 +3663,7 @@ class TestECObjController(ECObjectControllerMixin, BaseTestCase):
 
     def test_GET_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
+        _, in_memory_spans = activate_tracing(req.environ)
         get_statuses = [200] * self.policy.ec_ndata
         get_hdrs = [{
             'Connection': 'close',
@@ -3550,10 +3679,20 @@ class TestECObjController(ECObjectControllerMixin, BaseTestCase):
         self.assertEqual('GET', mock_conn.requests[0]['method'])
         timestamp = mock_conn.requests[0]['headers'].get('X-Timestamp')
         self.assert_valid_timestamp(timestamp)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', 'GETorHEAD']
+        expected_spans += [
+            'ECFragGetter._make_node_request -> (10.0.0.x:100x)'
+        ] * self.policy.ec_ndata
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans,
+                               fuzzy_make_node_request=True)
 
     def test_HEAD_simple(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o',
                                               {'REQUEST_METHOD': 'HEAD'})
+        _, in_memory_spans = activate_tracing(req.environ)
         resp_hdrs = {
             'Connection': 'close',
             'X-Object-Sysmeta-Ec-Scheme': self.policy.ec_scheme_description,
@@ -3568,6 +3707,15 @@ class TestECObjController(ECObjectControllerMixin, BaseTestCase):
         self.assertEqual('HEAD', mock_conn.requests[0]['method'])
         timestamp = mock_conn.requests[0]['headers'].get('X-Timestamp')
         self.assert_valid_timestamp(timestamp)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', 'GETorHEAD']
+        expected_spans += [
+            'ECFragGetter._make_node_request -> (10.0.0.x:100x)'
+        ] * self.policy.ec_ndata
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans,
+                               fuzzy_make_node_request=True)
 
     def test_GET_disconnect(self):
         self.app.recoverable_node_timeout = 0.01
@@ -3792,10 +3940,20 @@ class TestECObjController(ECObjectControllerMixin, BaseTestCase):
 
     def test_GET_error(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')
+        _, in_memory_spans = activate_tracing(req.environ)
         get_resp = [503] + [200] * self.policy.ec_ndata
         with set_http_connect(*get_resp):
             resp = req.get_response(self.app)
         self.assertEqual(resp.status_int, 200)
+        expected_spans = [
+            '_get_info_from_caches(a, c)', '_get_info_from_caches(a, c)',
+            'Application', 'GETorHEAD']
+        expected_spans += [
+            'ECFragGetter._make_node_request -> (10.0.0.x:100x)'
+        ] * (self.policy.ec_ndata + 1)
+        expected_spans.append('PatchedObjControllerApp')
+        self.assert_span_names(in_memory_spans, expected_spans,
+                               fuzzy_make_node_request=True)
 
     def test_GET_no_response_error(self):
         req = swift.common.swob.Request.blank('/v1/a/c/o')

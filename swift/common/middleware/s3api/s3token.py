@@ -63,6 +63,7 @@ from keystoneauth1 import loading as keystone_loading
 import requests
 import urllib
 
+from swift.common.trace import wsgi_trace
 from swift.common.swob import Request, HTTPBadRequest, HTTPUnauthorized, \
     HTTPException, str_to_wsgi
 from swift.common.utils import config_true_value, split_path, get_logger, \
@@ -133,6 +134,7 @@ def parse_v3_response(token):
     return headers, token['project']
 
 
+@wsgi_trace
 class S3Token(object):
     """Middleware that handles S3 authentication."""
 

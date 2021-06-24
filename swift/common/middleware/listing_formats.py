@@ -16,6 +16,7 @@
 import json
 from xml.etree.cElementTree import Element, SubElement, tostring
 
+from swift.common.trace import wsgi_trace
 from swift.common.constraints import valid_api_version
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import HTTP_NO_CONTENT
@@ -116,6 +117,7 @@ def listing_to_text(listing):
     return b''.join(get_lines())
 
 
+@wsgi_trace
 class ListingFilter(object):
     def __init__(self, app, conf, logger=None):
         self.app = app

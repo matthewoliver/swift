@@ -123,6 +123,7 @@ import json
 from swift.common import constraints
 from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.http import is_success
+from swift.common.trace import wsgi_trace, trace_function
 from swift.common.swob import Request, Response, HTTPException, \
     HTTPRequestedRangeNotSatisfiable, HTTPBadRequest, HTTPConflict, \
     str_to_wsgi, wsgi_to_str, wsgi_quote, wsgi_unquote, normalize_etag
@@ -140,6 +141,7 @@ class GetContext(WSGIContext):
         self.dlo = dlo
         self.logger = logger
 
+    @trace_function
     def _get_container_listing(self, req, version, account, container,
                                prefix, marker=''):
         '''
@@ -169,6 +171,7 @@ class GetContext(WSGIContext):
         with closing_if_possible(con_resp.app_iter):
             return None, json.loads(b''.join(con_resp.app_iter))
 
+    @trace_function
     def _segment_listing_iterator(self, req, version, account, container,
                                   prefix, segments, first_byte=None,
                                   last_byte=None):
@@ -242,6 +245,7 @@ class GetContext(WSGIContext):
                     "Got status %d listing container /%s/%s" %
                     (error_response.status_int, account, container))
 
+    @trace_function
     def get_or_head_response(self, req, x_object_manifest):
         '''
         :param req: user's request
@@ -361,6 +365,7 @@ class GetContext(WSGIContext):
 
         return resp
 
+    @trace_function
     def handle_request(self, req, start_response):
         """
         Take a GET or HEAD request, and if it is for a dynamic large object
@@ -389,6 +394,7 @@ class GetContext(WSGIContext):
         return resp_iter
 
 
+@wsgi_trace
 class DynamicLargeObject(object):
     def __init__(self, app, conf):
         self.app = app
@@ -442,6 +448,7 @@ class DynamicLargeObject(object):
                 return error_response(env, start_response)
         return self.app(env, start_response)
 
+    @trace_function
     def _validate_x_object_manifest_header(self, req):
         """
         Make sure that X-Object-Manifest is valid if present.

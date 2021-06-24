@@ -26,10 +26,12 @@ from swift.common.middleware import container_sync
 from swift.common.utils.timestamp import Timestamp
 from swift.proxy.controllers.base import get_cache_key
 from swift.proxy.controllers.info import InfoController
+from swift.common.trace import wsgi_trace
 
 from test.debug_logger import debug_logger
 
 
+@wsgi_trace
 class FakeApp(object):
 
     def __call__(self, env, start_response):

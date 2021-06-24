@@ -95,6 +95,7 @@ from swift.common.middleware.s3api.utils import extract_bucket_and_key, \
     is_s3_req
 from swift.common.request_helpers import get_log_info
 from swift.common.swob import Request
+from swift.common.trace import wsgi_trace, trace_add, trace_function
 from swift.common.utils import (get_logger, get_remote_client,
                                 config_true_value, reiterate,
                                 close_if_possible, cap_length,
@@ -185,6 +186,7 @@ class BufferXferEmitCallback(object):
         self.next_emit_time = (now + self.emit_buffer_xfer_bytes_sec)
 
 
+@wsgi_trace
 class ProxyLoggingMiddleware(object):
     """
     Middleware that logs Swift proxy requests in the swift log format.
@@ -342,6 +344,7 @@ class ProxyLoggingMiddleware(object):
         """
         return req.environ.get('swift.access_logging', {}).get('user_id')
 
+    @trace_function(force_span=True)
     def log_request(self, req, status_int, bytes_received, bytes_sent,
                     start_time, end_time, resp_headers=None, ttfb=0,
                     wire_status_int=None):
@@ -433,6 +436,8 @@ class ProxyLoggingMiddleware(object):
                 self.get_access_user_id(req), self.anonymization_method,
                 self.anonymization_salt),
         }
+        trace_add('wire_status_int', wire_status_int, req.environ)
+        trace_add('status_int', status_int, req.environ)
         self.access_logger.info(
             self.log_formatter.format(self.log_msg_template,
                                       **replacements))

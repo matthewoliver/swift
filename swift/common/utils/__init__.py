@@ -58,11 +58,12 @@ try:
 except ImportError:
     # python < 3.8
     import pkg_resources
-from eventlet import GreenPool, sleep, Timeout
+from eventlet import GreenPool, sleep, Timeout, GreenPile
 from eventlet.event import Event
 from eventlet.green import socket
 import eventlet.hubs
 import eventlet.queue
+from opentelemetry import trace as otel_trace
 
 import pickle  # nosec: B403
 from configparser import (ConfigParser, NoSectionError,
@@ -73,6 +74,7 @@ from collections import UserList
 import swift.common.exceptions
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.linkat import linkat
+from swift.common import trace
 
 # For backwards compatability with 3rd party middlewares
 from swift.common.registry import register_swift_info, get_swift_info  # noqa
@@ -199,6 +201,7 @@ DEFAULT_LOCK_TIMEOUT = 10
 # the more likely case they've increased the value to optimize high througput
 # transfers this will still cut off the transfer after the first chunk.
 DEFAULT_DRAIN_LIMIT = 65536
+EXPIRES_ISO8601_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 
 
 def _patch_statsd_methods(target, statsd_client_source):
@@ -2159,6 +2162,33 @@ class GreenAsyncPileWaitallTimeout(Timeout):
 DEAD = object()
 
 
+class TraceAwareGreenPile(GreenPile):
+    def __init__(self, size_or_pool=1000, env=None):
+        super().__init__(size_or_pool)
+        self.env = env
+
+    def spawn(self, func, *args, **kw):
+        """
+        Runs *func* in its own green thread, with the result available by
+        iterating over the GreenPile object.
+        """
+        self.counter += 1
+        try:
+            span = trace.trace_get_current_span(self.env)
+            gt = self.pool.spawn(self._run_func, span, func, args, kw)
+            self.waiters.put(gt)
+        except: # noqa
+            self.counter -= 1
+            raise
+
+    def _run_func(self, span, func, args, kwargs):
+        if span:
+            with otel_trace.use_span(span):
+                return func(*args, **kwargs)
+        else:
+            return func(*args, **kwargs)
+
+
 class GreenAsyncPile(object):
     """
     Runs jobs in a pool of green threads, and the results can be retrieved by
@@ -2171,7 +2201,7 @@ class GreenAsyncPile(object):
     Correlating results with jobs (if necessary) is left to the caller.
     """
 
-    def __init__(self, size_or_pool):
+    def __init__(self, size_or_pool, env=None):
         """
         :param size_or_pool: thread pool size or a pool to use
         """
@@ -2184,10 +2214,15 @@ class GreenAsyncPile(object):
         self._responses = eventlet.queue.LightQueue(size)
         self._inflight = 0
         self._pending = 0
+        self.env = env
 
-    def _run_func(self, func, args, kwargs):
+    def _run_func(self, func, args, kwargs, span=None):
         try:
-            self._responses.put(func(*args, **kwargs))
+            if span:
+                with otel_trace.use_span(span):
+                    self._responses.put(func(*args, **kwargs))
+            else:
+                self._responses.put(func(*args, **kwargs))
         except Exception:
             if eventlet.hubs.get_hub().debug_exceptions:
                 traceback.print_exception(*sys.exc_info())
@@ -2205,7 +2240,8 @@ class GreenAsyncPile(object):
         """
         self._pending += 1
         self._inflight += 1
-        self._pool.spawn(self._run_func, func, args, kwargs)
+        span = trace.trace_get_current_span(self.env)
+        self._pool.spawn(self._run_func, func, args, kwargs, span=span)
 
     def waitfirst(self, timeout):
         """
@@ -2264,10 +2300,10 @@ class StreamingPile(GreenAsyncPile):
     :class:`ContextPool`.
     """
 
-    def __init__(self, size):
+    def __init__(self, size, env=None):
         """:param size: number of worker threads to use"""
         self.pool = ContextPool(size)
-        super(StreamingPile, self).__init__(self.pool)
+        super(StreamingPile, self).__init__(self.pool, env)
 
     def asyncstarmap(self, func, args_iter):
         """

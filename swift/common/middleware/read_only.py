@@ -17,6 +17,7 @@ from swift.common.swob import HTTPMethodNotAllowed, Request
 from swift.common.utils import get_logger, config_true_value
 from swift.common.registry import register_swift_info
 from swift.proxy.controllers.base import get_info
+from swift.common.trace import wsgi_trace
 
 """
 =========
@@ -59,6 +60,7 @@ and can only be set using a direct client to the account nodes.
 """
 
 
+@wsgi_trace
 class ReadOnlyMiddleware(object):
     """
     Middleware that make an entire cluster or individual accounts read only.

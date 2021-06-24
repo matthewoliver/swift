@@ -16,8 +16,10 @@
 import os
 
 from swift.common.swob import Request, Response
+from swift.common.trace import wsgi_trace
 
 
+@wsgi_trace
 class HealthCheckMiddleware(object):
     """
     Healthcheck middleware used for monitoring.

@@ -154,6 +154,7 @@ from swift.common.http import is_success, is_client_error, HTTP_NOT_FOUND, \
 from swift.common.request_helpers import get_sys_meta_prefix, \
     copy_header_subset, get_reserved_name, split_reserved_name, \
     constrain_req_limit
+from swift.common.trace import wsgi_trace, trace_function
 from swift.common.middleware import app_property
 from swift.common.middleware.symlink import TGT_OBJ_SYMLINK_HDR, \
     TGT_ETAG_SYSMETA_SYMLINK_HDR, SYMLOOP_EXTEND, ALLOW_RESERVED_NAMES, \
@@ -261,6 +262,7 @@ class ObjectVersioningContext(WSGIContext):
 
 class ObjectContext(ObjectVersioningContext):
 
+    @trace_function
     def _get_source_object(self, req, path_info):
         # make a pre_auth request in case the user has write access
         # to container, but not READ. This was allowed in previous version
@@ -277,6 +279,7 @@ class ObjectContext(ObjectVersioningContext):
 
         return source_resp
 
+    @trace_function
     def _put_versioned_obj(self, req, put_path_info, source_resp):
         # Create a new Request object to PUT to the versions container, copying
         # all headers from the source object apart from x-timestamp.
@@ -297,6 +300,7 @@ class ObjectContext(ObjectVersioningContext):
         close_if_possible(source_resp.app_iter)
         return put_resp
 
+    @trace_function
     def _put_versioned_obj_from_client(self, req, versions_cont, api_version,
                                        account_name, object_name):
         vers_obj_name = self._build_versions_object_name(
@@ -352,6 +356,7 @@ class ObjectContext(ObjectVersioningContext):
 
         return (put_resp, vers_obj_name, put_bytes, put_content_type)
 
+    @trace_function
     def _put_symlink_to_version(self, req, versions_cont, put_vers_obj_name,
                                 api_version, account_name, object_name,
                                 put_etag, put_bytes, put_content_type):
@@ -1382,6 +1387,7 @@ class AccountContext(ObjectVersioningContext):
         return app_resp
 
 
+@wsgi_trace
 class ObjectVersioningMiddleware(object):
 
     def __init__(self, app, conf):
@@ -1395,6 +1401,7 @@ class ObjectVersioningMiddleware(object):
     _pipeline_request_logging_app = app_property(
         '_pipeline_request_logging_app')
 
+    @trace_function
     def account_request(self, req, api_version, account, start_response):
         account_ctx = AccountContext(self.app, self.logger)
         if req.method == 'GET':
@@ -1403,6 +1410,7 @@ class ObjectVersioningMiddleware(object):
         else:
             return self.app(req.environ, start_response)
 
+    @trace_function
     def container_request(self, req, start_response):
         container_ctx = ContainerContext(self.app, self.logger)
         if req.method in ('PUT', 'POST') and \
@@ -1414,6 +1422,7 @@ class ObjectVersioningMiddleware(object):
         # send request and translate sysmeta headers from response
         return container_ctx.handle_request(req, start_response)
 
+    @trace_function
     def object_request(self, req, api_version, account, container, obj):
         """
         Handle request for object resource.

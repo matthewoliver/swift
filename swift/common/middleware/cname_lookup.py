@@ -42,6 +42,7 @@ from swift.common.swob import Request, HTTPBadRequest, \
 from swift.common.utils import cache_from_env, get_logger, is_valid_ip, \
     list_from_csv, parse_socket_string
 from swift.common.registry import register_swift_info
+from swift.common.trace import wsgi_trace, new_trace_span
 
 
 def lookup_cname(domain, resolver):  # pragma: no cover
@@ -72,6 +73,7 @@ class _CnameLookupContext(RewriteContext):
     base_re = r'^(https?://)%s(/.*)?$'
 
 
+@wsgi_trace
 class CNAMELookupMiddleware(object):
     """
     CNAME Lookup Middleware
@@ -148,7 +150,9 @@ class CNAMELookupMiddleware(object):
                     memcache_key = ''.join(['cname-', a_domain])
                     found_domain = self.memcache.get(memcache_key)
                 if found_domain is None:
-                    ttl, found_domain = lookup_cname(a_domain, self.resolver)
+                    with new_trace_span(env, 'lookup_cname'):
+                        ttl, found_domain = lookup_cname(a_domain,
+                                                         self.resolver)
                     if self.memcache and ttl > 0:
                         memcache_key = ''.join(['cname-', given_domain])
                         self.memcache.set(memcache_key, found_domain,

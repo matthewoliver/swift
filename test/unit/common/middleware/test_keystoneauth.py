@@ -20,6 +20,7 @@ from swift.common.swob import Request, Response
 from swift.common.http import HTTP_FORBIDDEN
 from swift.common.utils import split_path
 from swift.proxy.controllers.base import get_cache_key
+from swift.common.trace import wsgi_trace
 from test.debug_logger import debug_logger
 
 UNKNOWN_ID = keystoneauth.UNKNOWN_ID
@@ -71,6 +72,7 @@ def get_identity_headers(status='Confirmed', tenant_id='1',
     return res
 
 
+@wsgi_trace
 class FakeApp(object):
     def __init__(self, status_headers_body_iter=None):
         self.calls = 0

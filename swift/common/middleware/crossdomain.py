@@ -15,8 +15,10 @@
 
 from swift.common.swob import Request, Response
 from swift.common.registry import register_swift_info
+from swift.common.trace import wsgi_trace
 
 
+@wsgi_trace
 class CrossDomainMiddleware(object):
 
     """

@@ -86,6 +86,7 @@ Due to the eventual consistency further uploads might be possible until the
 account size has been updated.
 """
 
+from swift.common.trace import wsgi_trace
 from swift.common.swob import HTTPForbidden, HTTPBadRequest, \
     HTTPRequestEntityTooLarge, wsgify
 from swift.common.registry import register_swift_info
@@ -93,6 +94,7 @@ from swift.common.storage_policy import POLICIES
 from swift.proxy.controllers.base import get_account_info, get_container_info
 
 
+@wsgi_trace
 class AccountQuotaMiddleware(object):
     """Account quota middleware
 

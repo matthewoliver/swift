@@ -42,10 +42,11 @@ from test.debug_logger import debug_logger
 from test.unit import (
     fake_http_connect, FakeRing, FakeMemcache, PatchPolicies, patch_policies,
     FakeSource, StubResponse, CaptureIteratorFactory, make_timestamp_iter,
-    BaseUnitTestCase)
+    BaseUnitTestCase, activate_tracing, TraceAssertMixin)
 from swift.common.request_helpers import (
     get_sys_meta_prefix, get_object_transient_sysmeta
 )
+from swift.common.trace import wsgi_trace
 
 
 class FakeResponse(object):
@@ -151,6 +152,7 @@ class ZeroCacheDynamicResponseFactory(DynamicResponseFactory):
     }
 
 
+@wsgi_trace
 class FakeApp(object):
 
     recheck_container_existence = 30
@@ -185,7 +187,7 @@ class FakeCache(FakeMemcache):
         return self.stub or super(FakeCache, self).get(key, raise_on_error)
 
 
-class BaseTest(BaseUnitTestCase):
+class BaseTest(BaseUnitTestCase, TraceAssertMixin):
 
     def setUp(self):
         super().setUp()
@@ -480,21 +482,24 @@ class TestFuncs(BaseTest):
         final_app = FakeApp()
 
         def factory(app, include_pipeline_ref=True):
-            def wsgi_filter(env, start_response):
-                # lots of middlewares get info...
-                if env['PATH_INFO'].count('/') > 2:
-                    get_container_info(env, app)
-                else:
-                    get_account_info(env, app)
-                # ...then decide to no-op based on the result
-                return app(env, start_response)
+            @wsgi_trace
+            class Mw(object):
+                def __call__(self, env, start_response):
+                    # lots of middlewares get info...
+                    if env['PATH_INFO'].count('/') > 2:
+                        get_container_info(env, app)
+                    else:
+                        get_account_info(env, app)
+                    # ...then decide to no-op based on the result
+                    return app(env, start_response)
 
+            mw = Mw()
             if include_pipeline_ref:
                 # Note that we have to do some book-keeping in tests to mimic
                 # what would be done in swift.common.wsgi.load_app
-                wsgi_filter._pipeline_final_app = final_app
-                wsgi_filter._pipeline_request_logging_app = final_app
-            return wsgi_filter
+                mw._pipeline_final_app = final_app
+                mw._pipeline_request_logging_app = final_app
+            return mw
 
         # build up a pipeline
         filtered_app = factory(factory(factory(final_app)))
@@ -518,13 +523,17 @@ class TestFuncs(BaseTest):
         def factory(app, func=None):
             calls = []
 
-            def wsgi_filter(env, start_response):
-                calls.append(env)
-                if func:
-                    func(env, app)
-                return app(env, start_response)
+            @wsgi_trace
+            class Mw(object):
+                def __call__(self, env, start_response):
+                    calls.append(env)
+                    if func:
+                        func(env, app)
+                    return app(env, start_response)
 
-            return wsgi_filter, calls
+            mw = Mw()
+
+            return mw, calls
 
         # build up a pipeline, pretend there is a proxy_logging middleware
         final_app = FakeApp()
@@ -548,13 +557,17 @@ class TestFuncs(BaseTest):
         def factory(app, func=None):
             calls = []
 
-            def wsgi_filter(env, start_response):
-                calls.append(env)
-                if func:
-                    func(env, app)
-                return app(env, start_response)
+            @wsgi_trace
+            class Mw(object):
+                def __call__(self, env, start_response):
+                    calls.append(env)
+                    if func:
+                        func(env, app)
+                    return app(env, start_response)
 
-            return wsgi_filter, calls
+            mw = Mw()
+
+            return mw, calls
 
         # build up a pipeline, pretend there is a proxy_logging middleware
         final_app = FakeApp()
@@ -748,7 +761,7 @@ class TestFuncs(BaseTest):
             "/v1/account/cont",
             environ={'swift.infocache': {cache_key: {'bytes': 3867}},
                      'swift.cache': FakeCache({})})
-        resp = get_container_info(req.environ, 'xxx')
+        resp = get_container_info(req.environ, FakeApp(), 'xxx')
         self.assertEqual(resp['bytes'], 3867)
 
     def test_info_clearing(self):
@@ -825,37 +838,61 @@ class TestFuncs(BaseTest):
             self.logger, 'object', 'shard_updating', 'miss')
         self.app.logger.increment.assert_not_called()
 
+    def assertExpectedSpans(self, in_memory_spans, expected_spans):
+        self.assert_span_names(in_memory_spans, expected_spans,
+                               fuzzy_make_node_request=True)
+
     def test_get_account_info_swift_source(self):
         app = FakeApp()
         req = Request.blank("/v1/a", environ={'swift.cache': FakeCache()})
+        _, in_memory_spans = activate_tracing(req.environ)
         get_account_info(req.environ, app, swift_source='MC')
         self.assertEqual([e['swift.source'] for e in app.captured_envs],
                          ['MC'])
+        expected_spans = [
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeApp']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_get_account_info_swift_owner(self):
         app = FakeApp()
         req = Request.blank("/v1/a", environ={'swift.cache': FakeCache()})
+        _, in_memory_spans = activate_tracing(req.environ)
         get_account_info(req.environ, app)
         self.assertEqual([e['swift_owner'] for e in app.captured_envs],
                          [True])
+        expected_spans = [
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeApp']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_get_account_info_infocache(self):
         app = FakeApp()
         ic = {}
         req = Request.blank("/v1/a", environ={'swift.cache': FakeCache(),
                                               'swift.infocache': ic})
+        _, in_memory_spans = activate_tracing(req.environ)
         get_account_info(req.environ, app)
         got_infocaches = [e['swift.infocache'] for e in app.captured_envs]
         self.assertEqual(1, len(got_infocaches))
         self.assertIs(ic, got_infocaches[0])
+        expected_spans = [
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)', 'FakeApp']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_get_account_info_no_cache(self):
         app = FakeApp()
         req = Request.blank("/v1/AUTH_account",
                             environ={'swift.cache': FakeCache({})})
+        _, in_memory_spans = activate_tracing(req.environ)
         resp = get_account_info(req.environ, app)
         self.assertEqual(resp['bytes'], 6666)
         self.assertEqual(resp['total_object_count'], 1000)
+        expected_spans = [
+            '_get_info_from_memcache(AUTH_account, None)',
+            '_get_info_from_caches(AUTH_account, None)', 'FakeApp']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_get_account_info_cache(self):
         # Works with fake apps that return ints in the headers
@@ -864,10 +901,15 @@ class TestFuncs(BaseTest):
                   'total_object_count': 10}
         req = Request.blank("/v1/account/cont",
                             environ={'swift.cache': FakeCache(cached)})
+        _, in_memory_spans = activate_tracing(req.environ)
         resp = get_account_info(req.environ, FakeApp())
         self.assertEqual(resp['bytes'], 3333)
         self.assertEqual(resp['total_object_count'], 10)
         self.assertEqual(resp['status'], 404)
+        expected_spans = [
+            '_get_info_from_memcache(account, None)',
+            '_get_info_from_caches(account, None)']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
         # Works with strings too, like you get when parsing HTTP headers
         # that came in through a socket from the account server
@@ -878,12 +920,17 @@ class TestFuncs(BaseTest):
                   'meta': {}}
         req = Request.blank("/v1/account/cont",
                             environ={'swift.cache': FakeCache(cached)})
+        _, in_memory_spans = activate_tracing(req.environ)
         resp = get_account_info(req.environ, FakeApp())
         self.assertEqual(resp['status'], 404)
         self.assertEqual(resp['bytes'], 3333)
         self.assertEqual(resp['container_count'], 234)
         self.assertEqual(resp['meta'], {})
         self.assertEqual(resp['total_object_count'], 10)
+        expected_spans = [
+            '_get_info_from_memcache(account, None)',
+            '_get_info_from_caches(account, None)']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_get_account_info_env(self):
         cache_key = get_cache_key("account")
@@ -891,25 +938,34 @@ class TestFuncs(BaseTest):
             "/v1/account",
             environ={'swift.infocache': {cache_key: {'bytes': 3867}},
                      'swift.cache': FakeCache({})})
-        resp = get_account_info(req.environ, 'xxx')
+        _, in_memory_spans = activate_tracing(req.environ)
+        resp = get_account_info(req.environ, FakeApp())
         self.assertEqual(resp['bytes'], 3867)
+        expected_spans = [
+            '_get_info_from_caches(account, None)']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_get_account_info_bad_path(self):
         fake_cache = FakeCache({})
         req = Request.blank("/non-swift/AUTH_account",
                             environ={'swift.cache': fake_cache})
         info = get_account_info(req.environ, FakeApp(statuses=[400]))
+        _, in_memory_spans = activate_tracing(req.environ)
         self.assertEqual(info['status'], 0)
         # *not* cached
         key = get_cache_key("AUTH_account")
         self.assertNotIn(key, fake_cache.store)
+        expected_spans = []
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
         # but if for some reason the account *already was* cached...
         fake_cache.store[key] = headers_to_account_info({}, 200)
         req = Request.blank("/non-swift/AUTH_account/does_not_exist",
                             environ={'swift.cache': fake_cache})
+        _, in_memory_spans = activate_tracing(req.environ)
         info = get_account_info(req.environ, FakeApp(statuses=[400]))
         self.assertEqual(info['status'], 0)
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_get_object_info_env(self):
         cached = {'status': 200,
@@ -921,20 +977,29 @@ class TestFuncs(BaseTest):
             "/v1/account/cont/obj",
             environ={'swift.infocache': {cache_key: cached},
                      'swift.cache': FakeCache({})})
-        resp = get_object_info(req.environ, 'xxx')
+        _, in_memory_spans = activate_tracing(req.environ)
+        resp = get_object_info(req.environ, FakeApp())
         self.assertEqual(resp['length'], 3333)
         self.assertEqual(resp['type'], 'application/json')
+        expected_spans = [
+            '_get_object_info(/v1/account/cont/obj)']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_get_object_info_no_env(self):
         app = FakeApp()
         req = Request.blank("/v1/account/cont/obj",
                             environ={'swift.cache': FakeCache({})})
+        _, in_memory_spans = activate_tracing(req.environ)
         resp = get_object_info(req.environ, app)
         self.assertEqual(app.responses.stats['account'], 0)
         self.assertEqual(app.responses.stats['container'], 0)
         self.assertEqual(app.responses.stats['obj'], 1)
         self.assertEqual(resp['length'], 5555)
         self.assertEqual(resp['type'], 'text/plain')
+        expected_spans = [
+            'FakeApp',
+            '_get_object_info(/v1/account/cont/obj)']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_options(self):
         base = Controller(self.app)
@@ -946,11 +1011,24 @@ class TestFuncs(BaseTest):
                             environ={'swift.cache': FakeCache()},
                             headers={'Origin': origin,
                                      'Access-Control-Request-Method': 'GET'})
+        _, in_memory_spans = activate_tracing(req.environ)
+        base.env = req.environ
 
         with mock.patch('swift.proxy.controllers.base.'
                         'http_connect', fake_http_connect(200)):
             resp = base.OPTIONS(req)
         self.assertEqual(resp.status_int, 200)
+        expected_spans = [
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)',
+            '_make_node_request -> (10.0.0.1:1001)', 'Application',
+            '_get_info_from_caches(a, None)',
+            '_make_node_request -> (10.0.0.2:1002)',
+            '_make_node_request -> (10.0.0.1:1001)',
+            '_make_node_request -> (10.0.0.0:1000)',
+            '_GETorHEAD_from_backend', 'Application_1']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_options_with_null_allow_origin(self):
         base = Controller(self.app)
@@ -968,6 +1046,7 @@ class TestFuncs(BaseTest):
                             environ={'swift.cache': FakeCache()},
                             headers={'Origin': '*',
                                      'Access-Control-Request-Method': 'GET'})
+        _, in_memory_spans = activate_tracing(req.environ)
 
         with mock.patch('swift.proxy.controllers.base.'
                         'http_connect', fake_http_connect(200)):
@@ -983,11 +1062,24 @@ class TestFuncs(BaseTest):
                             environ={'swift.cache': FakeCache()},
                             headers={'Origin': 'http://m.com',
                                      'Access-Control-Request-Method': 'GET'})
+        _, in_memory_spans = activate_tracing(req.environ)
+        base.req = req
 
         with mock.patch('swift.proxy.controllers.base.'
                         'http_connect', fake_http_connect(200)):
             resp = base.OPTIONS(req)
         self.assertEqual(resp.status_int, 401)
+        expected_spans = [
+            '_get_info_from_memcache(a, c)', '_get_info_from_caches(a, c)',
+            '_get_info_from_memcache(a, None)',
+            '_get_info_from_caches(a, None)',
+            '_make_node_request -> (10.0.0.2:1002)', 'Application',
+            '_get_info_from_caches(a, None)',
+            '_make_node_request -> (10.0.0.2:1002)',
+            '_make_node_request -> (10.0.0.0:1000)',
+            '_make_node_request -> (10.0.0.1:1001)',
+            '_GETorHEAD_from_backend', 'Application_1']
+        self.assertExpectedSpans(in_memory_spans, expected_spans)
 
     def test_headers_to_container_info_missing(self):
         resp = headers_to_container_info({}, 404)

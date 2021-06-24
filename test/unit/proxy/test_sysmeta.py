@@ -230,7 +230,8 @@ class TestObjectSysmeta(unittest.TestCase):
         path = '/v1/a/c/o'
         cache = FakeMemcache()
 
-        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache}
+        env = {'REQUEST_METHOD': 'PUT', 'swift.cache': cache,
+               'X-Timestamp': 1}
         hdrs = dict(self.original_sysmeta_headers_1)
         hdrs.update(self.original_sysmeta_headers_2)
         hdrs.update(self.original_meta_headers_1)

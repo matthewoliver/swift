@@ -37,6 +37,7 @@ from swift.common import utils, constraints
 from swift.common.http_protocol import SwiftHttpProtocol, \
     SwiftHttpProxiedProtocol
 from swift.common.storage_policy import BindPortsCache
+from swift.common.trace import TRACE_ENV_KEYS
 from swift.common.swob import Request, wsgi_unquote
 from swift.common.utils import capture_stdio, disable_fallocate, \
     drop_privileges, get_logger, NullLogger, config_true_value, \
@@ -1350,7 +1351,7 @@ def make_env(env, method=None, path=None, agent='Swift', query_string=None,
     :returns: Fresh WSGI environment.
     """
     newenv = {}
-    for name in ('HTTP_USER_AGENT', 'HTTP_HOST', 'PATH_INFO',
+    for name in ['HTTP_USER_AGENT', 'HTTP_HOST', 'PATH_INFO',
                  'QUERY_STRING', 'REMOTE_USER', 'REQUEST_METHOD',
                  'SCRIPT_NAME', 'SERVER_NAME', 'SERVER_PORT',
                  'HTTP_ORIGIN', 'HTTP_ACCESS_CONTROL_REQUEST_METHOD',
@@ -1358,7 +1359,8 @@ def make_env(env, method=None, path=None, agent='Swift', query_string=None,
                  'swift.trans_id', 'swift.authorize_override',
                  'swift.authorize', 'HTTP_X_USER_ID', 'HTTP_X_PROJECT_ID',
                  'HTTP_REFERER', 'swift.infocache',
-                 'swift.base_labels', 'swift.shard_listing_history'):
+                 'swift.base_labels',
+                 'swift.shard_listing_history'] + TRACE_ENV_KEYS:
         if name in env:
             newenv[name] = env[name]
     if method:

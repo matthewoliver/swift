@@ -44,6 +44,7 @@ import re
 from swift.common.utils import get_logger
 from swift.common.registry import register_swift_info
 
+from swift.common.trace import wsgi_trace
 from swift.common.swob import Request, HTTPBadRequest
 
 
@@ -52,6 +53,7 @@ MAX_LENGTH = 255
 FORBIDDEN_REGEXP = r"/\./|/\.\./|/\.$|/\.\.$"
 
 
+@wsgi_trace
 class NameCheckMiddleware(object):
 
     def __init__(self, app, conf):

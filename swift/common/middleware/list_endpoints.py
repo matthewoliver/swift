@@ -87,11 +87,13 @@ from swift.common.utils import get_logger, split_path
 from swift.common.swob import Request, Response
 from swift.common.swob import HTTPBadRequest, HTTPMethodNotAllowed
 from swift.common.storage_policy import POLICIES
+from swift.common.trace import wsgi_trace
 from swift.proxy.controllers.base import get_container_info
 
 RESPONSE_VERSIONS = (1.0, 2.0)
 
 
+@wsgi_trace
 class ListEndpointsMiddleware(object):
     """
     List endpoints for an object, account or container.

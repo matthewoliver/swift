@@ -25,6 +25,7 @@ from swift.common.middleware.acl import format_acl
 from swift.common.swob import Request, Response, bytes_to_wsgi, HTTPOk
 from swift.common.statsd_client import StatsdClient
 from swift.common.utils import split_path
+from swift.common.trace import wsgi_trace
 from test.unit import FakeMemcache
 from test.unit.common.middleware.helpers import FakeSwift
 
@@ -37,6 +38,7 @@ def b64encode(str_or_bytes):
     return _b64encode(str_or_bytes).decode('ascii')
 
 
+@wsgi_trace
 class FakeApp(object):
 
     def __init__(self, status_headers_body_iter=None, acl=None, sync_key=None):

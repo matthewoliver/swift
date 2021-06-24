@@ -18,6 +18,7 @@ import eventlet
 
 from swift.common.utils import cache_from_env, get_logger
 from swift.common.registry import register_swift_info
+from swift.common.trace import wsgi_trace
 from swift.proxy.controllers.base import get_account_info, get_container_info
 from swift.common.constraints import valid_api_version
 from swift.common.memcached import MemcacheConnectionError
@@ -85,6 +86,7 @@ class MaxSleepTimeHitError(Exception):
     pass
 
 
+@wsgi_trace
 class RateLimitMiddleware(object):
     """
     Rate limiting middleware
