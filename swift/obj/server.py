@@ -371,11 +371,11 @@ class ObjectController(BaseStorageServer):
             else:
                 status_or_error = 'exception'
             msg = ('ERROR container update failed (%(error_type)s) with '
-                '%(ip)s:%(port)s/%(dev)s (saving for async update later)' %
-                {'ip': ip, 'port': port, 'dev': contdevice,
-                 'error_type': status_or_error})
+                   '%(ip)s:%(port)s/%(dev)s (saving for async update later)' %
+                   {'ip': ip, 'port': port, 'dev': contdevice,
+                    'error_type': status_or_error})
             self.logger.exception(msg)
-            trace_exception(ex, request.environ)
+            trace_exception(e, request.environ)
             trace_add('Error', msg, request.environ)
         finally:
             # self.stats.increment('sync_update', **sync_update_ctx)
