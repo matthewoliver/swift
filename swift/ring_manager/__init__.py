@@ -1,0 +1,1 @@
+"""Swift ring-manager service."""

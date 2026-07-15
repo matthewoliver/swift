@@ -1,0 +1,35 @@
+[DEFAULT]
+# bind_ip = 0.0.0.0
+bind_port = 6205
+# keep_idle = 600
+# bind_timeout = 30
+# backlog = 4096
+# user = swift
+# swift_dir = /etc/swift
+# workers = auto
+# max_clients = 1024
+# log_name = swift
+# log_facility = LOG_LOCAL0
+# log_level = INFO
+# log_address = /dev/log
+# log_anonymization_method = MD5
+# log_anonymization_salt =
+# log_format = {remote_addr} - - [{time.d}/{time.b}/{time.Y}:{time.H}:{time.M}:{time.S} +0000] "{method} {path}" {status} {content_length} "{referer}" "{txn_id}" "{user_agent}" {trans_time:.4f} "{additional_info}" {pid} {policy_index}
+
+[pipeline:main]
+pipeline = catch_errors healthcheck ring-manager-server
+
+[app:ring-manager-server]
+use = egg:swift#ring_manager
+# set log_name = ring-manager-server
+# set log_facility = LOG_LOCAL0
+# set log_level = INFO
+# set log_address = /dev/log
+# set log_requests = true
+
+[filter:healthcheck]
+use = egg:swift#healthcheck
+# disable_path =
+
+[filter:catch_errors]
+use = egg:swift#catch_errors
