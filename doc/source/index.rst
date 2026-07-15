@@ -47,6 +47,7 @@ Overview and Concepts
     overview_architecture
     overview_wsgi_management
     overview_ring
+    overview_ring_manager
     overview_ring_format
     overview_policies
     overview_reaper
@@ -107,6 +108,18 @@ Administrator Documentation
     admin/index
     install/index
     config/index
+
+
+Ring Manager REST API Documentation
+===================================
+
+The following provides reference information for the ring-manager operator
+control-plane API:
+
+.. toctree::
+    :maxdepth: 1
+
+    api/ring_manager.rst
 
 
 Object Storage v1 REST API Documentation

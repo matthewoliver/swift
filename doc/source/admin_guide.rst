@@ -56,6 +56,11 @@ of the downgrade.
 
 For more information see :doc:`overview_ring`.
 
+Swift also includes an optional ring-manager control-plane service.
+The service has its own versioned API, authentication middleware, and durable
+state directory, and is managed through ``swift-init control``.
+See :doc:`overview_ring_manager` before enabling it.
+
 .. highlight:: none
 
 Removing a device from the ring::

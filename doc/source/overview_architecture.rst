@@ -104,6 +104,17 @@ it is an important concept in understanding Swift architecture.
 
 See :doc:`overview_policies` for complete information on storage policies.
 
+--------------------------
+Ring Manager Control Plane
+--------------------------
+
+The optional ring-manager service provides a separate control-plane WSGI
+application for ring operations.
+It is not part of the Object Storage v1 API and is not in the client data
+path.
+See :doc:`overview_ring_manager` for its service boundary, authentication,
+state storage, and operational integration.
+
 -------------
 Object Server
 -------------

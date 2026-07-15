@@ -1,0 +1,42 @@
+digraph ring_manager_architecture {
+    graph [
+        bgcolor="white",
+        fontname="DejaVu Sans",
+        label="Ring manager service foundation",
+        labelloc="t",
+        nodesep="0.45",
+        rankdir="LR",
+        ranksep="0.7"
+    ];
+    node [
+        color="#4f5d75",
+        fillcolor="#f4f7fb",
+        fontname="DejaVu Sans",
+        shape="box",
+        style="rounded,filled"
+    ];
+    edge [color="#4f5d75", fontname="DejaVu Sans"];
+
+    operator [label="Operator or\nautomation"];
+    auth [label="ring-manager-auth\nread/admin policy"];
+    app [label="RingManagerApplication\ndiscovery, status, dispatch"];
+    controller [label="RingController\nring-specific routes"];
+    store [label="RingManagerStore\nlocks and durable JSON"];
+    state [label="ring_manager_state_dir", shape="cylinder"];
+
+    operator -> auth [label="control API"];
+    auth -> app;
+    app -> controller [label="routes()"];
+    app -> store;
+    controller -> store;
+    store -> state;
+
+    subgraph cluster_data_path {
+        color="#9aa5b1";
+        fontcolor="#4f5d75";
+        label="Swift data path (separate)";
+        proxy [label="Proxy server"];
+        storage [label="Account, container,\nand object servers"];
+        proxy -> storage [label="client data"];
+    }
+}

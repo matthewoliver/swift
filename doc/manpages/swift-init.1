@@ -33,7 +33,7 @@ The swift-init tool can be used to initialize all swift daemons available as par
 OpenStack Swift. Instead of calling individual init scripts for each
 swift daemon, one can just use swift-init. With swift-init you can initialize
 just one swift service, such as the "proxy", or a combination of them. The tool also
-allows one to use the keywords such as "all", "main" and "rest" for the <server> argument.
+allows one to use the keywords such as "all", "main", "rest" and "control" for the <server> argument.
 
 
 \fBServers:\fR
@@ -60,6 +60,11 @@ allows one to use the keywords such as "all", "main" and "rest" for the <server>
 .RE
 
 .RS 4
+.IP "\fIring-manager-server\fR"
+.IP "    - Initializes the swift ring-manager service"
+.RE
+
+.RS 4
 .IP "\fIall\fR"
 .IP "    - Initializes \fBall\fR the swift daemons"
 .RE
@@ -74,6 +79,12 @@ allows one to use the keywords such as "all", "main" and "rest" for the <server>
 .IP "\fIrest\fR"
 .IP "    - Initializes all the other \fBswift background daemons\fR"
 .IP "      (updater, replicator, auditor, reaper, etc)"
+.RE
+
+.RS 4
+.IP "\fIcontrol\fR"
+.IP "    - Initializes Swift \fBcontrol-plane services\fR"
+.IP "      (ring-manager)"
 .RE
 .PD
 
@@ -111,7 +122,7 @@ allows one to use the keywords such as "all", "main" and "rest" for the <server>
 .IP "-k N, --kill-wait=N \t wait N seconds for processes to die (default 15)
 .IP "-r RUN_DIR, --run-dir=RUN_DIR directory where the pids will be stored (default /var/run/swift)
 .IP "--strict return non-zero status code if some config is missing. Default mode if server is explicitly named."
-.IP "--non-strict return zero status code even if some config is missing. Default mode if server is one of aliases `all`, `main` or `rest`."
+.IP "--non-strict return zero status code even if some config is missing. Default mode if server is one of aliases `all`, `main`, `rest` or `control`."
 .IP "--kill-after-timeout kill daemon and all children after kill-wait period."
 .PD
 .RE
