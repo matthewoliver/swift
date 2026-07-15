@@ -121,6 +121,13 @@ exclusive lock.
 PATCH may change the replica count, ``min_part_hours``, and overload through
 Swift's ``RingBuilder`` methods.
 Ordinary PUT or PATCH cannot change partition power on an existing builder.
+Object-ring partition power instead uses explicit prepare, increase, cancel,
+and finish actions under the same builder lock.
+Ring reads report the builder's lifecycle state and valid next actions.
+Prepare and increase reject an overlapping active build, while cancel and
+finish stay available for recovery.
+Every action changes builder state only and requires a later rebalance and
+publication workflow.
 Device add, replace, and remove requests validate the complete input before
 saving a new durable builder file.
 These operations change desired builder state only: they do not rebalance the

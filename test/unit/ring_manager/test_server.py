@@ -77,6 +77,19 @@ class TestRingManagerApplication(unittest.TestCase):
         builder.rebalance(seed=1)
         builder.save(path)
 
+    def _make_object_ring(self, ring_id='object-0'):
+        builder_path = os.path.join(self.testdir, '%s.builder' % ring_id)
+        self._make_builder(builder_path)
+        self._write_json('rings/%s.json' % ring_id, {
+            'id': ring_id,
+            'name': 'Policy %s' % ring_id,
+            'ring_type': 'object',
+            'storage_policy_index': 0,
+            'policy_type': 'replication',
+            'builder_files': [builder_path],
+        })
+        return builder_path
+
     def _write_json(self, relpath, value):
         path = os.path.join(self.state_dir, relpath)
         directory = os.path.dirname(path)
@@ -173,6 +186,10 @@ class TestRingManagerApplication(unittest.TestCase):
              ('POST',), 'ring_devices_add'),
             ('^/api/v1/rings/(?P<ring_id>[^/]+)/devices/remove/?$',
              ('POST',), 'ring_devices_remove'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/'
+             'partition_power_increase/'
+             '(?P<action>prepare|increase|cancel|finish)/?$',
+             ('POST',), 'ring_partition_power_increase'),
         ], [
             (route.regex.pattern, route.methods, route.handler.__name__)
             for route in self.app.routes
@@ -224,8 +241,14 @@ class TestRingManagerApplication(unittest.TestCase):
                          body['allowed_detail_http_methods'])
         self.assertEqual(['get', 'post'], body['allowed_list_http_methods'])
         for field in ('id', 'name', 'cluster', 'policy_type',
-                      'storage_policy_index', 'resource_uri'):
+                      'storage_policy_index', 'resource_uri',
+                      'next_part_power',
+                      'partition_power_increase_state',
+                      'allowed_partition_power_actions'):
             self.assertIn(field, body['fields'])
+        self.assertEqual(
+            True,
+            body['fields']['partition_power_increase_state']['readonly'])
 
     def test_ring_list(self):
         resp, body = self.get_json('/api/v1/rings/')
@@ -251,6 +274,9 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(3, body['num_replicas'])
         self.assertEqual(1, body['min_part_hours'])
         self.assertEqual(3, body['device_count'])
+        self.assertIsNone(body['next_part_power'])
+        self.assertEqual('idle', body['partition_power_increase_state'])
+        self.assertEqual([], body['allowed_partition_power_actions'])
         self.assertIn('builder_version', body)
 
     def test_ring_detail_not_found(self):
@@ -316,6 +342,17 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(409, resp.status_int)
         self.assertEqual('Ring already exists', body['error'])
 
+    def test_ring_create_rejects_partition_power_state(self):
+        resp, body = self.json_request('/api/v1/rings/', 'POST', {
+            'name': 'Policy-2',
+            'storage_policy_index': 2,
+            'next_part_power': 5,
+        })
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('Read-only ring fields', body['error'])
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, 'rings', 'object-2.json')))
+
     def test_ring_update(self):
         resp, body = self.json_request('/api/v1/rings/1/', 'PATCH', {
             'name': 'Renamed',
@@ -360,6 +397,241 @@ class TestRingManagerApplication(unittest.TestCase):
 
         builder = RingBuilder.load(self.builder_path)
         self.assertEqual(4, builder.part_power)
+
+    def test_ring_update_rejects_partition_power_state_updates(self):
+        cases = (
+            {'next_part_power': 5},
+            {'partition_power_increase_state': 'prepared'},
+            {'allowed_partition_power_actions': ['finish']},
+        )
+        for method in ('PATCH', 'PUT'):
+            for payload in cases:
+                before = RingBuilder.load(self.builder_path)
+                before_values = (
+                    before.version, before.part_power,
+                    before.next_part_power)
+
+                resp, body = self.json_request(
+                    '/api/v1/rings/1/', method, payload)
+                self.assertEqual(400, resp.status_int)
+                self.assertIn('Read-only ring fields', body['error'])
+
+                after = RingBuilder.load(self.builder_path)
+                self.assertEqual(before_values, (
+                    after.version, after.part_power,
+                    after.next_part_power))
+
+    def test_ring_detail_reports_partition_power_increase_state(self):
+        self._make_object_ring()
+
+        resp, body = self.get_json('/api/v1/rings/object-0/')
+        self.assertEqual(200, resp.status_int)
+        self.assertIsNone(body['next_part_power'])
+        self.assertEqual('idle', body['partition_power_increase_state'])
+        self.assertEqual(
+            ['prepare'], body['allowed_partition_power_actions'])
+
+    def test_ring_partition_power_increase_lifecycle(self):
+        builder_path = self._make_object_ring()
+        before = RingBuilder.load(builder_path)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/prepare/',
+            'POST', {})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('prepare', body['action'])
+        self.assertEqual(True, body['requires_publish'])
+        self.assertEqual(4, body['part_power'])
+        self.assertEqual(5, body['next_part_power'])
+        self.assertEqual(
+            'prepared', body['partition_power_increase_state'])
+        self.assertEqual(
+            ['increase', 'cancel'],
+            body['allowed_partition_power_actions'])
+        prepared = RingBuilder.load(builder_path)
+        self.assertEqual(before.version + 1, prepared.version)
+        self.assertEqual(4, prepared.part_power)
+        self.assertEqual(5, prepared.next_part_power)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/increase/',
+            'POST', {})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('increase', body['action'])
+        self.assertEqual(5, body['part_power'])
+        self.assertEqual(5, body['next_part_power'])
+        self.assertEqual(
+            'cleanup_pending', body['partition_power_increase_state'])
+        self.assertEqual(
+            ['finish'], body['allowed_partition_power_actions'])
+        increased = RingBuilder.load(builder_path)
+        self.assertEqual(prepared.version + 1, increased.version)
+        self.assertEqual(5, increased.part_power)
+        self.assertEqual(5, increased.next_part_power)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/finish/',
+            'POST', {})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('finish', body['action'])
+        self.assertEqual(5, body['part_power'])
+        self.assertIsNone(body['next_part_power'])
+        self.assertEqual('idle', body['partition_power_increase_state'])
+        self.assertEqual(
+            ['prepare'], body['allowed_partition_power_actions'])
+        finished = RingBuilder.load(builder_path)
+        self.assertEqual(increased.version + 1, finished.version)
+        self.assertIsNone(finished.next_part_power)
+
+    def test_ring_partition_power_increase_cancel_lifecycle(self):
+        builder_path = self._make_object_ring()
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/prepare/',
+            'POST', {})
+        self.assertEqual(200, resp.status_int)
+        prepared = RingBuilder.load(builder_path)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/cancel/',
+            'POST', {})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('cancel', body['action'])
+        self.assertEqual(4, body['part_power'])
+        self.assertEqual(4, body['next_part_power'])
+        self.assertEqual(
+            'cleanup_pending', body['partition_power_increase_state'])
+        self.assertEqual(
+            ['finish'], body['allowed_partition_power_actions'])
+        cancelled = RingBuilder.load(builder_path)
+        self.assertEqual(prepared.version + 1, cancelled.version)
+        self.assertEqual(4, cancelled.part_power)
+        self.assertEqual(4, cancelled.next_part_power)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/finish/',
+            'POST', {})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('idle', body['partition_power_increase_state'])
+        self.assertIsNone(body['next_part_power'])
+
+    def test_ring_partition_power_rejects_invalid_transition(self):
+        builder_path = self._make_object_ring()
+        before = RingBuilder.load(builder_path)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/increase/',
+            'POST', {})
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('cannot increase from state idle', body['error'])
+
+        after = RingBuilder.load(builder_path)
+        self.assertEqual(before.version, after.version)
+        self.assertIsNone(after.next_part_power)
+
+    def test_ring_partition_power_rejects_non_object_ring(self):
+        resp, body = self.json_request(
+            '/api/v1/rings/1/partition_power_increase/prepare/',
+            'POST', {})
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('only supported for object rings', body['error'])
+
+    def test_ring_partition_power_rejects_active_build(self):
+        builder_path = self._make_object_ring()
+        before = RingBuilder.load(builder_path)
+        self._write_json('ring_builds/0001-build.json', {
+            'id': 'build-1',
+            'sequence': 1,
+            'state': 'queued',
+            'artifact_only': True,
+            'ring_id': 'object-0',
+        })
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/prepare/',
+            'POST', {})
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('active ring build build-1', body['error'])
+
+        after = RingBuilder.load(builder_path)
+        self.assertEqual(before.version, after.version)
+        self.assertIsNone(after.next_part_power)
+
+    def test_ring_partition_power_rejects_active_cluster_build(self):
+        self._make_object_ring()
+        self._write_json('ring_builds/0001-build.json', {
+            'id': 'build-1',
+            'sequence': 1,
+            'state': 'deferred',
+            'rings': None,
+        })
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/prepare/',
+            'POST', {})
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('active ring build build-1', body['error'])
+
+    def test_ring_partition_power_ignores_inactive_builds(self):
+        self._make_object_ring()
+        self._write_json('ring_builds/0001-build.json', {
+            'id': 'build-1',
+            'sequence': 1,
+            'state': 'completed',
+            'artifact_only': True,
+            'ring_id': 'object-0',
+        })
+        self._write_json('ring_builds/0002-build.json', {
+            'id': 'build-2',
+            'sequence': 2,
+            'state': 'queued',
+            'artifact_only': True,
+            'ring_id': 'object-1',
+        })
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/prepare/',
+            'POST', {})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('prepared',
+                         body['partition_power_increase_state'])
+
+    def test_ring_partition_power_recovery_allows_active_build(self):
+        builder_path = self._make_object_ring()
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/prepare/',
+            'POST', {})
+        self.assertEqual(200, resp.status_int)
+        self._write_json('ring_builds/0001-build.json', {
+            'id': 'build-1',
+            'sequence': 1,
+            'state': 'building',
+            'artifact_only': True,
+            'ring_id': 'object-0',
+        })
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/increase/',
+            'POST', {})
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('active ring build', body['error'])
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/cancel/',
+            'POST', {})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(
+            'cleanup_pending', body['partition_power_increase_state'])
+        cancelled = RingBuilder.load(builder_path)
+        self.assertEqual(4, cancelled.next_part_power)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/partition_power_increase/finish/',
+            'POST', {})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('idle', body['partition_power_increase_state'])
+        finished = RingBuilder.load(builder_path)
+        self.assertIsNone(finished.next_part_power)
 
     def test_ring_update_not_found(self):
         resp, body = self.json_request('/api/v1/rings/404/', 'PATCH', {

@@ -63,6 +63,8 @@ Ring JSON stores logical metadata only.
 Builder-owned settings and devices are read from and written to the Swift
 builder file.
 Mutating a ring or its devices does not rebalance or publish it.
+Partition power on an existing object builder changes only through the
+explicit lifecycle actions described below.
 
 ``GET /api/v1/rings/schema/``
 ------------------------------------
@@ -116,6 +118,9 @@ If builder validation or saving fails, the new JSON resource is removed.
 
 Returns logical metadata plus current builder-owned settings,
 ``builder_version``, ``device_count``, and ``devices_url``.
+Object-ring responses also report ``next_part_power``,
+``partition_power_increase_state``, and
+``allowed_partition_power_actions`` from the current builder.
 A missing builder is valid for metadata-only rings, so builder fields are
 omitted until a builder is created.
 
@@ -136,6 +141,61 @@ builder.
 
 Deletes the logical ring resource and returns ``204 No Content``.
 This operation does not delete, rebalance, or publish the builder file.
+
+Partition power increase
+========================
+
+``POST /api/v1/rings/<ring_id>/partition_power_increase/prepare/``
+------------------------------------------------------------------
+
+Prepares an object ring for a one-step partition power increase under the
+builder-file lock.
+The ring must have no active build job whose scope overlaps it.
+
+``POST /api/v1/rings/<ring_id>/partition_power_increase/increase/``
+-------------------------------------------------------------------
+
+Applies a prepared increase and moves the builder to
+``cleanup_pending``.
+The ring must have no active overlapping build job when this forward
+transition starts.
+
+``POST /api/v1/rings/<ring_id>/partition_power_increase/cancel/``
+-----------------------------------------------------------------
+
+Cancels a prepared increase and moves the builder to
+``cleanup_pending`` so object-server cleanup can finish.
+This recovery action remains available when an active build record exists.
+
+``POST /api/v1/rings/<ring_id>/partition_power_increase/finish/``
+-----------------------------------------------------------------
+
+Finishes an increase or cancellation after cleanup and clears
+``next_part_power``.
+This recovery action remains available when an active build record exists.
+
+Each successful action returns the hydrated ring resource with ``action`` and
+``requires_publish: true``.
+The lifecycle states are ``idle``, ``prepared``, ``cleanup_pending``, and
+``invalid``.
+The ``allowed_partition_power_actions`` field lists the valid next actions.
+These lifecycle fields are read-only and cannot be changed with ordinary ring
+POST, PUT, or PATCH requests.
+Invalid transitions return ``409 Conflict``.
+Non-object rings return ``400 Bad Request``.
+Active overlapping builds return ``409 Conflict`` for ``prepare`` and
+``increase``.
+
+.. warning::
+
+    These actions mutate the builder only.
+    They do not rebalance or publish a ``.ring.gz`` file, restart object
+    services, run ``swift-object-relinker``, wait for ring distribution, or
+    enforce the object-server ``reclaim_age`` window.
+    Follow :ref:`modify_part_power` on every object node before applying the
+    next lifecycle action.
+    Only the prepared state can be cancelled; a published increase cannot be
+    reverted.
 
 Device resources
 ================

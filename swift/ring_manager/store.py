@@ -20,7 +20,7 @@ import tempfile
 
 from urllib.parse import quote
 
-from swift.common.utils import fsync, fsync_dir, lock_path
+from swift.common.utils import config_true_value, fsync, fsync_dir, lock_path
 from swift.ring_manager.common import normal_timestamp_float
 
 
@@ -30,6 +30,9 @@ class RingNotFound(KeyError):
 
 class RingAlreadyExists(KeyError):
     pass
+
+
+TERMINAL_RING_BUILD_STATES = ('completed', 'failed', 'cancelled')
 
 
 class RingManagerStore(object):
@@ -327,6 +330,48 @@ class RingManagerStore(object):
         ring = self._load_dir_object('rings', ring_id, RingNotFound)
         self._delete_dir_object('rings', ring['id'], RingNotFound)
         return self._with_resource_uri(ring, 'rings')
+
+    def _ring_build_sort_key(self, build):
+        try:
+            return (0, int(build.get('sequence')))
+        except (TypeError, ValueError):
+            return (
+                1, str(build.get('created_at', '')),
+                str(build.get('id', '')))
+
+    def _ring_build_scope(self, build):
+        request = build.get('request') or {}
+        if config_true_value(str(build.get(
+                'artifact_only', request.get('artifact_only', 'false')))):
+            ring_id = build.get('ring_id', request.get('ring_id'))
+            if ring_id not in (None, ''):
+                return set([str(ring_id)])
+        rings = build.get('rings', request.get('rings'))
+        if rings is None:
+            return None
+        scope = set()
+        for ring in rings:
+            ring_id = ring.get('id', ring.get('ring_id')) \
+                if isinstance(ring, dict) else ring
+            if ring_id not in (None, ''):
+                scope.add(str(ring_id))
+        return scope or None
+
+    def _ring_build_scopes_overlap(self, first, second):
+        if first is None or second is None:
+            return True
+        return bool(first & second)
+
+    def active_ring_builds_for_ring(self, ring_id, timestamp=None):
+        ring_scope = set([str(ring_id)])
+        builds = self._list_dir_objects('ring_builds')
+        builds.sort(key=self._ring_build_sort_key)
+        return [
+            copy.deepcopy(build) for build in builds
+            if build.get('state') not in TERMINAL_RING_BUILD_STATES
+            and self._ring_build_scopes_overlap(
+                self._ring_build_scope(build), ring_scope)
+        ]
 
     def _timestamp_float(self, obj, keys=('created_at', 'updated_at')):
         for key in keys:

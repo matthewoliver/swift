@@ -20,7 +20,8 @@ from swift.common.swob import HTTPBadRequest, HTTPConflict, HTTPNoContent, \
     HTTPNotFound, HTTPNotImplemented
 from swift.common.utils import config_true_value
 from swift.ring_manager import http
-from swift.ring_manager.builder import RingBuilderManagerError
+from swift.ring_manager.builder import RingBuilderManagerConflict, \
+    RingBuilderManagerError
 from swift.ring_manager.routing import Route
 from swift.ring_manager.store import RingAlreadyExists, RingNotFound
 
@@ -54,9 +55,18 @@ RING_FIELDS = [
     'builder_files',
     'builder_path',
     'builder_version',
+    'next_part_power',
+    'partition_power_increase_state',
+    'allowed_partition_power_actions',
     'device_count',
     'devices_url',
 ]
+
+PARTITION_POWER_READONLY_FIELDS = set([
+    'next_part_power',
+    'partition_power_increase_state',
+    'allowed_partition_power_actions',
+])
 
 
 class RingController(object):
@@ -84,6 +94,10 @@ class RingController(object):
                   ('POST',), self.ring_devices_add),
             Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/devices/remove/?$',
                   ('POST',), self.ring_devices_remove),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/'
+                  r'partition_power_increase/'
+                  r'(?P<action>prepare|increase|cancel|finish)/?$',
+                  ('POST',), self.ring_partition_power_increase),
         ]
 
     def _json_response(self, req, data, status=200, headers=None):
@@ -205,6 +219,15 @@ class RingController(object):
             },
         })
 
+    def _check_partition_power_fields(self, metadata):
+        readonly = sorted(
+            key for key in metadata
+            if key in PARTITION_POWER_READONLY_FIELDS)
+        if readonly:
+            raise ValueError(
+                'Read-only ring fields may not be set: %s' %
+                ', '.join(readonly))
+
     def _remember_builder_metadata(self, ring_id, ring, builder_path,
                                    device_count):
         updates = self._builder_metadata_updates(
@@ -237,6 +260,9 @@ class RingController(object):
             'nullable': True,
             'readonly': name in ('id', 'resource_uri', 'ever_pushed',
                                  'last_rebalance_time', 'builder_version',
+                                 'next_part_power',
+                                 'partition_power_increase_state',
+                                 'allowed_partition_power_actions',
                                  'device_count', 'devices_url'),
             'type': 'string',
         }) for name in RING_FIELDS)
@@ -250,6 +276,7 @@ class RingController(object):
     def ring_list(self, req):
         if req.method == 'POST':
             payload = self._json_request_body(req)
+            self._check_partition_power_fields(payload)
             metadata, builder_updates = \
                 self._builder_manager.split_builder_fields(payload)
             try:
@@ -284,6 +311,7 @@ class RingController(object):
             return HTTPNoContent(request=req)
         if req.method in ('PUT', 'PATCH'):
             payload = self._json_request_body(req)
+            self._check_partition_power_fields(payload)
             metadata, builder_updates = \
                 self._builder_manager.split_builder_fields(payload)
             try:
@@ -379,3 +407,36 @@ class RingController(object):
             'devices': removed,
             'device_count': device_count,
         })
+
+    def _active_ring_build_conflict(self, ring_id):
+        active = self._store.active_ring_builds_for_ring(ring_id)
+        if active:
+            build = active[0]
+            return 'ring %s has active ring build %s in state %s' % (
+                ring_id, build.get('id'), build.get('state', 'unknown'))
+        return None
+
+    def ring_partition_power_increase(self, req, ring_id, action):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id)
+        if action in ('prepare', 'increase'):
+            conflict = self._active_ring_build_conflict(ring_id)
+            if conflict is not None:
+                return self._json_error(req, HTTPConflict, conflict)
+        try:
+            builder_path, _builder, device_count = \
+                self._builder_manager.change_partition_power_increase(
+                    ring, action)
+            self._remember_builder_metadata(
+                ring_id, ring, builder_path, device_count)
+        except RingBuilderManagerConflict as err:
+            return self._json_error(req, HTTPConflict, str(err))
+        except RingBuilderManagerError as err:
+            return self._json_error(req, HTTPBadRequest, str(err))
+        ring = self._store.get_ring(ring_id)
+        response = self._hydrate_builder_metadata(ring)
+        response.update({
+            'action': action,
+            'requires_publish': True,
+        })
+        return self._json_response(req, response)

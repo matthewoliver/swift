@@ -31,6 +31,10 @@ class RingBuilderManagerError(Exception):
     pass
 
 
+class RingBuilderManagerConflict(RingBuilderManagerError):
+    pass
+
+
 DEFAULT_MAX_EXPLICIT_DEVICE_ID = 1000000
 
 
@@ -308,6 +312,7 @@ class RingBuilderManager(object):
             builder_path, builder = self.load_builder(ring)
         except swift_exceptions.FileNotFoundError:
             return {}
+        part_power_info = self.partition_power_increase_info(ring, builder)
         info = {
             'part_power': builder.part_power,
             'num_replicas': builder.replicas,
@@ -316,11 +321,101 @@ class RingBuilderManager(object):
             'builder_version': builder.version,
             'device_count': self.active_device_count(builder),
         }
+        info.update(part_power_info)
         if ring.get('builder_files'):
             info['builder_files'] = ring['builder_files']
         elif not ring.get('builder_path'):
             info['builder_files'] = [builder_path]
         return info
+
+    def _ring_is_object(self, ring):
+        ring_type = ring.get('ring_type') or ring.get('type')
+        if ring_type == 'object':
+            return True
+        if ring_type in ('account', 'container'):
+            return False
+        if ring.get('storage_policy_index') not in (None, ''):
+            return True
+        ring_id = ring.get('id')
+        if ring_id is not None:
+            ring_id = str(ring_id)
+        if ring_id == 'object' or (
+                ring_id is not None and ring_id.startswith('object-')):
+            return True
+        return False
+
+    def _partition_power_increase_state(self, builder):
+        next_part_power = getattr(builder, 'next_part_power', None)
+        if next_part_power is None:
+            return 'idle'
+        if next_part_power == builder.part_power + 1:
+            return 'prepared'
+        if next_part_power == builder.part_power:
+            return 'cleanup_pending'
+        return 'invalid'
+
+    def _partition_power_allowed_actions(self, ring, builder):
+        if not self._ring_is_object(ring):
+            return []
+        state = self._partition_power_increase_state(builder)
+        if state == 'idle':
+            return ['prepare']
+        if state == 'prepared':
+            return ['increase', 'cancel']
+        if state == 'cleanup_pending':
+            return ['finish']
+        return []
+
+    def partition_power_increase_info(self, ring, builder):
+        return {
+            'next_part_power': getattr(builder, 'next_part_power', None),
+            'partition_power_increase_state':
+                self._partition_power_increase_state(builder),
+            'allowed_partition_power_actions':
+                self._partition_power_allowed_actions(ring, builder),
+        }
+
+    def change_partition_power_increase(self, ring, action):
+        return self._locked_builder_mutation(
+            ring, lambda: self._change_partition_power_increase_locked(
+                ring, action))
+
+    def _change_partition_power_increase_locked(self, ring, action):
+        actions = {
+            'prepare': 'prepare_increase_partition_power',
+            'increase': 'increase_partition_power',
+            'cancel': 'cancel_increase_partition_power',
+            'finish': 'finish_increase_partition_power',
+        }
+        if action not in actions:
+            raise RingBuilderManagerError(
+                'unknown partition power increase action %s' % action)
+        if not self._ring_is_object(ring):
+            raise RingBuilderManagerError(
+                'partition power increase is only supported for object rings')
+
+        try:
+            builder_path, builder = self.load_builder(ring)
+        except swift_exceptions.FileNotFoundError as err:
+            raise RingBuilderManagerError(
+                'ring %s builder could not be loaded: %s' %
+                (ring.get('id'), err))
+        state = self._partition_power_increase_state(builder)
+        allowed = self._partition_power_allowed_actions(ring, builder)
+        if action not in allowed:
+            raise RingBuilderManagerConflict(
+                'ring %s partition power increase cannot %s from state %s' %
+                (ring.get('id'), action, state))
+
+        changed = getattr(builder, actions[action])()
+        if not changed:
+            raise RingBuilderManagerConflict(
+                'ring %s partition power increase cannot %s from state %s' %
+                (ring.get('id'), action, state))
+        if action == 'increase':
+            builder._update_last_part_moves()
+        self.save_builder(builder, builder_path)
+        return builder_path, builder, self.active_device_count(builder)
 
     def apply_ring_settings(self, ring, builder):
         updates = dict((key, ring[key]) for key in self.BUILDER_FIELDS
