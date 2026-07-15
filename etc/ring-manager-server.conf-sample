@@ -26,6 +26,10 @@ use = egg:swift#ring_manager
 # set log_level = INFO
 # set log_address = /dev/log
 # set log_requests = true
+#
+# Directory for Swift-native ring-manager state. Each resource is stored in
+# its own JSON file and updates are written atomically and durably.
+# ring_manager_state_dir = /etc/swift/ring-manager-state
 
 [filter:healthcheck]
 use = egg:swift#healthcheck

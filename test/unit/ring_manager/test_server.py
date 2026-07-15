@@ -12,18 +12,30 @@
 # limitations under the License.
 
 import json
+import os
+import shutil
+import tempfile
 import unittest
+from unittest import mock
 
 from swift.common.swob import Request
 from swift.ring_manager import routing
+from swift.ring_manager.common import DEFAULT_RING_MANAGER_STATE_DIR
 from swift.ring_manager.server import app_factory, RingManagerApplication
+from swift.ring_manager.store import RingManagerStore
 from test.debug_logger import debug_logger
 
 
 class TestRingManagerApplication(unittest.TestCase):
     def setUp(self):
+        self.testdir = tempfile.mkdtemp()
+        self.state_dir = os.path.join(self.testdir, 'state')
         self.logger = debug_logger()
-        self.app = RingManagerApplication({}, logger=self.logger)
+        self.app = RingManagerApplication(
+            {'ring_manager_state_dir': self.state_dir}, logger=self.logger)
+
+    def tearDown(self):
+        shutil.rmtree(self.testdir)
 
     def get_json(self, path, method='GET', app=None):
         req = Request.blank(path, method=method)
@@ -35,7 +47,16 @@ class TestRingManagerApplication(unittest.TestCase):
         return resp, body
 
     def test_app_factory(self):
-        self.assertIsInstance(app_factory({}), RingManagerApplication)
+        app = app_factory({}, ring_manager_state_dir=self.state_dir)
+        self.assertIsInstance(app, RingManagerApplication)
+        self.assertEqual(self.state_dir, app.store.state_dir)
+
+    def test_app_factory_uses_sample_config_defaults(self):
+        app = app_factory({})
+        self.assertEqual(DEFAULT_RING_MANAGER_STATE_DIR, app.store.state_dir)
+
+    def test_controller_receives_store(self):
+        self.assertIs(self.app.store, self.app.ring_controller._store)
 
     def test_discovery_documents(self):
         resp, body = self.get_json('/')
@@ -103,6 +124,73 @@ class TestRingManagerApplication(unittest.TestCase):
             {'log_requests': 'false'}, logger=self.logger)
         self.get_json('/', app=app)
         self.assertEqual([], self.logger.get_lines_for_level('info'))
+
+
+class TestRingManagerStateDirApplication(unittest.TestCase):
+    def setUp(self):
+        self.testdir = tempfile.mkdtemp()
+        self.state_dir = os.path.join(self.testdir, 'state')
+        os.makedirs(self.state_dir)
+        self.store = RingManagerStore(self.state_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.testdir)
+
+    def test_store_uses_unique_temp_paths_for_same_state_file(self):
+        path = os.path.join(self.state_dir, 'index.json')
+        fd1, temp_path1 = self.store._temporary_state_file(path)
+        fd2, temp_path2 = self.store._temporary_state_file(path)
+        try:
+            self.assertNotEqual(temp_path1, temp_path2)
+            self.assertEqual(self.state_dir, os.path.dirname(temp_path1))
+            self.assertTrue(os.path.basename(temp_path1).startswith(
+                '.index.json.'))
+        finally:
+            os.close(fd1)
+            os.close(fd2)
+            os.unlink(temp_path1)
+            os.unlink(temp_path2)
+
+    def test_store_write_failure_preserves_existing_json(self):
+        index_path = os.path.join(self.state_dir, 'index.json')
+        self.store._write_json_file(index_path, {'value': 'before'})
+
+        with mock.patch(
+                'swift.ring_manager.store.fsync',
+                side_effect=OSError('fsync failed')):
+            self.assertRaises(
+                OSError, self.store._write_json_file,
+                index_path, {'value': 'after'})
+
+        with open(index_path) as fp:
+            self.assertEqual({'value': 'before'}, json.load(fp))
+        self.assertEqual([], [
+            name for name in os.listdir(self.state_dir)
+            if name.startswith('.index.json.') and name.endswith('.tmp')])
+
+    def test_store_write_fsyncs_file_and_parent_directory(self):
+        path = os.path.join(self.state_dir, 'rings', 'durable.json')
+        os.makedirs(os.path.dirname(path))
+        with mock.patch('swift.ring_manager.store.fsync') as mock_fsync, \
+                mock.patch('swift.ring_manager.store.fsync_dir') as mock_dir:
+            self.store._write_json_file(path, {'id': 'durable'})
+
+        self.assertEqual(1, mock_fsync.call_count)
+        mock_dir.assert_called_once_with(os.path.dirname(path))
+
+    def test_store_write_fsyncs_created_directory_parents(self):
+        releases_dir = os.path.join(self.state_dir, 'releases')
+        os.makedirs(releases_dir)
+        path = os.path.join(releases_dir, 'release-2', 'manifest.json')
+        target_dir = os.path.dirname(path)
+        with mock.patch('swift.ring_manager.store.fsync'), \
+                mock.patch('swift.ring_manager.store.fsync_dir') as mock_dir:
+            self.store._write_json_file(path, {'version': 'release-2'})
+
+        self.assertEqual([
+            releases_dir,
+            target_dir,
+        ], [call[0][0] for call in mock_dir.call_args_list])
 
 
 if __name__ == '__main__':

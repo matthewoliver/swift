@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import sys
-import time
 
 from swift import __version__ as swift_version
 from swift.common.concurrency import Timeout
@@ -23,8 +22,11 @@ from swift.common.swob import HTTPBadRequest, HTTPException, \
 from swift.common.utils import config_true_value, get_log_line, get_logger, \
     LOG_LINE_DEFAULT_FORMAT, parse_options
 from swift.common.wsgi import run_wsgi
+from swift.ring_manager.common import DEFAULT_RING_MANAGER_STATE_DIR, \
+    NormalTimestamp
 from swift.ring_manager.controllers import ring as ring_controller
 from swift.ring_manager import http, routing
+from swift.ring_manager.store import RingManagerStore
 
 
 RING_MANAGER_API_VERSION = 'v1'
@@ -36,7 +38,7 @@ class RingManagerApplication(object):
 
     server_type = 'ring-manager-server'
 
-    def __init__(self, conf, logger=None, controller=None):
+    def __init__(self, conf, logger=None, store=None, controller=None):
         if conf is None:
             conf = {}
         self.conf = conf
@@ -48,7 +50,11 @@ class RingManagerApplication(object):
         self.log_format = conf.get('log_format', LOG_LINE_DEFAULT_FORMAT)
         self.anonymization_method = conf.get('log_anonymization_method', 'md5')
         self.anonymization_salt = conf.get('log_anonymization_salt', '')
-        self.ring_controller = controller or ring_controller.RingController()
+        state_dir = conf.get(
+            'ring_manager_state_dir', DEFAULT_RING_MANAGER_STATE_DIR)
+        self.store = store or RingManagerStore(state_dir=state_dir)
+        self.ring_controller = controller or ring_controller.RingController(
+            store=self.store)
         self.routes = self._make_routes()
 
     def _make_routes(self):
@@ -101,7 +107,7 @@ class RingManagerApplication(object):
         self.logger.info(log_msg)
 
     def __call__(self, env, start_response):
-        start_time = time.time()
+        start_time = float(NormalTimestamp.now())
         req = Request(env)
         self.logger.txn_id = req.headers.get('x-trans-id', None)
         try:
@@ -116,7 +122,7 @@ class RingManagerApplication(object):
                 {'method': req.method, 'path': req.path})
             res = http.json_error(
                 req, HTTPInternalServerError, 'Internal server error')
-        trans_time = time.time() - start_time
+        trans_time = float(NormalTimestamp.now()) - start_time
         self.logger.timing_since('%s.timing' % req.method.lower(), start_time)
         self._log_request(req, res, trans_time)
         return res(env, start_response)

@@ -16,5 +16,8 @@
 class RingController(object):
     """Own ring-specific routes and their orchestration."""
 
+    def __init__(self, store):
+        self._store = store
+
     def routes(self):
         return []
