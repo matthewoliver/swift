@@ -35,6 +35,7 @@ from swift.ring_manager.store import RingManagerStore
 RING_MANAGER_API_VERSION = 'v1'
 RING_MANAGER_API_PREFIX = '/api/%s' % RING_MANAGER_API_VERSION
 DEFAULT_MAX_JSON_REQUEST_BODY_SIZE = 1024 * 1024
+DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS = 1000
 
 
 class RingManagerApplication(object):
@@ -67,13 +68,19 @@ class RingManagerApplication(object):
         self.max_json_request_body_size = config_positive_int_value(conf.get(
             'max_json_request_body_size',
             DEFAULT_MAX_JSON_REQUEST_BODY_SIZE))
+        self.max_partitions_at_risk_selectors = config_positive_int_value(
+            conf.get('max_partitions_at_risk_selectors',
+                     DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS))
         self.builder_manager = builder_manager or RingBuilderManager(
             self.ring_builder_dir,
             max_explicit_device_id=self.max_explicit_device_id,
             builder_lock_timeout=self.builder_lock_timeout)
         self.ring_controller = controller or ring_controller.RingController(
             store=self.store, builder_manager=self.builder_manager,
-            max_json_request_body_size=self.max_json_request_body_size)
+            ring_builder_dir=self.ring_builder_dir,
+            max_json_request_body_size=self.max_json_request_body_size,
+            max_partitions_at_risk_selectors=(
+                self.max_partitions_at_risk_selectors))
         self.routes = self._make_routes()
 
     def _make_routes(self):

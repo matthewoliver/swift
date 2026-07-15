@@ -43,8 +43,12 @@ use = egg:swift#ring_manager
 # builder-setting updates.
 # builder_lock_timeout = 600
 #
-# Maximum JSON request body size for ring mutations.
+# Maximum JSON request body size for ring-manager API requests.
 # max_json_request_body_size = 1048576
+#
+# Maximum number of node IP, replication IP, and device ID selectors accepted
+# by one partitions_at_risk request before builder analysis starts.
+# max_partitions_at_risk_selectors = 1000
 
 [filter:ring-manager-auth]
 use = egg:swift#ring_manager_auth

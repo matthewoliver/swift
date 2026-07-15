@@ -54,7 +54,16 @@ class RingManagerAuthMiddleware(object):
             req, self.read_key,
             ('x-ring-manager-read-key', 'x-auth-token'))
 
+    def _is_read_only_post(self, req):
+        if req.method != 'POST':
+            return False
+        parts = req.path.rstrip('/').strip('/').split('/')
+        return (len(parts) == 5 and parts[:3] == ['api', 'v1', 'rings'] and
+                parts[4] == 'partitions_at_risk')
+
     def _requires_admin(self, req):
+        if self._is_read_only_post(req):
+            return False
         if req.method not in READ_METHODS:
             return True
         path = req.path.rstrip('/')

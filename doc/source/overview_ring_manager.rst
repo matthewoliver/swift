@@ -142,6 +142,14 @@ Invalid multi-device requests leave the existing builder unchanged.
 Builder saves use a unique temporary file, fsync the file, atomically rename
 it, preserve an existing file mode, and fsync the parent directory.
 
+Read-only analysis endpoints expose assigned parts, rebalance readiness,
+dispersion, and partition risk directly from current builder files.
+The bulk partition-risk endpoint accepts node, replication, and device
+selectors through GET query strings or a bounded POST body.
+Selector limits are checked before builders are loaded, detailed partition
+lists are opt-in, and multiple builders keep separate device namespaces.
+The analysis does not mutate, rebalance, or publish a builder.
+
 Operations
 ==========
 

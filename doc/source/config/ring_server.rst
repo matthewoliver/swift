@@ -65,8 +65,15 @@ Server options
     The default is ``600``.
 
 ``max_json_request_body_size``
-    Maximum JSON request size in bytes for ring mutations.
+    Maximum JSON request size in bytes for ring-manager API requests.
     The default is ``1048576``.
+
+``max_partitions_at_risk_selectors``
+    Maximum combined number of node IP, replication IP, and device ID
+    selectors accepted by one ``partitions_at_risk`` request.
+    The default is ``1000``.
+    The request is rejected before a builder is loaded when this limit is
+    exceeded.
 
 Authentication options
 ======================

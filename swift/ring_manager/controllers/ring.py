@@ -20,6 +20,8 @@ from swift.common.swob import HTTPBadRequest, HTTPConflict, HTTPNoContent, \
     HTTPNotFound, HTTPNotImplemented
 from swift.common.utils import config_true_value
 from swift.ring_manager import http
+from swift.ring_manager.analysis import RingBuilderAnalysisError, \
+    RingBuilderAnalyzer, get_query_list
 from swift.ring_manager.builder import RingBuilderManagerConflict, \
     RingBuilderManagerError
 from swift.ring_manager.routing import Route
@@ -72,10 +74,15 @@ PARTITION_POWER_READONLY_FIELDS = set([
 class RingController(object):
     """Own ring-specific routes and their orchestration."""
 
-    def __init__(self, store, builder_manager, max_json_request_body_size):
+    def __init__(self, store, builder_manager, ring_builder_dir,
+                 max_json_request_body_size,
+                 max_partitions_at_risk_selectors):
         self._store = store
         self._builder_manager = builder_manager
+        self._ring_builder_dir = ring_builder_dir
         self._max_json_request_body_size = max_json_request_body_size
+        self._max_partitions_at_risk_selectors = \
+            max_partitions_at_risk_selectors
 
     def routes(self):
         return [
@@ -98,6 +105,20 @@ class RingController(object):
                   r'partition_power_increase/'
                   r'(?P<action>prepare|increase|cancel|finish)/?$',
                   ('POST',), self.ring_partition_power_increase),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/parts/?$',
+                  ('GET',), self.ring_parts),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/rebalance/?$',
+                  ('GET',), self.ring_rebalance),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/dispersion/?$',
+                  ('GET',), self.ring_dispersion),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/at_risk/?$',
+                  ('GET',), self.ring_at_risk),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/count_parts/?$',
+                  ('GET',), self.ring_count_parts),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/'
+                  r'partitions_at_risk/?$',
+                  ('GET', 'POST'), self.ring_partitions_at_risk,
+                  read_only_methods=('GET', 'HEAD', 'POST')),
         ]
 
     def _json_response(self, req, data, status=200, headers=None):
@@ -113,6 +134,65 @@ class RingController(object):
 
     def _collection_response(self, req, objects):
         return http.collection_response(req, objects)
+
+    def _payload_values(self, payload, *names):
+        values = []
+        for name in names:
+            if name not in payload:
+                continue
+            value = payload.get(name)
+            if value in (None, ''):
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    if item in (None, ''):
+                        continue
+                    if isinstance(item, (dict, list)):
+                        raise ValueError(
+                            '%s entries must be scalar values' % name)
+                    values.append(item)
+            elif isinstance(value, dict):
+                raise ValueError(
+                    '%s must be a scalar value or list' % name)
+            else:
+                values.append(value)
+        return values
+
+    def _payload_string_values(self, payload, *names):
+        values = []
+        for value in self._payload_values(payload, *names):
+            if not isinstance(value, str):
+                raise ValueError(
+                    '%s entries must be strings' % (names[0],))
+            values.append(value)
+        return values
+
+    def _check_partitions_at_risk_selector_count(
+            self, node_ips, replication_ips, device_ids):
+        selector_count = (
+            len(node_ips) + len(replication_ips) + len(device_ids))
+        if selector_count > self._max_partitions_at_risk_selectors:
+            raise ValueError(
+                'partitions_at_risk accepts at most %d down selectors; '
+                'got %d' % (
+                    self._max_partitions_at_risk_selectors, selector_count))
+
+    def _request_bool_value(self, value, name):
+        if value in (None, ''):
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            if value in (0, 1):
+                return bool(value)
+            raise ValueError('%s must be a boolean value' % name)
+        if isinstance(value, str):
+            lowered = value.lower()
+            if lowered in ('true', '1', 'yes', 'on', 't', 'y'):
+                return True
+            if lowered in ('false', '0', 'no', 'off', 'f', 'n'):
+                return False
+        raise ValueError('%s must be a boolean value' % name)
 
     def _devices_from_request_body(self, payload):
         devices = []
@@ -245,6 +325,26 @@ class RingController(object):
         hydrated = copy.deepcopy(ring)
         hydrated.update(self._builder_manager.builder_info(hydrated))
         return hydrated
+
+    def _analyzer(self, ring):
+        return RingBuilderAnalyzer(ring, self._ring_builder_dir)
+
+    def _non_negative_int_value(self, value, name):
+        if isinstance(value, bool):
+            raise ValueError('%s must be a non-negative integer' % name)
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = int(value)
+            except ValueError:
+                raise ValueError(
+                    '%s must be a non-negative integer' % name)
+        else:
+            raise ValueError('%s must be a non-negative integer' % name)
+        if parsed < 0:
+            raise ValueError('%s must be a non-negative integer' % name)
+        return parsed
 
     def _apply_builder_settings(self, ring, builder_updates):
         builder_path, _builder, device_count = \
@@ -440,3 +540,93 @@ class RingController(object):
             'requires_publish': True,
         })
         return self._json_response(req, response)
+
+    def ring_parts(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id, hydrate_builder=True)
+        return self._json_response(req, self._analyzer(ring).parts())
+
+    def ring_rebalance(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id, hydrate_builder=True)
+        return self._json_response(
+            req, self._analyzer(ring).rebalance_status())
+
+    def ring_dispersion(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id, hydrate_builder=True)
+        return self._json_response(
+            req, self._analyzer(ring).dispersion(
+                req.params.get('level', 'zone')))
+
+    def ring_at_risk(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id, hydrate_builder=True)
+        return self._json_response(req, self._analyzer(ring).at_risk())
+
+    def ring_count_parts(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id, hydrate_builder=True)
+        risk_count = req.params.get('risk_count')
+        if risk_count is not None:
+            risk_count = int(risk_count)
+        return self._json_response(
+            req, self._analyzer(ring).count_parts(
+                get_query_list(req, 'replication_ip'), risk_count))
+
+    def ring_partitions_at_risk(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id)
+        payload = {}
+        try:
+            if req.method == 'POST':
+                payload = self._json_request_body(req)
+            risk_count_value = payload.get(
+                'risk_count', req.params.get('risk_count'))
+            if risk_count_value in (None, ''):
+                risk_count = None
+            else:
+                risk_count = self._non_negative_int_value(
+                    risk_count_value, 'risk_count')
+            device_ids = [
+                self._non_negative_int_value(value, 'device_id')
+                for value in get_query_list(req, 'device_id')]
+            device_ids.extend([
+                self._non_negative_int_value(value, 'device_id')
+                for value in self._payload_values(
+                    payload, 'device_id', 'device_ids')])
+            node_ips = [
+                value for value in
+                get_query_list(req, 'node_ip') + get_query_list(req, 'ip')
+                if value]
+            node_ips.extend(self._payload_string_values(
+                payload, 'node_ip', 'node_ips', 'ip', 'ips'))
+            replication_ips = [
+                value for value in get_query_list(req, 'replication_ip')
+                if value]
+            replication_ips.extend(self._payload_string_values(
+                payload, 'replication_ip', 'replication_ips'))
+            self._check_partitions_at_risk_selector_count(
+                node_ips, replication_ips, device_ids)
+        except ValueError as err:
+            return self._json_error(req, HTTPBadRequest, str(err))
+        if not any((node_ips, replication_ips, device_ids)):
+            return self._json_error(
+                req, HTTPBadRequest,
+                'partitions_at_risk requires at least one down selector')
+        try:
+            include_partitions = self._request_bool_value(
+                payload.get('details', req.params.get('details', 'false')),
+                'details')
+        except ValueError as err:
+            return self._json_error(req, HTTPBadRequest, str(err))
+        try:
+            analysis = self._analyzer(ring).partitions_at_risk(
+                node_ips=node_ips,
+                replication_ips=replication_ips,
+                device_ids=device_ids,
+                risk_count=risk_count,
+                include_partitions=include_partitions)
+        except RingBuilderAnalysisError as err:
+            return self._json_error(req, HTTPConflict, str(err))
+        return self._json_response(req, analysis)

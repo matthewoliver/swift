@@ -28,7 +28,8 @@ Ordinary GET and HEAD requests may instead use::
 
     X-Ring-Manager-Read-Key: <key>
 
-Requests other than GET and HEAD require the administrator key.
+Requests other than GET and HEAD require the administrator key, except for
+the read-only ``POST .../partitions_at_risk/`` bulk analysis request.
 GET and HEAD paths ending in ``/builder`` or ``/builder/file`` also require
 the administrator key.
 OPTIONS and ``/healthcheck`` do not require a key.
@@ -196,6 +197,79 @@ Active overlapping builds return ``409 Conflict`` for ``prepare`` and
     next lifecycle action.
     Only the prepared state can be cancelled; a published increase cannot be
     reverted.
+
+Read-only ring analysis
+=======================
+
+The analysis resources load Swift builders without saving, rebalancing, or
+publishing them.
+
+``GET /api/v1/rings/<ring_id>/parts/``
+----------------------------------------------
+
+Returns the total assigned replica parts and a count grouped by device name.
+
+``GET /api/v1/rings/<ring_id>/rebalance/``
+--------------------------------------------------
+
+Returns balance, dispersion, whether rebalance is requested by metadata, and
+the elapsed and minimum remaining rebalance times.
+This is a status calculation and does not run a rebalance.
+
+``GET /api/v1/rings/<ring_id>/dispersion/``
+---------------------------------------------------
+
+Returns the builder dispersion graph grouped at ``region``, ``zone``, ``ip``,
+or ``device`` level.
+The ``level`` query parameter defaults to ``zone``.
+
+``GET /api/v1/rings/<ring_id>/at_risk/``
+-----------------------------------------------
+
+Returns per-replication-IP totals for assigned, dispersed, and at-risk parts.
+
+``GET /api/v1/rings/<ring_id>/count_parts/``
+--------------------------------------------------
+
+Counts partitions with at least ``risk_count`` replicas on the selected
+``replication_ip`` values.
+Repeat the query parameter or supply a comma-separated value.
+The effective risk count is at least two.
+Unplaced and removed device assignments are ignored.
+
+``GET or POST /api/v1/rings/<ring_id>/partitions_at_risk/``
+-----------------------------------------------------------------
+
+Analyses the impact of taking selected nodes or devices down.
+GET accepts repeated or comma-separated ``node_ip``, ``ip``,
+``replication_ip``, and ``device_id`` query parameters.
+POST accepts the scalar or plural forms in a JSON object, for example::
+
+    {
+      "node_ips": ["10.0.0.10", "10.0.0.11"],
+      "replication_ips": ["10.1.0.10"],
+      "device_ids": [70000],
+      "risk_count": 2,
+      "details": true
+    }
+
+At least one down selector is required.
+``risk_count`` must be a non-negative integer and is normalised to at least
+two.
+``details`` defaults to false; when true, each builder summary includes the
+partition numbers grouped by down-replica count.
+The response identifies matched devices by builder so account and container
+builders cannot collide on device ID.
+It also reports affected partitions, partitions meeting the risk threshold,
+and the maximum replicas lost from one partition.
+
+``max_partitions_at_risk_selectors`` limits the combined selector count before
+any builder is loaded.
+``max_json_request_body_size`` bounds POST bodies before JSON decoding.
+A missing required builder returns ``409 Conflict`` and names only the missing
+builder file, not its local directory.
+Invalid selectors or request values return ``400 Bad Request``.
+The POST form is read-only and may use the read key.
 
 Device resources
 ================

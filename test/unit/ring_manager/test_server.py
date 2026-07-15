@@ -23,8 +23,9 @@ from swift.common.swob import Request, Response
 from swift.ring_manager import routing
 from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
-    DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR
-from swift.ring_manager.server import app_factory, RingManagerApplication
+    DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, NormalTimestamp
+from swift.ring_manager.server import app_factory, \
+    DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS, RingManagerApplication
 from swift.ring_manager.middleware.auth import RingManagerAuthMiddleware
 from swift.ring_manager.store import RingManagerStore, RingNotFound
 from test.debug_logger import debug_logger
@@ -36,6 +37,8 @@ class TestRingManagerApplication(unittest.TestCase):
         self.state_dir = os.path.join(self.testdir, 'state')
         self.builder_path = os.path.join(self.testdir, 'object.builder')
         self._make_builder(self.builder_path)
+        self.last_rebalance_time = NormalTimestamp(
+            float(NormalTimestamp.now()) - 1800).internal
         self._write_json('rings/1.json', {
             'id': 1,
             'name': 'Account & Container',
@@ -44,6 +47,7 @@ class TestRingManagerApplication(unittest.TestCase):
             'storage_policy_index': None,
             'policy_type': 'replication',
             'ever_pushed': True,
+            'last_rebalance_time': self.last_rebalance_time,
             'builder_files': [self.builder_path],
         })
         self._write_json('rings/2.json', {
@@ -76,6 +80,37 @@ class TestRingManagerApplication(unittest.TestCase):
             })
         builder.rebalance(seed=1)
         builder.save(path)
+
+    def _make_large_device_id_builder(self, path, device_id=70000):
+        builder = RingBuilder(4, 3, 1)
+        for index, dev_id in enumerate((device_id, 1, 2)):
+            builder.add_dev({
+                'id': dev_id,
+                'region': 1,
+                'zone': index,
+                'ip': '10.0.70.%d' % index,
+                'port': 6000,
+                'device': 'sd%d' % index,
+                'replication_ip': '10.0.70.%d' % index,
+                'replication_port': 6003,
+                'weight': 100,
+            })
+        builder.rebalance(seed=1)
+        builder.save(path)
+
+    def _make_count_parts_edge_ring(self, ring_id, mutate_builder):
+        builder_path = os.path.join(self.testdir, '%s.builder' % ring_id)
+        self._make_builder(builder_path)
+        builder = RingBuilder.load(builder_path)
+        mutate_builder(builder)
+        builder.save(builder_path)
+        self._write_json('rings/%s.json' % ring_id, {
+            'id': ring_id,
+            'name': 'Count Parts Edge %s' % ring_id,
+            'storage_policy_index': 0,
+            'policy_type': 'replication',
+            'builder_files': [builder_path],
+        })
 
     def _make_object_ring(self, ring_id='object-0'):
         builder_path = os.path.join(self.testdir, '%s.builder' % ring_id)
@@ -140,6 +175,8 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(DEFAULT_RING_BUILDER_DIR, app.ring_builder_dir)
         self.assertEqual(DEFAULT_MAX_EXPLICIT_DEVICE_ID,
                          app.max_explicit_device_id)
+        self.assertEqual(DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS,
+                         app.max_partitions_at_risk_selectors)
         self.assertEqual(DEFAULT_BUILDER_LOCK_TIMEOUT,
                          app.builder_lock_timeout)
 
@@ -190,10 +227,28 @@ class TestRingManagerApplication(unittest.TestCase):
              'partition_power_increase/'
              '(?P<action>prepare|increase|cancel|finish)/?$',
              ('POST',), 'ring_partition_power_increase'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/parts/?$',
+             ('GET',), 'ring_parts'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/rebalance/?$',
+             ('GET',), 'ring_rebalance'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/dispersion/?$',
+             ('GET',), 'ring_dispersion'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/at_risk/?$',
+             ('GET',), 'ring_at_risk'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/count_parts/?$',
+             ('GET',), 'ring_count_parts'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/partitions_at_risk/?$',
+             ('GET', 'POST'), 'ring_partitions_at_risk'),
         ], [
             (route.regex.pattern, route.methods, route.handler.__name__)
             for route in self.app.routes
         ])
+
+    def test_partitions_at_risk_post_is_read_only(self):
+        route = next(
+            route for route in self.app.routes
+            if route.handler.__name__ == 'ring_partitions_at_risk')
+        self.assertEqual(('GET', 'HEAD', 'POST'), route.read_only_methods)
 
     def test_method_negotiation(self):
         resp, body = self.get_json('/', method='OPTIONS')
@@ -1183,6 +1238,351 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(before_devices, [
             dev['device'] for dev in after.devs if dev is not None])
 
+    def test_ring_parts(self):
+        resp, body = self.get_json('/api/v1/rings/1/parts/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(48, body['total_parts'])
+        self.assertEqual({'sd0': 16, 'sd1': 16, 'sd2': 16}, body['parts'])
+
+    def test_ring_parts_checks_ring(self):
+        resp, body = self.get_json('/api/v1/rings/404/parts/')
+        self.assertEqual(404, resp.status_int)
+        self.assertIsNone(body)
+
+    def test_ring_rebalance(self):
+        resp, body = self.get_json('/api/v1/rings/1/rebalance/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(0, body['dispersion'])
+        self.assertEqual(True, body['requires_rebalance'])
+        self.assertGreaterEqual(body['time_since_last_rebalance'], 1800)
+        self.assertGreater(body['minimum_time_until_rebalance'], 0)
+        self.assertLessEqual(body['minimum_time_until_rebalance'], 1800)
+
+    def test_ring_dispersion(self):
+        resp, body = self.get_json('/api/v1/rings/1/dispersion/?level=zone')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('zone', body['level'])
+        self.assertEqual(3, len(body['dispersion']))
+        for record in body['dispersion']:
+            self.assertEqual(1, record['region'])
+            self.assertEqual(1, record['max_replicas'])
+            self.assertEqual(16, sum(record['num_of_parts'][1:]))
+
+    def test_ring_dispersion_defaults_invalid_level_to_zone(self):
+        resp, body = self.get_json('/api/v1/rings/1/dispersion/?level=bogus')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('bogus', body['level'])
+        self.assertEqual(3, len(body['dispersion']))
+        for record in body['dispersion']:
+            self.assertIn('zone', record)
+
+    def test_ring_at_risk(self):
+        resp, body = self.get_json('/api/v1/rings/1/at_risk/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual({
+            '10.0.0.0': 16,
+            '10.0.0.1': 16,
+            '10.0.0.2': 16,
+        }, body['total'])
+        self.assertEqual(body['total'], body['dispersed'])
+        self.assertEqual({
+            '10.0.0.0': 0,
+            '10.0.0.1': 0,
+            '10.0.0.2': 0,
+        }, body['at_risk'])
+
+    def test_ring_count_parts(self):
+        resp, body = self.get_json(
+            '/api/v1/rings/1/count_parts/?replication_ip=10.0.0.0&'
+            'replication_ip=10.0.0.1')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(2, body['risk_count'])
+        self.assertEqual(list(range(16)), body['count_parts']['2'])
+
+    def test_ring_count_parts_normalizes_risk_count(self):
+        resp, body = self.get_json(
+            '/api/v1/rings/1/count_parts/?replication_ip=10.0.0.0&'
+            'risk_count=1')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(2, body['risk_count'])
+        self.assertEqual({}, body['count_parts'])
+
+    def test_ring_count_parts_skips_unplaced_assignments(self):
+        def set_none_dev_id(builder):
+            builder._replica2part2dev[0][0] = builder.none_dev_id
+
+        def set_out_of_range_dev_id(builder):
+            builder._replica2part2dev[0][0] = len(builder.devs)
+
+        def set_removed_dev_id(builder):
+            builder.devs[2] = None
+            builder._replica2part2dev[0][0] = 2
+
+        cases = (
+            ('none-dev-id', set_none_dev_id),
+            ('out-of-range-dev-id', set_out_of_range_dev_id),
+            ('removed-dev-id', set_removed_dev_id),
+        )
+        query = ('replication_ip=10.0.0.0&replication_ip=10.0.0.1&'
+                 'replication_ip=10.0.0.2&risk_count=3')
+        for ring_id, mutate_builder in cases:
+            with self.subTest(ring_id=ring_id):
+                self._make_count_parts_edge_ring(ring_id, mutate_builder)
+                resp, body = self.get_json(
+                    '/api/v1/rings/%s/count_parts/?%s' % (ring_id, query))
+                self.assertEqual(200, resp.status_int)
+                self.assertEqual(3, body['risk_count'])
+                self.assertIn('count_parts', body)
+
+    def test_ring_partitions_at_risk_by_node_ip(self):
+        resp, body = self.get_json(
+            '/api/v1/rings/1/partitions_at_risk/?'
+            'node_ip=10.0.0.0&node_ip=10.0.0.1&details=true')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(2, body['risk_count'])
+        self.assertEqual(['10.0.0.0', '10.0.0.1'],
+                         body['selectors']['node_ips'])
+        self.assertEqual(2, body['summary']['matched_devices'])
+        self.assertEqual(16, body['summary']['affected_partitions'])
+        self.assertEqual(16, body['summary']['at_risk_partitions'])
+        self.assertEqual(2, body['summary']['max_down_replicas'])
+        self.assertNotIn('partitions_by_down_replica_count', body)
+        self.assertEqual(1, len(body['builder_summaries']))
+        self.assertEqual('object.builder',
+                         body['builder_summaries'][0]['builder'])
+        self.assertEqual(list(range(16)),
+                         body['builder_summaries'][0]
+                         ['partitions_by_down_replica_count']['2'])
+
+    def test_ring_partitions_at_risk_post_body(self):
+        resp, body = self.json_request(
+            '/api/v1/rings/1/partitions_at_risk/', 'POST', {
+                'node_ips': ['10.0.0.0', '10.0.0.1'],
+                'device_ids': [],
+                'risk_count': 2,
+                'details': True,
+            })
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(['10.0.0.0', '10.0.0.1'],
+                         body['selectors']['node_ips'])
+        self.assertEqual(2, body['risk_count'])
+        self.assertEqual(2, body['summary']['matched_devices'])
+        self.assertEqual(16, body['summary']['at_risk_partitions'])
+        self.assertEqual(list(range(16)),
+                         body['builder_summaries'][0]
+                         ['partitions_by_down_replica_count']['2'])
+
+    def test_ring_partitions_at_risk_rejects_oversize_body(self):
+        app = RingManagerApplication(
+            {
+                'ring_manager_state_dir': self.state_dir,
+                'ring_artifact_dir': self.testdir,
+                'max_json_request_body_size': '24',
+            },
+            logger=debug_logger())
+        resp, body = self.json_request(
+            '/api/v1/rings/1/partitions_at_risk/', 'POST', {
+                'node_ips': ['10.0.0.0'],
+                'padding': 'x' * 64,
+            }, app=app)
+        self.assertEqual(413, resp.status_int)
+        self.assertEqual(
+            'Request body must be no larger than 24 bytes', body['error'])
+
+    def test_ring_partitions_at_risk_rejects_streamed_oversize_body(self):
+        app = RingManagerApplication(
+            {
+                'ring_manager_state_dir': self.state_dir,
+                'ring_artifact_dir': self.testdir,
+                'max_json_request_body_size': '24',
+            },
+            logger=debug_logger())
+        req = Request.blank(
+            '/api/v1/rings/1/partitions_at_risk/', method='POST',
+            body=json.dumps({
+                'node_ips': ['10.0.0.0'],
+                'padding': 'x' * 64,
+            }).encode('ascii'),
+            headers={'Content-Type': 'application/json'})
+        req.environ.pop('CONTENT_LENGTH', None)
+        resp = req.get_response(app)
+        body = json.loads(resp.body.decode('ascii'))
+        self.assertEqual(413, resp.status_int)
+        self.assertEqual(
+            'Request body must be no larger than 24 bytes', body['error'])
+
+    def test_ring_partitions_at_risk_by_ip_alias_and_device_id(self):
+        resp, body = self.get_json(
+            '/api/v1/rings/1/partitions_at_risk/?ip=10.0.0.0&'
+            'device_id=1&details=false')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(['10.0.0.0'], body['selectors']['node_ips'])
+        self.assertEqual([1], body['selectors']['device_ids'])
+        self.assertEqual(2, body['summary']['matched_devices'])
+        self.assertEqual(16, body['summary']['affected_partitions'])
+        self.assertEqual(16, body['summary']['at_risk_partitions'])
+        self.assertNotIn('partitions_by_down_replica_count', body)
+        self.assertNotIn('partitions_by_down_replica_count',
+                         body['builder_summaries'][0])
+
+    def test_ring_partitions_at_risk_no_matching_devices(self):
+        resp, body = self.get_json(
+            '/api/v1/rings/1/partitions_at_risk/?node_ip=10.9.9.9')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(0, body['summary']['matched_devices'])
+        self.assertEqual(0, body['summary']['affected_partitions'])
+        self.assertEqual(0, body['summary']['at_risk_partitions'])
+        self.assertNotIn('partitions_by_down_replica_count', body)
+        self.assertEqual(0, body['builder_summaries'][0]['matched_devices'])
+
+    def test_ring_partitions_at_risk_rejects_invalid_device_id(self):
+        resp, body = self.get_json(
+            '/api/v1/rings/1/partitions_at_risk/?device_id=nope')
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('device_id must be a non-negative integer',
+                      body['error'])
+
+    def test_ring_partitions_at_risk_rejects_no_selectors(self):
+        resp, body = self.get_json(
+            '/api/v1/rings/1/partitions_at_risk/')
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('requires at least one down selector', body['error'])
+
+    def test_ring_partitions_at_risk_rejects_blank_selectors(self):
+        resp, body = self.get_json(
+            '/api/v1/rings/1/partitions_at_risk/?node_ip=&'
+            'replication_ip=')
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('requires at least one down selector', body['error'])
+
+    def test_ring_partitions_at_risk_rejects_too_many_selectors(self):
+        missing_builder = os.path.join(self.testdir, 'missing.builder')
+        self._write_json('rings/selector-limit.json', {
+            'id': 'selector-limit',
+            'name': 'Selector Limit',
+            'storage_policy_index': 0,
+            'policy_type': 'replication',
+            'num_replicas': 3,
+            'builder_files': [missing_builder],
+        })
+        app = RingManagerApplication(
+            {
+                'ring_manager_state_dir': self.state_dir,
+                'ring_artifact_dir': self.testdir,
+                'max_partitions_at_risk_selectors': '1',
+            },
+            logger=debug_logger())
+        resp, body = self.get_json(
+            '/api/v1/rings/selector-limit/partitions_at_risk/?'
+            'node_ip=10.0.0.0&node_ip=10.0.0.1', app=app)
+        self.assertEqual(400, resp.status_int)
+        self.assertEqual(
+            'partitions_at_risk accepts at most 1 down selectors; got 2',
+            body['error'])
+
+    def test_ring_partitions_at_risk_post_rejects_too_many_selectors(self):
+        missing_builder = os.path.join(self.testdir, 'missing.builder')
+        self._write_json('rings/selector-limit.json', {
+            'id': 'selector-limit',
+            'name': 'Selector Limit',
+            'storage_policy_index': 0,
+            'policy_type': 'replication',
+            'num_replicas': 3,
+            'builder_files': [missing_builder],
+        })
+        app = RingManagerApplication(
+            {
+                'ring_manager_state_dir': self.state_dir,
+                'ring_artifact_dir': self.testdir,
+                'max_partitions_at_risk_selectors': '2',
+            },
+            logger=debug_logger())
+        resp, body = self.json_request(
+            '/api/v1/rings/selector-limit/partitions_at_risk/', 'POST', {
+                'node_ips': ['10.0.0.0'],
+                'replication_ips': ['10.1.0.0'],
+                'device_ids': [2],
+            }, app=app)
+        self.assertEqual(400, resp.status_int)
+        self.assertEqual(
+            'partitions_at_risk accepts at most 2 down selectors; got 3',
+            body['error'])
+
+    def test_ring_partitions_at_risk_post_rejects_invalid_body(self):
+        resp, body = self.json_request(
+            '/api/v1/rings/1/partitions_at_risk/', 'POST',
+            {'node_ips': [10]})
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('node_ip entries must be strings', body['error'])
+
+    def test_ring_partitions_at_risk_post_rejects_invalid_details(self):
+        resp, body = self.json_request(
+            '/api/v1/rings/1/partitions_at_risk/', 'POST',
+            {'node_ips': ['10.0.0.0'], 'details': ['true']})
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('details must be a boolean value', body['error'])
+
+    def test_ring_partitions_at_risk_reports_missing_builder(self):
+        missing_builder = os.path.join(self.testdir, 'missing.builder')
+        self._write_json('rings/missing.json', {
+            'id': 'missing',
+            'name': 'Missing Builder',
+            'storage_policy_index': 99,
+            'policy_type': 'replication',
+            'num_replicas': 3,
+            'builder_files': [missing_builder],
+        })
+        resp, body = self.get_json(
+            '/api/v1/rings/missing/partitions_at_risk/?node_ip=10.0.0.1')
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('builder files unavailable', body['error'])
+        self.assertNotIn(self.testdir, body['error'])
+
+    def test_ring_partitions_at_risk_namespaces_multiple_builders(self):
+        second_builder_path = os.path.join(self.testdir, 'container.builder')
+        self._make_builder(second_builder_path)
+        self._write_json('rings/multi.json', {
+            'id': 'multi',
+            'name': 'Account and Container',
+            'storage_policy_index': None,
+            'policy_type': 'replication',
+            'num_replicas': 3,
+            'builder_files': [self.builder_path, second_builder_path],
+        })
+        resp, body = self.get_json(
+            '/api/v1/rings/multi/partitions_at_risk/?'
+            'node_ip=10.0.0.0&node_ip=10.0.0.1&details=true')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(4, body['summary']['matched_devices'])
+        self.assertEqual(32, body['summary']['affected_partitions'])
+        self.assertEqual(32, body['summary']['at_risk_partitions'])
+        self.assertEqual(2, len(body['builder_summaries']))
+        for builder_summary in body['builder_summaries']:
+            self.assertEqual(2, builder_summary['matched_devices'])
+            self.assertEqual(16, builder_summary['affected_partitions'])
+            self.assertEqual(16, builder_summary['at_risk_partitions'])
+            self.assertEqual(
+                list(range(16)),
+                builder_summary['partitions_by_down_replica_count']['2'])
+
+    def test_ring_partitions_at_risk_matches_large_device_id(self):
+        builder_path = os.path.join(self.testdir, 'large-id.builder')
+        self._make_large_device_id_builder(builder_path, device_id=70000)
+        self._write_json('rings/large-id.json', {
+            'id': 'large-id',
+            'name': 'Large Device IDs',
+            'storage_policy_index': 0,
+            'policy_type': 'replication',
+            'num_replicas': 3,
+            'builder_files': [builder_path],
+        })
+        resp, body = self.get_json(
+            '/api/v1/rings/large-id/partitions_at_risk/?'
+            'device_id=70000&node_ip=10.0.70.1&details=true')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual([70000], body['selectors']['device_ids'])
+        self.assertEqual(2, body['summary']['matched_devices'])
+
     def test_builder_save_fsyncs_file_and_parent_directory(self):
         builder_path = os.path.join(self.testdir, 'durable.builder')
         builder = RingBuilder(4, 3, 1)
@@ -1389,6 +1789,9 @@ class TestRingManagerAuthMiddleware(unittest.TestCase):
         self.assertEqual(401, Request.blank(
             '/api/v1/rings/', method='POST', headers=read_headers,
             body=b'{}').get_response(app).status_int)
+        self.assertEqual(200, Request.blank(
+            '/api/v1/rings/1/partitions_at_risk/', method='POST',
+            headers=read_headers, body=b'{}').get_response(app).status_int)
         self.assertEqual(401, Request.blank(
             '/api/v1/rings/1/builder/', headers=read_headers
         ).get_response(app).status_int)
@@ -1407,6 +1810,9 @@ class TestRingManagerAuthMiddleware(unittest.TestCase):
         self.assertEqual(503, Request.blank(
             '/api/v1/rings/', method='POST', headers=headers,
             body=b'{}').get_response(app).status_int)
+        self.assertEqual(200, Request.blank(
+            '/api/v1/rings/1/partitions_at_risk/', method='POST',
+            headers=headers, body=b'{}').get_response(app).status_int)
         self.assertEqual(503, Request.blank(
             '/api/v1/rings/1/builder/', headers=headers
         ).get_response(app).status_int)
