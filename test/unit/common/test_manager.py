@@ -76,11 +76,20 @@ def pop_stream(f):
 class TestManagerModule(unittest.TestCase):
 
     def test_servers(self):
-        main_plus_rest = set(manager.MAIN_SERVERS + manager.REST_SERVERS)
-        self.assertEqual(set(manager.ALL_SERVERS), main_plus_rest)
-        # make sure there's no server listed in both
-        self.assertEqual(len(main_plus_rest), len(manager.MAIN_SERVERS) +
-                         len(manager.REST_SERVERS))
+        grouped_servers = set(manager.MAIN_SERVERS + manager.REST_SERVERS +
+                              manager.CONTROL_SERVERS)
+        self.assertEqual(set(manager.ALL_SERVERS), grouped_servers)
+        # make sure there's no server listed in more than one group
+        self.assertEqual(len(grouped_servers), len(manager.MAIN_SERVERS) +
+                         len(manager.REST_SERVERS) +
+                         len(manager.CONTROL_SERVERS))
+        self.assertIn('ring-manager-server', manager.CONTROL_SERVERS)
+        self.assertNotIn('ring-manager-server', manager.REST_SERVERS)
+        self.assertNotIn('ring-manager-server', manager.START_ONCE_SERVERS)
+        self.assertIn('ring-manager-server',
+                      manager.GRACEFUL_SHUTDOWN_SERVERS)
+        self.assertIn('ring-manager-server',
+                      manager.SEAMLESS_SHUTDOWN_SERVERS)
 
     def test_setup_env(self):
         class MockResource(object):
@@ -344,6 +353,10 @@ class TestServer(unittest.TestCase):
         self.assertEqual(server.server, 'object-replicator')
         self.assertEqual(server.type, 'object')
         self.assertEqual(server.cmd, 'swift-object-replicator')
+        server = manager.Server('ring-manager-server')
+        self.assertEqual(server.server, 'ring-manager-server')
+        self.assertEqual(server.type, 'ring-manager')
+        self.assertEqual(server.cmd, 'swift-ring-manager-server')
 
     def test_server_to_string(self):
         server = manager.Server('Proxy')
@@ -377,6 +390,10 @@ class TestServer(unittest.TestCase):
             'container-server/1/container-auditor.conf')
         pid_file = self.join_run_dir(
             'container-auditor/1/container-auditor.pid')
+        self.assertEqual(pid_file, server.get_pid_file_name(conf_file))
+        server = manager.Server('ring-manager-server')
+        conf_file = self.join_swift_dir('ring-manager-server.conf')
+        pid_file = self.join_run_dir('ring-manager-server.pid')
         self.assertEqual(pid_file, server.get_pid_file_name(conf_file))
 
     def test_get_custom_pid_file_name(self):
@@ -417,6 +434,10 @@ class TestServer(unittest.TestCase):
         conf_file = self.join_swift_dir(server_name + '.conf')
         pid_file = self.join_run_dir(server_name + '.pid')
         self.assertEqual(conf_file, server.get_conf_file_name(pid_file))
+        server = manager.Server('ring-manager-server')
+        conf_file = self.join_swift_dir('ring-manager-server.conf')
+        pid_file = self.join_run_dir('ring-manager-server.pid')
+        self.assertEqual(conf_file, server.get_conf_file_name(pid_file))
 
     def test_conf_files(self):
         # test get single conf file
@@ -433,6 +454,16 @@ class TestServer(unittest.TestCase):
             conf_file = conf_files[0]
             proxy_conf = self.join_swift_dir('proxy-server.conf')
             self.assertEqual(conf_file, proxy_conf)
+
+        with temptree(('ring-manager-server.conf',)) as t:
+            manager.SWIFT_DIR = t
+            server = manager.Server('ring-manager-server')
+            conf_files = server.conf_files()
+            self.assertEqual(len(conf_files), 1)
+            conf_file = conf_files[0]
+            ring_manager_conf = self.join_swift_dir(
+                'ring-manager-server.conf')
+            self.assertEqual(conf_file, ring_manager_conf)
 
         # test multi server conf files & grouping of server-type config
         conf_files = (
@@ -1683,13 +1714,18 @@ class TestManager(unittest.TestCase):
         self.assertEqual(len(m.servers), len(manager.REST_SERVERS))
         for server in m.servers:
             self.assertTrue(server.server in manager.REST_SERVERS)
-        # test main + rest == all
-        m = manager.Manager(['main', 'rest'])
+        # test control
+        m = manager.Manager(['control'])
+        self.assertEqual(len(m.servers), len(manager.CONTROL_SERVERS))
+        for server in m.servers:
+            self.assertTrue(server.server in manager.CONTROL_SERVERS)
+        # test main + rest + control == all
+        m = manager.Manager(['main', 'rest', 'control'])
         self.assertEqual(len(m.servers), len(manager.ALL_SERVERS))
         for server in m.servers:
             self.assertTrue(server.server in manager.ALL_SERVERS)
         # test dedupe
-        m = manager.Manager(['main', 'rest', 'proxy', 'object',
+        m = manager.Manager(['main', 'rest', 'control', 'proxy', 'object',
                              'container', 'account'])
         self.assertEqual(len(m.servers), len(manager.ALL_SERVERS))
         for server in m.servers:
@@ -2330,7 +2366,9 @@ class TestManager(unittest.TestCase):
 
             m = manager.Manager(['*-server'])
             expected_servers = set([server.server for server in m.servers])
-            self.assertEqual(len(expected_servers), 4)
+            self.assertEqual(
+                len(expected_servers),
+                len(manager.MAIN_SERVERS + manager.CONTROL_SERVERS))
             for server in expected_servers:
                 self.assertIn(server, manager.GRACEFUL_SHUTDOWN_SERVERS)
 
@@ -2339,7 +2377,8 @@ class TestManager(unittest.TestCase):
                     status = m.reload(graceful=graceful)
 
             self.assertEqual(status, 0)
-            self.assertEqual(4, len(called))
+            self.assertEqual(len(manager.MAIN_SERVERS +
+                                 manager.CONTROL_SERVERS), len(called))
             actual_servers = set()
             for m, calls in called.items():
                 self.assertEqual(calls, [('stop', {'graceful': True}),

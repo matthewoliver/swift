@@ -40,14 +40,18 @@ ALL_SERVERS = ['account-auditor', 'account-server', 'container-auditor',
                'container-updater', 'object-auditor', 'object-server',
                'object-expirer', 'object-replicator',
                'object-reconstructor', 'object-updater',
-               'proxy-server', 'account-replicator', 'account-reaper']
+               'proxy-server', 'account-replicator', 'account-reaper',
+               'ring-manager-server']
 MAIN_SERVERS = ['proxy-server', 'account-server', 'container-server',
                 'object-server']
-REST_SERVERS = [s for s in ALL_SERVERS if s not in MAIN_SERVERS]
+CONTROL_SERVERS = ['ring-manager-server']
+REST_SERVERS = [s for s in ALL_SERVERS
+                if s not in MAIN_SERVERS + CONTROL_SERVERS]
 # aliases mapping
-ALIASES = {'all': ALL_SERVERS, 'main': MAIN_SERVERS, 'rest': REST_SERVERS}
-GRACEFUL_SHUTDOWN_SERVERS = MAIN_SERVERS
-SEAMLESS_SHUTDOWN_SERVERS = MAIN_SERVERS
+ALIASES = {'all': ALL_SERVERS, 'main': MAIN_SERVERS, 'rest': REST_SERVERS,
+           'control': CONTROL_SERVERS}
+GRACEFUL_SHUTDOWN_SERVERS = MAIN_SERVERS + CONTROL_SERVERS
+SEAMLESS_SHUTDOWN_SERVERS = MAIN_SERVERS + CONTROL_SERVERS
 START_ONCE_SERVERS = REST_SERVERS
 # These are servers that match a type (account-*, container-*, object-*) but
 # don't use that type-server.conf file and instead use their own.
@@ -939,14 +943,16 @@ USAGE = \
 where:
     <server>  is the name of a swift service e.g. proxy-server.
               The '-server' part of the name may be omitted.
-              'all', 'main' and 'rest' are reserved words that represent a
-              group of services.
+              'all', 'main', 'rest' and 'control' are reserved words that
+              represent a group of services.
               all: Expands to all swift daemons.
               main: Expands to main swift daemons.
                     (proxy, container, account, object)
               rest: Expands to all remaining background daemons (beyond
-                    "main").
+                    "main" and "control").
                     (updater, replicator, auditor, etc)
+              control: Expands to Swift control-plane daemons.
+                    (ring-manager)
     <config>  is an explicit configuration filename without the
               .conf extension. If <config> is specified then <server> should
               refer to a directory containing the configuration file, e.g.:
@@ -994,7 +1000,8 @@ def main():
     parser.add_option('--non-strict', dest='strict', action='store_false',
                       help="Return zero status code even if some config is "
                            "missing. Default mode if any server is a glob or "
-                           "one of aliases `all`, `main` or `rest`.")
+                           "one of aliases `all`, `main`, `rest` or "
+                           "`control`.")
     # SIGKILL daemon after kill_wait period
     parser.add_option('--kill-after-timeout', dest='kill_after_timeout',
                       action='store_true',

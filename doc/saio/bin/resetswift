@@ -21,6 +21,7 @@ mkdir -p /srv/1/node/sdb1 /srv/1/node/sdb5 \
          /srv/4/node/sdb4 /srv/4/node/sdb8
 sudo rm -f /var/log/debug /var/log/messages /var/log/rsyncd.log /var/log/syslog
 find /var/cache/swift* -type f -name *.recon -exec rm -f {} \;
+sudo rm -rf /etc/swift/ring-manager-state
 if [ "`type -t systemctl`" == "file" ]; then
     sudo systemctl restart rsyslog
     sudo systemctl restart memcached
