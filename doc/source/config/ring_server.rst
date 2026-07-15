@@ -49,6 +49,25 @@ Server options
     Root of the directory-backed JSON state.
     The default is ``/etc/swift/ring-manager-state``.
 
+``ring_builder_dir``
+    Root directory for Swift builder files.
+    The default is ``/etc/swift``.
+    Standard account, container, and object builder names are derived here
+    unless a ring names one explicit builder file.
+
+``max_explicit_device_id``
+    Largest explicit device ID accepted by add and replace operations.
+    The default is ``1000000``.
+    This bounds allocation in the builder's dense device list.
+
+``builder_lock_timeout``
+    Seconds to wait for a ring builder's exclusive mutation lock.
+    The default is ``600``.
+
+``max_json_request_body_size``
+    Maximum JSON request size in bytes for ring mutations.
+    The default is ``1048576``.
+
 Authentication options
 ======================
 

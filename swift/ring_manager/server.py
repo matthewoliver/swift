@@ -20,10 +20,13 @@ from swift.common.swob import HTTPBadRequest, HTTPException, \
     HTTPInternalServerError, HTTPMethodNotAllowed, HTTPNotFound, Request, \
     Response, wsgi_to_str
 from swift.common.utils import config_true_value, get_log_line, get_logger, \
-    LOG_LINE_DEFAULT_FORMAT, parse_options
+    config_positive_int_value, LOG_LINE_DEFAULT_FORMAT, non_negative_float, \
+    parse_options
 from swift.common.wsgi import run_wsgi
-from swift.ring_manager.common import DEFAULT_RING_MANAGER_STATE_DIR, \
-    NormalTimestamp
+from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID, \
+    RingBuilderManager
+from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
+    DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, NormalTimestamp
 from swift.ring_manager.controllers import ring as ring_controller
 from swift.ring_manager import http, routing
 from swift.ring_manager.store import RingManagerStore
@@ -31,6 +34,7 @@ from swift.ring_manager.store import RingManagerStore
 
 RING_MANAGER_API_VERSION = 'v1'
 RING_MANAGER_API_PREFIX = '/api/%s' % RING_MANAGER_API_VERSION
+DEFAULT_MAX_JSON_REQUEST_BODY_SIZE = 1024 * 1024
 
 
 class RingManagerApplication(object):
@@ -38,7 +42,8 @@ class RingManagerApplication(object):
 
     server_type = 'ring-manager-server'
 
-    def __init__(self, conf, logger=None, store=None, controller=None):
+    def __init__(self, conf, logger=None, store=None, controller=None,
+                 builder_manager=None):
         if conf is None:
             conf = {}
         self.conf = conf
@@ -53,8 +58,22 @@ class RingManagerApplication(object):
         state_dir = conf.get(
             'ring_manager_state_dir', DEFAULT_RING_MANAGER_STATE_DIR)
         self.store = store or RingManagerStore(state_dir=state_dir)
+        self.ring_builder_dir = conf.get(
+            'ring_builder_dir', DEFAULT_RING_BUILDER_DIR)
+        self.builder_lock_timeout = non_negative_float(conf.get(
+            'builder_lock_timeout', DEFAULT_BUILDER_LOCK_TIMEOUT))
+        self.max_explicit_device_id = config_positive_int_value(conf.get(
+            'max_explicit_device_id', DEFAULT_MAX_EXPLICIT_DEVICE_ID))
+        self.max_json_request_body_size = config_positive_int_value(conf.get(
+            'max_json_request_body_size',
+            DEFAULT_MAX_JSON_REQUEST_BODY_SIZE))
+        self.builder_manager = builder_manager or RingBuilderManager(
+            self.ring_builder_dir,
+            max_explicit_device_id=self.max_explicit_device_id,
+            builder_lock_timeout=self.builder_lock_timeout)
         self.ring_controller = controller or ring_controller.RingController(
-            store=self.store)
+            store=self.store, builder_manager=self.builder_manager,
+            max_json_request_body_size=self.max_json_request_body_size)
         self.routes = self._make_routes()
 
     def _make_routes(self):
@@ -130,6 +149,7 @@ class RingManagerApplication(object):
     def _api_links(self):
         return {
             'status': '/api/v1/ring_manager/status/',
+            'rings': '/api/v1/rings/',
         }
 
     def _service_document(self, api_version=None):

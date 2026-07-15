@@ -21,6 +21,8 @@ from swift.common.utils.timestamp import NormalTimestamp
 DEFAULT_SWIFT_DIR = '/etc/swift'
 DEFAULT_RING_MANAGER_STATE_DIR = os.path.join(
     DEFAULT_SWIFT_DIR, 'ring-manager-state')
+DEFAULT_RING_BUILDER_DIR = DEFAULT_SWIFT_DIR
+DEFAULT_BUILDER_LOCK_TIMEOUT = 600
 
 
 def _configured(value):

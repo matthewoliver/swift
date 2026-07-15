@@ -2,7 +2,7 @@ digraph ring_manager_architecture {
     graph [
         bgcolor="white",
         fontname="DejaVu Sans",
-        label="Ring manager service foundation",
+        label="Ring manager ring authoring path",
         labelloc="t",
         nodesep="0.45",
         rankdir="LR",
@@ -21,14 +21,19 @@ digraph ring_manager_architecture {
     auth [label="ring-manager-auth\nread/admin policy"];
     app [label="RingManagerApplication\ndiscovery, status, dispatch"];
     controller [label="RingController\nring-specific routes"];
+    builder_manager [label="RingBuilderManager\nlocked topology updates"];
     store [label="RingManagerStore\nlocks and durable JSON"];
     state [label="ring_manager_state_dir", shape="cylinder"];
+    builders [label="Swift builder files\nring_builder_dir",
+              shape="cylinder"];
 
     operator -> auth [label="control API"];
     auth -> app;
     app -> controller [label="routes()"];
     app -> store;
     controller -> store;
+    controller -> builder_manager;
+    builder_manager -> builders [label="atomic save"];
     store -> state;
 
     subgraph cluster_data_path {

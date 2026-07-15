@@ -12,12 +12,370 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+
+from urllib.parse import quote, unquote
+
+from swift.common.swob import HTTPBadRequest, HTTPConflict, HTTPNoContent, \
+    HTTPNotFound, HTTPNotImplemented
+from swift.common.utils import config_true_value
+from swift.ring_manager import http
+from swift.ring_manager.builder import RingBuilderManagerError
+from swift.ring_manager.routing import Route
+from swift.ring_manager.store import RingAlreadyExists, RingNotFound
+
+
+RING_FIELDS = [
+    'id',
+    'background_ring_push',
+    'cluster',
+    'default',
+    'deprecated',
+    'ever_pushed',
+    'is_composite',
+    'last_rebalance_time',
+    'min_part_hours',
+    'name',
+    'num_replicas',
+    'overload',
+    'part_power',
+    'policy_type',
+    'rebalance_prohibited',
+    'storage_policy_index',
+    'target_adj_percent',
+    'ec_multi_region_type',
+    'rebalance_cork',
+    'ec_num_parity_fragments',
+    'ec_duplication_factor',
+    'ec_object_segment_size',
+    'ec_type',
+    'ec_num_data_fragments',
+    'resource_uri',
+    'builder_files',
+    'builder_path',
+    'builder_version',
+    'device_count',
+    'devices_url',
+]
+
 
 class RingController(object):
     """Own ring-specific routes and their orchestration."""
 
-    def __init__(self, store):
+    def __init__(self, store, builder_manager, max_json_request_body_size):
         self._store = store
+        self._builder_manager = builder_manager
+        self._max_json_request_body_size = max_json_request_body_size
 
     def routes(self):
-        return []
+        return [
+            Route(r'^/api/v1/rings/schema/?$',
+                  ('GET',), self.ring_schema),
+            Route(r'^/api/v1/rings/?$',
+                  ('GET', 'POST'), self.ring_list),
+            Route(r'^/api/v1/rings/membership/device/'
+                  r'(?P<device_id>[0-9]+)/?$',
+                  ('GET',), self.ring_membership_device),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/?$',
+                  ('GET', 'PUT', 'PATCH', 'DELETE'), self.ring_detail),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/devices/?$',
+                  ('GET', 'PUT'), self.ring_devices),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/devices/add/?$',
+                  ('POST',), self.ring_devices_add),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/devices/remove/?$',
+                  ('POST',), self.ring_devices_remove),
+        ]
+
+    def _json_response(self, req, data, status=200, headers=None):
+        return http.json_response(
+            req, data, status=status, headers=headers)
+
+    def _json_error(self, req, status_class, message):
+        return http.json_error(req, status_class, message)
+
+    def _json_request_body(self, req):
+        return http.json_request_body(
+            req, self._max_json_request_body_size)
+
+    def _collection_response(self, req, objects):
+        return http.collection_response(req, objects)
+
+    def _devices_from_request_body(self, payload):
+        devices = []
+        if 'nodes' in payload:
+            nodes = payload['nodes']
+            if not isinstance(nodes, list) or not nodes:
+                raise ValueError("'nodes' must be a non-empty list")
+            for node in nodes:
+                if not isinstance(node, dict):
+                    raise ValueError("'nodes' entries must be objects")
+                labels = node.get('device_labels')
+                node_devices = node.get('devices')
+                if labels is None and node_devices is None:
+                    raise ValueError(
+                        "'device_labels' or 'devices' is required")
+                if labels is not None:
+                    if not isinstance(labels, list) or not labels:
+                        raise ValueError(
+                            "'device_labels' must be a non-empty list")
+                    for label in labels:
+                        if not label:
+                            raise ValueError(
+                                "'device_labels' cannot contain empty values")
+                        device = {'label': label}
+                        if node.get('id') is not None:
+                            device['node_id'] = node['id']
+                        if node.get('resource_uri') is not None:
+                            device['node'] = node['resource_uri']
+                        devices.append(device)
+                if node_devices is not None:
+                    if not isinstance(node_devices, list) or not node_devices:
+                        raise ValueError("'devices' must be a non-empty list")
+                    node_keys = (
+                        'region', 'zone', 'ip', 'port', 'replication_ip',
+                        'replication_port')
+                    for item in node_devices:
+                        if not isinstance(item, dict):
+                            raise ValueError(
+                                "'devices' entries must be objects")
+                        device_name = item.get('device', item.get('name'))
+                        if not device_name:
+                            raise ValueError(
+                                "'devices' entries require device or name")
+                        device = {}
+                        if node.get('id') is not None:
+                            device['node_id'] = node['id']
+                        for key in node_keys:
+                            if node.get(key) is not None:
+                                device[key] = node[key]
+                        device.update(dict(
+                            (key, value) for key, value in item.items()
+                            if key != 'name'))
+                        device.setdefault('device', device_name)
+                        device.setdefault('label', '%s:%s' % (
+                            node['id'], device_name)
+                            if node.get('id') is not None else device_name)
+                        if (device.get('weight') is None and
+                                node.get('weight') is not None):
+                            device['weight'] = node['weight']
+                        devices.append(device)
+        elif 'devices' in payload:
+            payload_devices = payload['devices']
+            if not isinstance(payload_devices, list) or not payload_devices:
+                raise ValueError("'devices' must be a non-empty list")
+            for device in payload_devices:
+                if isinstance(device, dict):
+                    devices.append(device)
+                elif device:
+                    devices.append({'label': device})
+                else:
+                    raise ValueError("'devices' cannot contain empty values")
+        else:
+            raise ValueError("'nodes' or 'devices' is required")
+        return devices
+
+    def _not_implemented(self, req, name):
+        return self._json_error(
+            req, HTTPNotImplemented,
+            '%s is not implemented in the initial ring-manager service' % name)
+
+    def _get_ring(self, req, ring_id, hydrate_builder=False):
+        try:
+            ring = self._store.get_ring(ring_id)
+        except RingNotFound:
+            raise HTTPNotFound(request=req)
+        if hydrate_builder:
+            return self._hydrate_builder_metadata(ring)
+        return ring
+
+    def _device_collection_response(self, req, ring_id, page):
+        next_marker = page.get('next_marker')
+        next_path = None
+        if next_marker:
+            next_path = '/api/v1/rings/%s/devices/?marker=%s' % (
+                quote(ring_id, safe=''), quote(next_marker, safe=''))
+        devices = page.get('devices', [])
+        return self._json_response(req, {
+            'devices': devices,
+            'meta': {
+                'limit': len(devices),
+                'next': next_path,
+                'marker': next_marker,
+                'total_count': page.get('total_count', len(devices)),
+            },
+        })
+
+    def _remember_builder_metadata(self, ring_id, ring, builder_path,
+                                   device_count):
+        updates = self._builder_metadata_updates(
+            ring, builder_path, device_count)
+        self._store.update_ring(ring_id, updates)
+
+    def _builder_metadata_updates(self, ring, builder_path, device_count):
+        updates = {'device_count': device_count}
+        if builder_path and not (
+                ring.get('builder_files') or ring.get('builder_path')):
+            updates['builder_files'] = [builder_path]
+        return updates
+
+    def _hydrate_builder_metadata(self, ring):
+        hydrated = copy.deepcopy(ring)
+        hydrated.update(self._builder_manager.builder_info(hydrated))
+        return hydrated
+
+    def _apply_builder_settings(self, ring, builder_updates):
+        builder_path, _builder, device_count = \
+            self._builder_manager.update_builder_settings(
+                ring, builder_updates)
+        if builder_path is None:
+            return {}
+        return self._builder_metadata_updates(
+            ring, builder_path, device_count)
+
+    def ring_schema(self, req):
+        fields = dict((name, {
+            'nullable': True,
+            'readonly': name in ('id', 'resource_uri', 'ever_pushed',
+                                 'last_rebalance_time', 'builder_version',
+                                 'device_count', 'devices_url'),
+            'type': 'string',
+        }) for name in RING_FIELDS)
+        return self._json_response(req, {
+            'allowed_detail_http_methods': [
+                'get', 'put', 'patch', 'delete'],
+            'allowed_list_http_methods': ['get', 'post'],
+            'fields': fields,
+        })
+
+    def ring_list(self, req):
+        if req.method == 'POST':
+            payload = self._json_request_body(req)
+            metadata, builder_updates = \
+                self._builder_manager.split_builder_fields(payload)
+            try:
+                ring = self._store.create_ring(metadata)
+            except RingAlreadyExists:
+                return self._json_error(
+                    req, HTTPConflict, 'Ring already exists')
+            try:
+                builder_metadata = self._apply_builder_settings(
+                    ring, builder_updates)
+                if builder_metadata:
+                    ring = self._store.update_ring(
+                        ring['id'], builder_metadata)
+            except RingBuilderManagerError as err:
+                try:
+                    self._store.delete_ring(ring['id'])
+                except RingNotFound:
+                    pass
+                return self._json_error(req, HTTPBadRequest, str(err))
+            return self._json_response(
+                req, self._hydrate_builder_metadata(ring), status=201)
+        return self._collection_response(
+            req, self._store.list_rings(req.params.get('cluster_id')))
+
+    def ring_detail(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        if req.method == 'DELETE':
+            try:
+                self._store.delete_ring(ring_id)
+            except RingNotFound:
+                return HTTPNotFound(request=req)
+            return HTTPNoContent(request=req)
+        if req.method in ('PUT', 'PATCH'):
+            payload = self._json_request_body(req)
+            metadata, builder_updates = \
+                self._builder_manager.split_builder_fields(payload)
+            try:
+                existing = self._store.get_ring(ring_id)
+            except RingNotFound:
+                return HTTPNotFound(request=req)
+            if 'id' in metadata and str(metadata['id']) != str(ring_id):
+                raise ValueError('Request body id does not match ring id')
+            candidate = copy.deepcopy(metadata)
+            if req.method == 'PATCH':
+                candidate = copy.deepcopy(existing)
+                candidate.update(metadata)
+            candidate['id'] = existing['id']
+            try:
+                builder_metadata = self._apply_builder_settings(
+                    candidate, builder_updates)
+            except RingBuilderManagerError as err:
+                return self._json_error(req, HTTPBadRequest, str(err))
+            metadata.update(builder_metadata)
+            try:
+                ring = self._store.update_ring(
+                    ring_id, metadata,
+                    replace=req.method == 'PUT')
+            except RingNotFound:
+                return HTTPNotFound(request=req)
+            return self._json_response(
+                req, self._hydrate_builder_metadata(ring))
+        ring = self._get_ring(req, ring_id, hydrate_builder=True)
+        return self._json_response(req, ring)
+
+    def ring_membership_device(self, req, device_id):
+        return self._not_implemented(req, 'ring membership by device')
+
+    def ring_devices(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id)
+        if req.method == 'PUT':
+            devices = self._devices_from_request_body(
+                self._json_request_body(req))
+            try:
+                builder_path, devices, device_count = \
+                    self._builder_manager.replace_devices(ring, devices)
+                self._remember_builder_metadata(
+                    ring_id, ring, builder_path, device_count)
+            except RingBuilderManagerError as err:
+                return self._json_error(req, HTTPBadRequest, str(err))
+            return self._json_response(req, {
+                'devices': devices,
+                'device_count': device_count,
+            })
+        try:
+            page = self._builder_manager.list_devices(
+                ring, marker=req.params.get('marker'),
+                limit=req.params.get('limit', 1000),
+                include_removed=config_true_value(
+                    req.params.get('include_removed', 'false')))
+        except RingBuilderManagerError as err:
+            return self._json_error(req, HTTPBadRequest, str(err))
+        return self._device_collection_response(req, ring_id, page)
+
+    def ring_devices_add(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id)
+        devices = self._devices_from_request_body(self._json_request_body(req))
+        try:
+            builder_path, added, device_count = \
+                self._builder_manager.add_devices(ring, devices)
+            self._remember_builder_metadata(
+                ring_id, ring, builder_path, device_count)
+        except RingBuilderManagerError as err:
+            return self._json_error(req, HTTPBadRequest, str(err))
+        return self._json_response(req, {
+            'action': 'add_rings',
+            'ring': ring.get('name'),
+            'devices': added,
+            'device_count': device_count,
+        })
+
+    def ring_devices_remove(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id)
+        devices = self._devices_from_request_body(self._json_request_body(req))
+        try:
+            builder_path, removed, device_count = \
+                self._builder_manager.remove_devices(ring, devices)
+            self._remember_builder_metadata(
+                ring_id, ring, builder_path, device_count)
+        except RingBuilderManagerError as err:
+            return self._json_error(req, HTTPBadRequest, str(err))
+        return self._json_response(req, {
+            'action': 'remove_rings',
+            'ring': ring.get('name'),
+            'devices': removed,
+            'device_count': device_count,
+        })

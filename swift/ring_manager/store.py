@@ -24,8 +24,19 @@ from swift.common.utils import fsync, fsync_dir, lock_path
 from swift.ring_manager.common import normal_timestamp_float
 
 
+class RingNotFound(KeyError):
+    pass
+
+
+class RingAlreadyExists(KeyError):
+    pass
+
+
 class RingManagerStore(object):
     """Directory-backed durable state for the ring-manager service."""
+
+    BUILDER_OWNED_RING_FIELDS = (
+        'part_power', 'num_replicas', 'min_part_hours', 'overload')
 
     def __init__(self, state_dir=None):
         self.state_dir = state_dir
@@ -161,6 +172,8 @@ class RingManagerStore(object):
             directory, '%s.json' % self._safe_id(object_id))
 
     def _load_dir_object(self, collection, object_id, not_found):
+        if object_id is None:
+            raise not_found(object_id)
         path = self._collection_file(collection, object_id)
         obj = self._read_json_file(path)
         if obj is not None:
@@ -222,6 +235,98 @@ class RingManagerStore(object):
         if str(actual) == expected:
             return True
         return str(actual).rstrip('/').endswith('/%s' % expected)
+
+    def _matches_cluster(self, obj, cluster_id):
+        return (
+            self._object_id_matches(obj, 'cluster_id', cluster_id) or
+            self._object_id_matches(obj, 'cluster', cluster_id)
+        )
+
+    def _with_resource_uri(self, obj, collection):
+        obj = copy.deepcopy(obj)
+        if 'id' in obj and 'resource_uri' not in obj:
+            obj['resource_uri'] = '/api/v1/%s/%s/' % (
+                collection, self._safe_id(obj['id']))
+        if collection == 'rings' and 'id' in obj:
+            obj = self._strip_builder_owned_ring_fields(obj)
+            obj.setdefault(
+                'devices_url',
+                '/api/v1/rings/%s/devices/' % self._safe_id(obj['id']))
+        return obj
+
+    def _strip_builder_owned_ring_fields(self, ring):
+        ring = copy.deepcopy(ring)
+        ring.pop('devices', None)
+        for key in self.BUILDER_OWNED_RING_FIELDS:
+            ring.pop(key, None)
+        return ring
+
+    def _next_id(self, objects):
+        next_id = 1
+        for obj in objects:
+            try:
+                next_id = max(next_id, int(obj.get('id')) + 1)
+            except (TypeError, ValueError):
+                continue
+        return next_id
+
+    def _default_ring_id(self, ring):
+        ring_type = ring.get('ring_type') or ring.get('type')
+        if ring_type in ('account', 'container'):
+            return ring_type
+        if (ring_type == 'object' or
+                ring.get('storage_policy_index') is not None):
+            policy_index = ring.get('storage_policy_index')
+            if policy_index in (None, ''):
+                policy_index = 0
+            return 'object-%s' % policy_index
+        return 'ring-%s' % self._next_id(self._list_dir_objects('rings'))
+
+    def list_rings(self, cluster_id=None):
+        rings = self._list_dir_objects('rings')
+        return [
+            self._with_resource_uri(ring, 'rings')
+            for ring in rings
+            if self._matches_cluster(ring, cluster_id)
+        ]
+
+    def get_ring(self, ring_id):
+        ring = self._load_dir_object('rings', ring_id, RingNotFound)
+        return self._with_resource_uri(ring, 'rings')
+
+    def create_ring(self, ring):
+        ring = copy.deepcopy(ring)
+        ring.pop('resource_uri', None)
+        ring = self._strip_builder_owned_ring_fields(ring)
+        ring.setdefault('id', self._default_ring_id(ring))
+        try:
+            self._load_dir_object('rings', ring['id'], RingNotFound)
+        except RingNotFound:
+            pass
+        else:
+            raise RingAlreadyExists(ring['id'])
+        self._save_dir_object('rings', ring)
+        return self._with_resource_uri(ring, 'rings')
+
+    def update_ring(self, ring_id, updates, replace=False):
+        existing = self._load_dir_object('rings', ring_id, RingNotFound)
+        if 'id' in updates and str(updates['id']) != str(ring_id):
+            raise ValueError('Request body id does not match ring id')
+        if replace:
+            ring = copy.deepcopy(updates)
+        else:
+            ring = copy.deepcopy(existing)
+            ring.update(updates)
+        ring['id'] = existing['id']
+        ring.pop('resource_uri', None)
+        ring = self._strip_builder_owned_ring_fields(ring)
+        self._save_dir_object('rings', ring)
+        return self._with_resource_uri(ring, 'rings')
+
+    def delete_ring(self, ring_id):
+        ring = self._load_dir_object('rings', ring_id, RingNotFound)
+        self._delete_dir_object('rings', ring['id'], RingNotFound)
+        return self._with_resource_uri(ring, 'rings')
 
     def _timestamp_float(self, obj, keys=('created_at', 'updated_at')):
         for key in keys:

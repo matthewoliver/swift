@@ -11,6 +11,8 @@ The service framework provides:
 * unversioned service discovery at ``/``;
 * versioned API discovery at ``/api/v1/``;
 * service status at ``/api/v1/ring_manager/status/``;
+* ring metadata and builder-backed device management at
+  ``/api/v1/rings/``;
 * separate read and administrator authentication keys;
 * directory-backed JSON state with locked, atomic, durable writes; and
 * normal Swift process management through ``swift-init``.
@@ -33,7 +35,11 @@ administrator operation before it reaches the application.
 The WSGI application owns discovery, status, method negotiation, error
 mapping, and request logging.
 Ring-specific routes are delegated through ``RingController.routes()``.
+``RingBuilderManager`` performs locked updates to Swift builder files for the
+controller.
 Durable service state is stored below ``ring_manager_state_dir``.
+Builder-owned topology remains in Swift builder files below
+``ring_builder_dir``.
 
 The proxy, account, container, and object services continue to use installed
 Swift ring files in the normal data path.
@@ -92,6 +98,43 @@ New directory parents and deletes are fsynced as well.
 This keeps prior state intact when a write fails before the rename and makes
 completed updates durable across a host crash.
 
+Ring resources and builder authority
+====================================
+
+A ring resource combines small logical metadata with a live view of its Swift
+builder.
+Logical metadata such as the ring name, cluster reference, policy type, and
+storage policy index is stored as JSON below ``ring_manager_state_dir``.
+Devices, weights, regions, zones, ports, partition power, replica count,
+``min_part_hours``, overload, and builder version remain authoritative in the
+builder file.
+They are not copied into the JSON resource.
+
+The API derives standard builder names for account, container, and object
+rings, or accepts one explicit ``builder_files`` entry on a ring.
+A ring response hydrates builder-owned fields from the current builder file.
+This means a builder changed by established Swift tooling is reflected in the
+next ring-manager read.
+
+Creating a ring with builder settings creates its builder file under an
+exclusive lock.
+PATCH may change the replica count, ``min_part_hours``, and overload through
+Swift's ``RingBuilder`` methods.
+Ordinary PUT or PATCH cannot change partition power on an existing builder.
+Device add, replace, and remove requests validate the complete input before
+saving a new durable builder file.
+These operations change desired builder state only: they do not rebalance the
+ring or publish a ``.ring.gz`` file.
+
+Device topology validation accepts IPv4, IPv6, and structured host names.
+Regions, zones, device IDs, and ports use guarded ASCII-decimal parsing;
+weights and builder numeric settings must be finite and within their allowed
+ranges.
+Explicit device IDs are bounded because ``RingBuilder.devs`` is a dense list.
+Invalid multi-device requests leave the existing builder unchanged.
+Builder saves use a unique temporary file, fsync the file, atomically rename
+it, preserve an existing file mode, and fsync the parent directory.
+
 Operations
 ==========
 
@@ -116,5 +159,5 @@ Configuration and API references
 ================================
 
 See :doc:`config/ring_server` for the server and authentication options.
-See :doc:`api/ring_manager` for the foundation API resources and response
-conventions.
+See :doc:`api/ring_manager` for ring resources, device operations, and
+response conventions.
