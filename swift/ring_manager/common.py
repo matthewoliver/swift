@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import stat
 
 from swift.common.utils.timestamp import NormalTimestamp
 
@@ -20,6 +21,86 @@ from swift.common.utils.timestamp import NormalTimestamp
 DEFAULT_SWIFT_DIR = '/etc/swift'
 DEFAULT_RING_MANAGER_STATE_DIR = os.path.join(
     DEFAULT_SWIFT_DIR, 'ring-manager-state')
+
+
+def _configured(value):
+    return value not in (None, '')
+
+
+def read_secret_file(path, field_name='secret_file'):
+    if not path:
+        raise ValueError('%s is required' % field_name)
+    flags = os.O_RDONLY
+    flags |= getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as err:
+        raise ValueError('Unable to open %s %s: %s' % (
+            field_name, path, err))
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError('%s must be a regular file: %s' % (
+                field_name, path))
+        if file_stat.st_uid not in (0, os.geteuid()):
+            raise ValueError(
+                '%s must be owned by root or the effective service user: %s' %
+                (field_name, path))
+        if file_stat.st_mode & 0o077:
+            raise ValueError(
+                '%s must not allow group or other permissions: %s' %
+                (field_name, path))
+        with os.fdopen(fd, 'rb') as fp:
+            fd = None
+            secret = fp.read()
+    except OSError as err:
+        raise ValueError('Unable to read %s %s: %s' % (
+            field_name, path, err))
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    if secret.endswith(b'\r\n'):
+        secret = secret[:-2]
+    elif secret.endswith(b'\n') or secret.endswith(b'\r'):
+        secret = secret[:-1]
+    if b'\x00' in secret:
+        raise ValueError('%s must not contain NUL bytes' % field_name)
+    if b'\n' in secret or b'\r' in secret:
+        raise ValueError('%s must not contain embedded newlines' % field_name)
+    if any(byte < 0x20 or byte == 0x7f for byte in secret):
+        raise ValueError('%s must not contain control characters' % field_name)
+    if not secret or not secret.strip():
+        raise ValueError('%s must not be empty' % field_name)
+    try:
+        return secret.decode('utf-8')
+    except UnicodeDecodeError as err:
+        raise ValueError('%s must be valid UTF-8: %s' % (field_name, err))
+
+
+def load_secret(value=None, value_name='secret', file_path=None,
+                file_name='secret_file'):
+    if _configured(value) and _configured(file_path):
+        raise ValueError('%s and %s are mutually exclusive' % (
+            value_name, file_name))
+    if _configured(file_path):
+        return read_secret_file(file_path, file_name)
+    return value
+
+
+def _first_configured(conf, names):
+    for name in names:
+        value = conf.get(name)
+        if _configured(value):
+            return value, name
+    return None, None
+
+
+def load_secret_from_conf(conf, value_names, file_names):
+    value, value_name = _first_configured(conf, value_names)
+    file_path, file_name = _first_configured(conf, file_names)
+    return load_secret(value, value_name or value_names[0],
+                       file_path, file_name or file_names[0])
 
 
 def normal_timestamp(timestamp=None):

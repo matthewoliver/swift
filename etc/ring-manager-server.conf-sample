@@ -17,7 +17,7 @@ bind_port = 6205
 # log_format = {remote_addr} - - [{time.d}/{time.b}/{time.Y}:{time.H}:{time.M}:{time.S} +0000] "{method} {path}" {status} {content_length} "{referer}" "{txn_id}" "{user_agent}" {trans_time:.4f} "{additional_info}" {pid} {policy_index}
 
 [pipeline:main]
-pipeline = catch_errors healthcheck ring-manager-server
+pipeline = catch_errors healthcheck ring-manager-auth ring-manager-server
 
 [app:ring-manager-server]
 use = egg:swift#ring_manager
@@ -30,6 +30,26 @@ use = egg:swift#ring_manager
 # Directory for Swift-native ring-manager state. Each resource is stored in
 # its own JSON file and updates are written atomically and durably.
 # ring_manager_state_dir = /etc/swift/ring-manager-state
+
+[filter:ring-manager-auth]
+use = egg:swift#ring_manager_auth
+#
+# Operator token/key accepted in X-Ring-Manager-Admin-Key or X-Auth-Token.
+# With no suitable key configured, protected requests fail closed with 503.
+# admin_key =
+# admin_key_file =
+#
+# Optional read-only key accepted in X-Ring-Manager-Read-Key or X-Auth-Token
+# for GET and HEAD requests. Builder downloads still require the admin key.
+# read_key =
+# read_key_file =
+#
+# Inline and file options for one credential are mutually exclusive. Secret
+# files are read once at startup and must be regular files owned by root or the
+# service user with restrictive permissions such as 0400 or 0600.
+#
+# Useful for local development only.
+# allow_unauthenticated = false
 
 [filter:healthcheck]
 use = egg:swift#healthcheck

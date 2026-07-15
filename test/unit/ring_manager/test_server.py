@@ -18,10 +18,11 @@ import tempfile
 import unittest
 from unittest import mock
 
-from swift.common.swob import Request
+from swift.common.swob import Request, Response
 from swift.ring_manager import routing
 from swift.ring_manager.common import DEFAULT_RING_MANAGER_STATE_DIR
 from swift.ring_manager.server import app_factory, RingManagerApplication
+from swift.ring_manager.middleware.auth import RingManagerAuthMiddleware
 from swift.ring_manager.store import RingManagerStore
 from test.debug_logger import debug_logger
 
@@ -191,6 +192,122 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
             releases_dir,
             target_dir,
         ], [call[0][0] for call in mock_dir.call_args_list])
+
+
+class TestRingManagerAuthMiddleware(unittest.TestCase):
+    def setUp(self):
+        self.testdir = tempfile.mkdtemp()
+        self.app = lambda env, start_response: Response(
+            body=b'OK')(env, start_response)
+
+    def tearDown(self):
+        shutil.rmtree(self.testdir)
+
+    def _write_secret(self, name, value):
+        path = os.path.join(self.testdir, name)
+        with open(path, 'wb') as fp:
+            fp.write(value)
+        os.chmod(path, 0o600)
+        return path
+
+    def test_allow_unauthenticated(self):
+        app = RingManagerAuthMiddleware(
+            self.app, {'allow_unauthenticated': 'true'},
+            logger=debug_logger())
+        req = Request.blank('/api/v1/rings/')
+        self.assertEqual(200, req.get_response(app).status_int)
+
+    def test_missing_keys_fail_closed(self):
+        app = RingManagerAuthMiddleware(
+            self.app, {}, logger=debug_logger())
+        self.assertEqual(
+            503, Request.blank('/api/v1/rings/').get_response(app).status_int)
+        self.assertEqual(
+            503, Request.blank(
+                '/api/v1/rings/', method='POST').get_response(app).status_int)
+
+    def test_admin_key_allows_reads_and_writes(self):
+        app = RingManagerAuthMiddleware(
+            self.app, {'admin_key': 'secret'}, logger=debug_logger())
+        self.assertEqual(
+            401, Request.blank('/api/v1/rings/').get_response(app).status_int)
+
+        headers = {'X-Ring-Manager-Admin-Key': 'secret'}
+        self.assertEqual(200, Request.blank(
+            '/api/v1/rings/', headers=headers).get_response(app).status_int)
+        self.assertEqual(200, Request.blank(
+            '/api/v1/rings/', method='POST', headers=headers,
+            body=b'{}').get_response(app).status_int)
+
+    def test_key_files(self):
+        app = RingManagerAuthMiddleware(
+            self.app, {
+                'admin_key_file': self._write_secret(
+                    'admin.key', b'admin\n'),
+                'read_key_file': self._write_secret(
+                    'read.key', b'reader\n'),
+            }, logger=debug_logger())
+
+        self.assertEqual(200, Request.blank(
+            '/api/v1/rings/',
+            headers={'X-Ring-Manager-Read-Key': 'reader'}
+        ).get_response(app).status_int)
+        self.assertEqual(200, Request.blank(
+            '/api/v1/rings/', method='POST',
+            headers={'X-Ring-Manager-Admin-Key': 'admin'},
+            body=b'{}').get_response(app).status_int)
+
+    def test_key_file_conflict_fails_closed(self):
+        with self.assertRaises(ValueError) as cm:
+            RingManagerAuthMiddleware(
+                self.app, {
+                    'admin_key': 'inline',
+                    'admin_key_file': self._write_secret(
+                        'admin.key', b'admin\n'),
+                }, logger=debug_logger())
+        self.assertIn('mutually exclusive', str(cm.exception))
+
+    def test_read_key_allows_reads_not_writes_or_builders(self):
+        app = RingManagerAuthMiddleware(
+            self.app, {'admin_key': 'admin', 'read_key': 'reader'},
+            logger=debug_logger())
+        read_headers = {'X-Ring-Manager-Read-Key': 'reader'}
+
+        self.assertEqual(200, Request.blank(
+            '/api/v1/rings/', headers=read_headers
+        ).get_response(app).status_int)
+        self.assertEqual(401, Request.blank(
+            '/api/v1/rings/', method='POST', headers=read_headers,
+            body=b'{}').get_response(app).status_int)
+        self.assertEqual(401, Request.blank(
+            '/api/v1/rings/1/builder/', headers=read_headers
+        ).get_response(app).status_int)
+        self.assertEqual(200, Request.blank(
+            '/api/v1/rings/1/builder/',
+            headers={'X-Ring-Manager-Admin-Key': 'admin'}
+        ).get_response(app).status_int)
+
+    def test_read_key_without_admin_keeps_admin_requests_unavailable(self):
+        app = RingManagerAuthMiddleware(
+            self.app, {'read_key': 'reader'}, logger=debug_logger())
+        headers = {'X-Ring-Manager-Read-Key': 'reader'}
+
+        self.assertEqual(200, Request.blank(
+            '/api/v1/rings/', headers=headers).get_response(app).status_int)
+        self.assertEqual(503, Request.blank(
+            '/api/v1/rings/', method='POST', headers=headers,
+            body=b'{}').get_response(app).status_int)
+        self.assertEqual(503, Request.blank(
+            '/api/v1/rings/1/builder/', headers=headers
+        ).get_response(app).status_int)
+
+    def test_options_and_healthcheck_bypass_auth(self):
+        app = RingManagerAuthMiddleware(
+            self.app, {}, logger=debug_logger())
+        self.assertEqual(200, Request.blank(
+            '/api/v1/rings/', method='OPTIONS').get_response(app).status_int)
+        self.assertEqual(200, Request.blank(
+            '/healthcheck').get_response(app).status_int)
 
 
 if __name__ == '__main__':
