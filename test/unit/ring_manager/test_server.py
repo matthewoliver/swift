@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import os
 import shutil
@@ -18,12 +19,16 @@ import tempfile
 import unittest
 from unittest import mock
 
+from urllib.parse import quote
+
 from swift.common.ring.builder import RingBuilder
 from swift.common.swob import Request, Response
+from swift.common.utils import md5
 from swift.ring_manager import routing
 from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
-    DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, NormalTimestamp
+    DEFAULT_RING_ARTIFACT_DIR, DEFAULT_RING_BUILDER_DIR, \
+    DEFAULT_RING_MANAGER_STATE_DIR, NormalTimestamp
 from swift.ring_manager.server import app_factory, \
     DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS, RingManagerApplication
 from swift.ring_manager.middleware.auth import RingManagerAuthMiddleware
@@ -37,8 +42,24 @@ class TestRingManagerApplication(unittest.TestCase):
         self.state_dir = os.path.join(self.testdir, 'state')
         self.builder_path = os.path.join(self.testdir, 'object.builder')
         self._make_builder(self.builder_path)
+        self.artifact_dir = os.path.join(self.testdir, 'artifacts')
+        os.makedirs(self.artifact_dir)
+        self.latest_version = '2026-05-22T10:31:00Z-abc123'
+        self.artifact_name = 'object.ring.gz'
+        self.artifact_body = b'new ring bytes'
+        self.artifact_path = os.path.join(
+            self.artifact_dir, self.artifact_name)
+        with open(self.artifact_path, 'wb') as fp:
+            fp.write(self.artifact_body)
+        self.artifact_md5 = md5(
+            self.artifact_body, usedforsecurity=False).hexdigest()
+        self.artifact_sha256 = hashlib.sha256(
+            self.artifact_body).hexdigest()
         self.last_rebalance_time = NormalTimestamp(
             float(NormalTimestamp.now()) - 1800).internal
+        self._write_json('index.json', {
+            'latest_ring_version': self.latest_version,
+        })
         self._write_json('rings/1.json', {
             'id': 1,
             'name': 'Account & Container',
@@ -57,12 +78,40 @@ class TestRingManagerApplication(unittest.TestCase):
             'storage_policy_index': 1,
             'policy_type': 'erasure_coding',
         })
+        self._write_json('releases/older-version/manifest.json', {
+            'version': 'older-version',
+            'cluster_id': 7,
+            'state': 'superseded',
+            'created_at': '2026-05-22T10:00:00Z',
+            'files': [],
+        })
+        self._write_latest_release()
         self.logger = debug_logger()
         self.app = RingManagerApplication(
             {
                 'ring_manager_state_dir': self.state_dir,
+                'ring_artifact_dir': self.artifact_dir,
                 'ring_builder_dir': self.testdir,
             }, logger=self.logger)
+
+    def _write_latest_release(self, files=None):
+        if files is None:
+            files = [{
+                'name': self.artifact_name,
+                'path': self.artifact_name,
+                'md5': self.artifact_md5,
+                'sha256': self.artifact_sha256,
+                'bytes': len(self.artifact_body),
+                'storage_policy_index': 0,
+            }]
+        self._write_json(
+            'releases/%s/manifest.json' % self.latest_version, {
+                'version': self.latest_version,
+                'cluster_id': 7,
+                'state': 'approved',
+                'created_at': '2026-05-22T10:31:00Z',
+                'files': files,
+            })
 
     def _make_builder(self, path):
         builder = RingBuilder(4, 3, 1)
@@ -140,6 +189,11 @@ class TestRingManagerApplication(unittest.TestCase):
             name for name in os.listdir(directory)
             if name.startswith(prefix) and name.endswith('.tmp')]
 
+    def _builder_snapshot_files(self):
+        return [
+            name for name in os.listdir(self.state_dir)
+            if name.startswith('.ring-manager-builder-snapshot-')]
+
     def tearDown(self):
         shutil.rmtree(self.testdir)
 
@@ -172,6 +226,8 @@ class TestRingManagerApplication(unittest.TestCase):
     def test_app_factory_uses_sample_config_defaults(self):
         app = app_factory({})
         self.assertEqual(DEFAULT_RING_MANAGER_STATE_DIR, app.store.state_dir)
+        self.assertEqual(
+            DEFAULT_RING_ARTIFACT_DIR, app.store.ring_artifact_dir)
         self.assertEqual(DEFAULT_RING_BUILDER_DIR, app.ring_builder_dir)
         self.assertEqual(DEFAULT_MAX_EXPLICIT_DEVICE_ID,
                          app.max_explicit_device_id)
@@ -194,6 +250,10 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(
             '/api/v1/ring_manager/status/', body['links']['status'])
         self.assertEqual('/api/v1/rings/', body['links']['rings'])
+        self.assertEqual('/api/v1/rings/releases/',
+                         body['links']['ring_versions'])
+        self.assertEqual('/api/v1/rings/releases/latest/',
+                         body['links']['latest_ring_version'])
 
         resp, body = self.get_json('/api/v1/')
         self.assertEqual(200, resp.status_int)
@@ -215,6 +275,21 @@ class TestRingManagerApplication(unittest.TestCase):
             ('^/api/v1/rings/membership/device/'
              '(?P<device_id>[0-9]+)/?$', ('GET',),
              'ring_membership_device'),
+            ('^/api/v1/rings/releases/?$', ('GET',), 'ring_versions'),
+            ('^/api/v1/rings/releases/latest/?$',
+             ('GET',), 'latest_ring_version'),
+            ('^/api/v1/rings/releases/latest/manifest/?$',
+             ('GET',), 'latest_ring_version_manifest'),
+            ('^/api/v1/rings/releases/latest/files/'
+             '(?P<file_name>[^/]+)/?$',
+             ('GET',), 'latest_ring_version_file'),
+            ('^/api/v1/rings/releases/(?P<version>[^/]+)/?$',
+             ('GET',), 'ring_version_detail'),
+            ('^/api/v1/rings/releases/(?P<version>[^/]+)/manifest/?$',
+             ('GET',), 'ring_version_manifest'),
+            ('^/api/v1/rings/releases/(?P<version>[^/]+)/files/'
+             '(?P<file_name>[^/]+)/?$',
+             ('GET',), 'ring_version_file'),
             ('^/api/v1/rings/(?P<ring_id>[^/]+)/?$',
              ('GET', 'PUT', 'PATCH', 'DELETE'), 'ring_detail'),
             ('^/api/v1/rings/(?P<ring_id>[^/]+)/devices/?$',
@@ -227,6 +302,10 @@ class TestRingManagerApplication(unittest.TestCase):
              'partition_power_increase/'
              '(?P<action>prepare|increase|cancel|finish)/?$',
              ('POST',), 'ring_partition_power_increase'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/builder/?$',
+             ('GET',), 'ring_builder'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/builder/file/?$',
+             ('GET',), 'ring_builder_file'),
             ('^/api/v1/rings/(?P<ring_id>[^/]+)/parts/?$',
              ('GET',), 'ring_parts'),
             ('^/api/v1/rings/(?P<ring_id>[^/]+)/rebalance/?$',
@@ -288,6 +367,324 @@ class TestRingManagerApplication(unittest.TestCase):
             {'log_requests': 'false'}, logger=self.logger)
         self.get_json('/', app=app)
         self.assertEqual([], self.logger.get_lines_for_level('info'))
+
+    def test_ring_versions(self):
+        resp, body = self.get_json('/api/v1/rings/releases/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(2, body['meta']['total_count'])
+        latest = next(
+            item for item in body['objects']
+            if item['version'] == self.latest_version)
+        self.assertTrue(latest['latest'])
+        self.assertEqual(
+            '/api/v1/rings/releases/%s/' % quote(
+                self.latest_version, safe=''),
+            latest['resource_uri'])
+        self.assertNotIn('path', latest['files'][0])
+        self.assertNotIn(self.artifact_dir, json.dumps(latest))
+        self.assertEqual(
+            '/api/v1/rings/releases/%s/files/%s' % (
+                quote(self.latest_version, safe=''), self.artifact_name),
+            latest['files'][0]['url'])
+
+    def test_ring_versions_cluster_filter(self):
+        resp, body = self.get_json(
+            '/api/v1/rings/releases/?cluster_id=8')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(0, body['meta']['total_count'])
+
+    def test_ring_versions_validate_manifest_identity(self):
+        self._write_json(
+            'releases/%s/manifest.json' % self.latest_version, {
+                'version': 'latest',
+                'files': [],
+            })
+        resp, body = self.get_json('/api/v1/rings/releases/')
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('reserved', body['error'])
+
+    def test_ring_versions_reject_state_path_mismatch(self):
+        self._write_json(
+            'releases/%s/manifest.json' % self.latest_version, {
+                'version': 'different-version',
+                'files': [],
+            })
+        resp, body = self.get_json('/api/v1/rings/releases/')
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('does not match state path', body['error'])
+
+    def test_ring_versions_validate_file_identity(self):
+        self._write_latest_release(files=[{
+            'name': '../object.ring.gz',
+            'path': self.artifact_name,
+        }])
+        resp, body = self.get_json('/api/v1/rings/releases/')
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('path separators', body['error'])
+
+    def test_ring_version_detail_and_manifest(self):
+        version_path = '/api/v1/rings/releases/%s/' % quote(
+            self.latest_version, safe='')
+        resp, body = self.get_json(version_path)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(self.latest_version, body['version'])
+        self.assertTrue(body['latest'])
+        self.assertNotIn('path', body['files'][0])
+
+        resp, body = self.get_json(version_path + 'manifest/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(self.latest_version, body['version'])
+        self.assertTrue(body['latest'])
+        self.assertEqual('approved', body['state'])
+        self.assertEqual(7, body['cluster_id'])
+        self.assertEqual(self.artifact_md5, body['files'][0]['md5'])
+        self.assertEqual(self.artifact_sha256, body['files'][0]['sha256'])
+        self.assertNotIn('path', body['files'][0])
+
+    def test_latest_ring_version_resources(self):
+        resp, body = self.get_json('/api/v1/rings/releases/latest/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(self.latest_version, body['version'])
+        self.assertTrue(body['latest'])
+
+        resp, body = self.get_json(
+            '/api/v1/rings/releases/latest/manifest/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(self.latest_version, body['version'])
+        self.assertTrue(body['latest'])
+
+        req = Request.blank(
+            '/api/v1/rings/releases/latest/files/%s' % self.artifact_name)
+        resp = req.get_response(self.app)
+        self.assertEqual(307, resp.status_int)
+        self.assertTrue(resp.headers['Location'].endswith(
+            '/api/v1/rings/releases/%s/files/%s' % (
+                quote(self.latest_version, safe=''), self.artifact_name)))
+
+    def test_ring_version_file_streams_with_validators(self):
+        path = '/api/v1/rings/releases/%s/files/%s' % (
+            quote(self.latest_version, safe=''), self.artifact_name)
+        resp = Request.blank(path).get_response(self.app)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(self.artifact_body, resp.body)
+        self.assertEqual(self.artifact_md5, resp.headers['Etag'])
+        self.assertEqual(
+            self.artifact_sha256, resp.headers['X-Checksum-Sha256'])
+        self.assertEqual(len(self.artifact_body), resp.content_length)
+
+        resp = Request.blank(path, method='HEAD').get_response(self.app)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(b'', resp.body)
+        self.assertEqual(len(self.artifact_body), resp.content_length)
+
+        resp = Request.blank(
+            path, headers={'If-None-Match': self.artifact_md5}
+        ).get_response(self.app)
+        self.assertEqual(304, resp.status_int)
+        self.assertEqual(b'', resp.body)
+
+        resp = Request.blank(
+            path, headers={'Range': 'bytes=4-7'}
+        ).get_response(self.app)
+        self.assertEqual(206, resp.status_int)
+        self.assertEqual(self.artifact_body[4:8], resp.body)
+        self.assertEqual(
+            'bytes 4-7/%d' % len(self.artifact_body),
+            resp.headers['Content-Range'])
+
+        resp = Request.blank(
+            path, headers={'Range': 'bytes=0-2,5-7'}
+        ).get_response(self.app)
+        self.assertEqual(206, resp.status_int)
+        self.assertIn(self.artifact_body[0:3], resp.body)
+        self.assertIn(self.artifact_body[5:8], resp.body)
+
+    def test_ring_version_file_uses_streaming_iterable(self):
+        calls = []
+        artifact_body = self.artifact_body
+
+        class FakeFileIterable(object):
+            def __init__(self, path, **kwargs):
+                calls.append((path, kwargs))
+
+            def __iter__(self):
+                yield artifact_body
+
+            def close(self):
+                pass
+
+        original_factory = self.app.ring_controller._file_iterable_factory
+        self.app.ring_controller._file_iterable_factory = FakeFileIterable
+        try:
+            req = Request.blank(
+                '/api/v1/rings/releases/%s/files/%s' % (
+                    quote(self.latest_version, safe=''), self.artifact_name))
+            resp = req.get_response(self.app)
+            self.assertEqual(self.artifact_body, resp.body)
+        finally:
+            self.app.ring_controller._file_iterable_factory = \
+                original_factory
+        self.assertEqual([(self.artifact_path, {})], calls)
+
+    def test_ring_version_file_without_md5_omits_etag(self):
+        self._write_latest_release(files=[{
+            'name': self.artifact_name,
+            'path': self.artifact_name,
+            'sha256': self.artifact_sha256,
+            'bytes': len(self.artifact_body),
+        }])
+        req = Request.blank(
+            '/api/v1/rings/releases/%s/files/%s' % (
+                quote(self.latest_version, safe=''), self.artifact_name),
+            headers={'If-None-Match': self.artifact_sha256})
+        resp = req.get_response(self.app)
+        self.assertEqual(200, resp.status_int)
+        self.assertNotIn('Etag', resp.headers)
+        self.assertEqual(
+            self.artifact_sha256, resp.headers['X-Checksum-Sha256'])
+
+    def test_ring_version_file_rejects_artifact_path_escape(self):
+        outside_path = os.path.join(self.testdir, 'outside.ring.gz')
+        with open(outside_path, 'wb') as fp:
+            fp.write(self.artifact_body)
+        self._write_latest_release(files=[{
+            'name': self.artifact_name,
+            'path': '../outside.ring.gz',
+            'md5': self.artifact_md5,
+            'sha256': self.artifact_sha256,
+            'bytes': len(self.artifact_body),
+        }])
+        req = Request.blank(
+            '/api/v1/rings/releases/%s/files/%s' % (
+                quote(self.latest_version, safe=''), self.artifact_name))
+        self.assertEqual(404, req.get_response(self.app).status_int)
+
+    def test_ring_version_file_rejects_symlink_escape(self):
+        outside_path = os.path.join(self.testdir, 'outside.ring.gz')
+        with open(outside_path, 'wb') as fp:
+            fp.write(self.artifact_body)
+        symlink_path = os.path.join(self.artifact_dir, 'linked.ring.gz')
+        os.symlink(outside_path, symlink_path)
+        self._write_latest_release(files=[{
+            'name': self.artifact_name,
+            'path': 'linked.ring.gz',
+            'md5': self.artifact_md5,
+            'sha256': self.artifact_sha256,
+            'bytes': len(self.artifact_body),
+        }])
+        req = Request.blank(
+            '/api/v1/rings/releases/%s/files/%s' % (
+                quote(self.latest_version, safe=''), self.artifact_name))
+        self.assertEqual(404, req.get_response(self.app).status_int)
+
+    def test_ring_version_file_missing_resources(self):
+        resp, body = self.get_json('/api/v1/rings/releases/nope/')
+        self.assertEqual(404, resp.status_int)
+        self.assertIsNone(body)
+        resp, body = self.get_json(
+            '/api/v1/rings/releases/nope/manifest/')
+        self.assertEqual(404, resp.status_int)
+        self.assertIsNone(body)
+
+        path = '/api/v1/rings/releases/%s/files/%s' % (
+            quote(self.latest_version, safe=''), self.artifact_name)
+        os.unlink(self.artifact_path)
+        self.assertEqual(
+            404, Request.blank(path).get_response(self.app).status_int)
+        self.assertEqual(
+            404, Request.blank(
+                path, method='HEAD').get_response(self.app).status_int)
+        self.assertEqual(
+            404, Request.blank(
+                path, headers={'If-None-Match': self.artifact_md5}
+            ).get_response(self.app).status_int)
+
+    def test_ring_builder_metadata_and_file(self):
+        with open(self.builder_path, 'rb') as fp:
+            builder_body = fp.read()
+        builder_md5 = md5(
+            builder_body, usedforsecurity=False).hexdigest()
+        builder_sha256 = hashlib.sha256(builder_body).hexdigest()
+        builder_version = RingBuilder.load(self.builder_path).version
+
+        resp, body = self.get_json('/api/v1/rings/1/builder/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('1', str(body['ring_id']))
+        self.assertEqual(builder_version, body['builder_version'])
+        self.assertEqual({
+            'bytes': len(builder_body),
+            'md5': builder_md5,
+            'sha256': builder_sha256,
+            'url': '/api/v1/rings/1/builder/file/',
+        }, body['file'])
+        self.assertNotIn(self.testdir, json.dumps(body))
+
+        path = '/api/v1/rings/1/builder/file/'
+        resp = Request.blank(path).get_response(self.app)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(builder_body, resp.body)
+        self.assertEqual(builder_md5, resp.headers['Etag'])
+        self.assertEqual(builder_sha256,
+                         resp.headers['X-Checksum-Sha256'])
+        self.assertEqual(str(builder_version),
+                         resp.headers['X-Ring-Builder-Version'])
+        self.assertEqual([], self._builder_snapshot_files())
+
+        resp = Request.blank(path, method='HEAD').get_response(self.app)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(b'', resp.body)
+        self.assertEqual(len(builder_body), resp.content_length)
+        self.assertEqual([], self._builder_snapshot_files())
+
+        resp = Request.blank(
+            path, headers={'If-None-Match': builder_md5}
+        ).get_response(self.app)
+        self.assertEqual(304, resp.status_int)
+        self.assertEqual(b'', resp.body)
+        self.assertEqual([], self._builder_snapshot_files())
+
+        resp = Request.blank(
+            path, headers={'Range': 'bytes=0-9'}
+        ).get_response(self.app)
+        self.assertEqual(206, resp.status_int)
+        self.assertEqual(builder_body[:10], resp.body)
+        self.assertEqual([], self._builder_snapshot_files())
+
+    def test_ring_builder_download_uses_stable_snapshot(self):
+        with open(self.builder_path, 'rb') as fp:
+            builder_body = fp.read()
+        ring = self.app.store.get_ring('1')
+        record = self.app.ring_controller._builder_file_snapshot_record(ring)
+        snapshot_path = record['path']
+        try:
+            with open(self.builder_path, 'wb') as fp:
+                fp.write(b'changed builder bytes')
+            req = Request.blank('/api/v1/rings/1/builder/file/')
+            resp = self.app.ring_controller._builder_file_response(
+                req, record)
+            self.assertEqual(builder_body, resp.body)
+            self.assertFalse(os.path.exists(snapshot_path))
+        finally:
+            if os.path.exists(snapshot_path):
+                os.unlink(snapshot_path)
+            with open(self.builder_path, 'wb') as fp:
+                fp.write(builder_body)
+
+    def test_ring_builder_rejects_path_outside_builder_dir(self):
+        app = RingManagerApplication({
+            'ring_manager_state_dir': self.state_dir,
+            'ring_artifact_dir': self.artifact_dir,
+            'ring_builder_dir': os.path.join(self.testdir, 'builders'),
+        }, logger=debug_logger())
+        with mock.patch(
+                'swift.ring_manager.controllers.ring.RingBuilder.load') \
+                as load:
+            resp, body = self.get_json(
+                '/api/v1/rings/1/builder/', app=app)
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('unavailable', body['error'])
+        self.assertNotIn(self.builder_path, body['error'])
+        load.assert_not_called()
 
     def test_ring_schema(self):
         resp, body = self.get_json('/api/v1/rings/schema/')

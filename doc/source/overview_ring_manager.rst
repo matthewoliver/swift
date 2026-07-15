@@ -13,6 +13,7 @@ The service framework provides:
 * service status at ``/api/v1/ring_manager/status/``;
 * ring metadata and builder-backed device management at
   ``/api/v1/rings/``;
+* immutable release and builder downloads with conditional and range support;
 * separate read and administrator authentication keys;
 * directory-backed JSON state with locked, atomic, durable writes; and
 * normal Swift process management through ``swift-init``.
@@ -40,6 +41,7 @@ controller.
 Durable service state is stored below ``ring_manager_state_dir``.
 Builder-owned topology remains in Swift builder files below
 ``ring_builder_dir``.
+Immutable release artefacts remain below ``ring_artifact_dir``.
 
 The proxy, account, container, and object services continue to use installed
 Swift ring files in the normal data path.
@@ -97,6 +99,20 @@ the directory.
 New directory parents and deletes are fsynced as well.
 This keeps prior state intact when a write fails before the rename and makes
 completed updates durable across a host crash.
+
+Immutable downloads
+===================
+
+Release metadata is stored as one manifest per release below ``ring_manager_state_dir/releases``.
+Public release and manifest responses remove local paths and expose concrete file URLs below ``/api/v1/rings/releases/``.
+Artefact file paths are resolved beneath ``ring_artifact_dir`` using real paths so ``..`` components and symbolic links cannot escape the configured root.
+
+Ring artefacts stream from disk and support HEAD, conditional requests, and byte ranges.
+The MD5 digest is used as the HTTP ETag for compatibility with Swift clients, while SHA-256 remains available in ``X-Checksum-Sha256`` as the stronger integrity value.
+
+Builder metadata and builder-file downloads require the administrator credential.
+The service verifies that a builder resolves below ``ring_builder_dir`` and streams a private snapshot so an in-progress response is stable across concurrent builder replacement.
+The temporary snapshot is removed when the response closes.
 
 Ring resources and builder authority
 ====================================

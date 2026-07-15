@@ -13,19 +13,26 @@
 # limitations under the License.
 
 import copy
+import errno
+import hashlib
+import os
+import tempfile
 
 from urllib.parse import quote, unquote
 
+from swift.common import exceptions as swift_exceptions
+from swift.common.ring.builder import RingBuilder
 from swift.common.swob import HTTPBadRequest, HTTPConflict, HTTPNoContent, \
-    HTTPNotFound, HTTPNotImplemented
-from swift.common.utils import config_true_value
+    HTTPNotFound, HTTPNotImplemented, HTTPTemporaryRedirect
+from swift.common.utils import config_true_value, md5, mkdirs
 from swift.ring_manager import http
 from swift.ring_manager.analysis import RingBuilderAnalysisError, \
     RingBuilderAnalyzer, get_query_list
 from swift.ring_manager.builder import RingBuilderManagerConflict, \
     RingBuilderManagerError
 from swift.ring_manager.routing import Route
-from swift.ring_manager.store import RingAlreadyExists, RingNotFound
+from swift.ring_manager.store import RingAlreadyExists, RingNotFound, \
+    RingVersionFileNotFound, RingVersionNotFound
 
 
 RING_FIELDS = [
@@ -76,13 +83,15 @@ class RingController(object):
 
     def __init__(self, store, builder_manager, ring_builder_dir,
                  max_json_request_body_size,
-                 max_partitions_at_risk_selectors):
+                 max_partitions_at_risk_selectors,
+                 file_iterable_factory=http.RingManagerFileIterable):
         self._store = store
         self._builder_manager = builder_manager
         self._ring_builder_dir = ring_builder_dir
         self._max_json_request_body_size = max_json_request_body_size
         self._max_partitions_at_risk_selectors = \
             max_partitions_at_risk_selectors
+        self._file_iterable_factory = file_iterable_factory
 
     def routes(self):
         return [
@@ -93,6 +102,22 @@ class RingController(object):
             Route(r'^/api/v1/rings/membership/device/'
                   r'(?P<device_id>[0-9]+)/?$',
                   ('GET',), self.ring_membership_device),
+            Route(r'^/api/v1/rings/releases/?$',
+                  ('GET',), self.ring_versions),
+            Route(r'^/api/v1/rings/releases/latest/?$',
+                  ('GET',), self.latest_ring_version),
+            Route(r'^/api/v1/rings/releases/latest/manifest/?$',
+                  ('GET',), self.latest_ring_version_manifest),
+            Route(r'^/api/v1/rings/releases/latest/files/'
+                  r'(?P<file_name>[^/]+)/?$',
+                  ('GET',), self.latest_ring_version_file),
+            Route(r'^/api/v1/rings/releases/(?P<version>[^/]+)/?$',
+                  ('GET',), self.ring_version_detail),
+            Route(r'^/api/v1/rings/releases/(?P<version>[^/]+)/manifest/?$',
+                  ('GET',), self.ring_version_manifest),
+            Route(r'^/api/v1/rings/releases/(?P<version>[^/]+)/files/'
+                  r'(?P<file_name>[^/]+)/?$',
+                  ('GET',), self.ring_version_file),
             Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/?$',
                   ('GET', 'PUT', 'PATCH', 'DELETE'), self.ring_detail),
             Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/devices/?$',
@@ -105,6 +130,10 @@ class RingController(object):
                   r'partition_power_increase/'
                   r'(?P<action>prepare|increase|cancel|finish)/?$',
                   ('POST',), self.ring_partition_power_increase),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/builder/?$',
+                  ('GET',), self.ring_builder),
+            Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/builder/file/?$',
+                  ('GET',), self.ring_builder_file),
             Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/parts/?$',
                   ('GET',), self.ring_parts),
             Route(r'^/api/v1/rings/(?P<ring_id>[^/]+)/rebalance/?$',
@@ -134,6 +163,10 @@ class RingController(object):
 
     def _collection_response(self, req, objects):
         return http.collection_response(req, objects)
+
+    def _artifact_file_response(self, req, file_info):
+        return http.artifact_file_response(
+            req, file_info, file_iterable_cls=self._file_iterable_factory)
 
     def _payload_values(self, payload, *names):
         values = []
@@ -346,6 +379,124 @@ class RingController(object):
             raise ValueError('%s must be a non-negative integer' % name)
         return parsed
 
+    def _builder_file_record(self, ring):
+        return self._builder_file_record_from_path(
+            ring, self._validated_builder_path(ring))
+
+    def _validated_builder_path(self, ring):
+        builder_path = self._builder_manager.builder_path(ring)
+        root = os.path.realpath(self._ring_builder_dir)
+        resolved = os.path.realpath(builder_path)
+        try:
+            common_path = os.path.commonpath([root, resolved])
+        except ValueError:
+            common_path = None
+        if common_path != root:
+            raise RingBuilderManagerError(
+                'ring %s builder file is outside ring_builder_dir' %
+                ring.get('id'))
+        return resolved
+
+    def _hash_file(self, path):
+        checksum = hashlib.sha256()
+        etag = md5(usedforsecurity=False)
+        bytes_read = 0
+        with open(path, 'rb') as fp:
+            while True:
+                chunk = fp.read(http.DEFAULT_FILE_CHUNK_SIZE)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                checksum.update(chunk)
+                etag.update(chunk)
+        return bytes_read, checksum.hexdigest(), etag.hexdigest()
+
+    def _remove_snapshot(self, snapshot_path):
+        http.remove_file(snapshot_path)
+
+    def _snapshot_builder_file(self, builder_path):
+        snapshot_dir = self._store.state_dir or tempfile.gettempdir()
+        mkdirs(snapshot_dir)
+        fd, snapshot_path = tempfile.mkstemp(
+            prefix='.ring-manager-builder-snapshot-', dir=snapshot_dir)
+        checksum = hashlib.sha256()
+        etag = md5(usedforsecurity=False)
+        bytes_written = 0
+        try:
+            with os.fdopen(fd, 'wb') as out_fp:
+                with open(builder_path, 'rb') as in_fp:
+                    while True:
+                        chunk = in_fp.read(http.DEFAULT_FILE_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        out_fp.write(chunk)
+                        bytes_written += len(chunk)
+                        checksum.update(chunk)
+                        etag.update(chunk)
+            return (snapshot_path, bytes_written, checksum.hexdigest(),
+                    etag.hexdigest())
+        except Exception:
+            self._remove_snapshot(snapshot_path)
+            raise
+
+    def _builder_file_record_from_path(self, ring, resolved,
+                                       snapshot_path=None,
+                                       snapshot_bytes=None,
+                                       snapshot_sha256=None,
+                                       snapshot_md5=None):
+        try:
+            builder = RingBuilder.load(snapshot_path or resolved)
+        except swift_exceptions.FileNotFoundError:
+            raise
+        except (swift_exceptions.PermissionError,
+                swift_exceptions.UnPicklingError) as err:
+            raise RingBuilderManagerError(
+                'ring %s builder file could not be loaded: %s' %
+                (ring.get('id'), err))
+        except Exception as err:
+            raise RingBuilderManagerError(
+                'ring %s builder file could not be loaded: %s' %
+                (ring.get('id'), err))
+        if snapshot_path is None:
+            stat_result = os.stat(resolved)
+            bytes_read, sha256, etag = self._hash_file(resolved)
+            if bytes_read == stat_result.st_size:
+                bytes_read = stat_result.st_size
+        else:
+            bytes_read = snapshot_bytes
+            sha256 = snapshot_sha256
+            etag = snapshot_md5
+        return {
+            'path': snapshot_path or resolved,
+            'unlink_on_close': snapshot_path is not None,
+            'bytes': bytes_read,
+            'md5': etag,
+            'sha256': sha256,
+            'builder_version': builder.version,
+            'partition_power_increase':
+                self._builder_manager.partition_power_increase_info(
+                    ring, builder),
+        }
+
+    def _builder_file_snapshot_record(self, ring):
+        resolved = self._validated_builder_path(ring)
+        snapshot_path, snapshot_bytes, snapshot_sha256, snapshot_md5 = \
+            self._snapshot_builder_file(resolved)
+        try:
+            return self._builder_file_record_from_path(
+                ring, resolved, snapshot_path=snapshot_path,
+                snapshot_bytes=snapshot_bytes,
+                snapshot_sha256=snapshot_sha256,
+                snapshot_md5=snapshot_md5)
+        except Exception:
+            self._remove_snapshot(snapshot_path)
+            raise
+
+    def _builder_file_response(self, req, record):
+        return http.builder_file_response(
+            req, record, remove_file_callback=self._remove_snapshot,
+            file_iterable_cls=self._file_iterable_factory)
+
     def _apply_builder_settings(self, ring, builder_updates):
         builder_path, _builder, device_count = \
             self._builder_manager.update_builder_settings(
@@ -540,6 +691,107 @@ class RingController(object):
             'requires_publish': True,
         })
         return self._json_response(req, response)
+
+    def ring_versions(self, req):
+        return self._collection_response(
+            req,
+            self._store.list_ring_versions(req.params.get('cluster_id')))
+
+    def latest_ring_version(self, req):
+        try:
+            version = self._store.get_ring_version('latest')
+        except RingVersionNotFound:
+            return HTTPNotFound(request=req)
+        return self._json_response(req, version)
+
+    def ring_version_detail(self, req, version):
+        try:
+            version = self._store.get_ring_version(unquote(version))
+        except RingVersionNotFound:
+            return HTTPNotFound(request=req)
+        return self._json_response(req, version)
+
+    def latest_ring_version_manifest(self, req):
+        return self.ring_version_manifest(req, 'latest')
+
+    def ring_version_manifest(self, req, version):
+        try:
+            manifest = self._store.get_ring_version_manifest(
+                unquote(version))
+        except RingVersionNotFound:
+            return HTTPNotFound(request=req)
+        return self._json_response(req, manifest)
+
+    def latest_ring_version_file(self, req, file_name):
+        try:
+            concrete_version = self._store.get_concrete_ring_version_id(
+                'latest')
+        except RingVersionNotFound:
+            return HTTPNotFound(request=req)
+        location = '/api/v1/rings/releases/%s/files/%s' % (
+            quote(concrete_version, safe=''), quote(file_name, safe=''))
+        return HTTPTemporaryRedirect(
+            request=req, headers={'Location': location})
+
+    def ring_version_file(self, req, version, file_name):
+        try:
+            _version, file_info = self._store.get_ring_version_file(
+                unquote(version), unquote(file_name))
+        except (RingVersionNotFound, RingVersionFileNotFound):
+            return HTTPNotFound(request=req)
+        return self._artifact_file_response(req, file_info)
+
+    def ring_builder(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id)
+        try:
+            record = self._builder_file_record(ring)
+        except swift_exceptions.FileNotFoundError:
+            return HTTPNotFound(request=req)
+        except RingBuilderManagerError:
+            return self._json_error(
+                req, HTTPBadRequest, 'Ring builder file is unavailable')
+        except IOError as err:
+            if err.errno in (errno.ENOENT, errno.EACCES, errno.EPERM):
+                return HTTPNotFound(request=req)
+            raise
+        return self._json_response(req, {
+            'ring_id': ring_id,
+            'builder_version': record['builder_version'],
+            'next_part_power':
+                record['partition_power_increase']['next_part_power'],
+            'partition_power_increase_state':
+                record['partition_power_increase'][
+                    'partition_power_increase_state'],
+            'allowed_partition_power_actions':
+                record['partition_power_increase'][
+                    'allowed_partition_power_actions'],
+            'latest_swift_ring_version': ring.get(
+                'latest_swift_ring_version'),
+            'file': {
+                'bytes': record['bytes'],
+                'md5': record['md5'],
+                'sha256': record['sha256'],
+                'url': '/api/v1/rings/%s/builder/file/' %
+                quote(str(ring_id), safe=''),
+            },
+        })
+
+    def ring_builder_file(self, req, ring_id):
+        ring_id = unquote(ring_id)
+        ring = self._get_ring(req, ring_id)
+        try:
+            record = self._builder_file_snapshot_record(ring)
+        except swift_exceptions.FileNotFoundError:
+            return HTTPNotFound(request=req)
+        except RingBuilderManagerError:
+            return self._json_error(
+                req, HTTPBadRequest, 'Ring builder file is unavailable')
+        except IOError as err:
+            if err.errno in (errno.ENOENT, errno.EACCES, errno.EPERM):
+                return HTTPNotFound(request=req)
+            raise
+        return self._builder_file_response(req, record)
 
     def ring_parts(self, req, ring_id):
         ring_id = unquote(ring_id)

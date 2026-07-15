@@ -50,6 +50,8 @@ Example response::
         {"id": "v1", "url": "/api/v1/"}
       ],
       "links": {
+        "latest_ring_version": "/api/v1/rings/releases/latest/",
+        "ring_versions": "/api/v1/rings/releases/",
         "rings": "/api/v1/rings/",
         "status": "/api/v1/ring_manager/status/"
       },
@@ -113,6 +115,64 @@ The response has status ``201`` and includes the settings loaded back from
 the builder.
 A duplicate identifier returns ``409 Conflict``.
 If builder validation or saving fails, the new JSON resource is removed.
+
+Immutable release downloads
+===========================
+
+Release manifests are read from ``ring_manager_state_dir/releases``.
+They describe immutable ring files below ``ring_artifact_dir`` without exposing local paths.
+This API can serve releases written by an external publication process; it does not create or select releases.
+
+``GET /api/v1/rings/releases/``
+--------------------------------
+
+Lists known releases in the standard collection envelope.
+The optional ``cluster_id`` query parameter filters the collection.
+File entries include a download URL, byte count, MD5 digest when present, and SHA-256 integrity digest when present.
+
+``GET /api/v1/rings/releases/<version>/``
+------------------------------------------------
+
+Returns one immutable release record.
+Local ``path`` and ``artifact_dir`` values are removed from the response.
+
+``GET /api/v1/rings/releases/<version>/manifest/``
+---------------------------------------------------------
+
+Returns the public manifest for one release.
+The response includes release metadata and public file entries without local paths.
+
+``GET /api/v1/rings/releases/latest/``
+---------------------------------------
+
+Returns the release selected by ``latest_ring_version`` in the state index, or by a release marked ``latest`` when no index value exists.
+The corresponding ``.../latest/manifest/`` resource returns its public manifest.
+
+``GET /api/v1/rings/releases/<version>/files/<file_name>``
+-----------------------------------------------------------------
+
+Streams one immutable artefact from disk.
+The server resolves the manifest path below ``ring_artifact_dir`` and rejects lexical or symbolic-link escapes with ``404 Not Found``.
+The response uses the file's MD5 digest as the HTTP ETag and exposes its SHA-256 digest in ``X-Checksum-Sha256``.
+HEAD, ``If-None-Match``, and single or multiple byte ranges use Swift's normal conditional response handling.
+The ``.../latest/files/<file_name>`` selector redirects to the concrete immutable version URL.
+
+Builder downloads
+=================
+
+``GET /api/v1/rings/<ring_id>/builder/``
+------------------------------------------------
+
+Returns builder version, partition-power lifecycle state, and download metadata for the ring's current Swift builder.
+The response includes byte count, MD5, SHA-256, and the public file URL without exposing the local builder path.
+
+``GET /api/v1/rings/<ring_id>/builder/file/``
+-----------------------------------------------------
+
+Streams a private snapshot of the current builder so a concurrent builder replacement cannot change a response in progress.
+The response supports HEAD, conditional requests, and byte ranges, and includes ``X-Ring-Builder-Version``.
+Both builder resources require the administrator key.
+Builder paths are resolved below ``ring_builder_dir`` and path or symbolic-link escapes are rejected before the file is loaded.
 
 ``GET /api/v1/rings/<ring_id>/``
 ----------------------------------------

@@ -26,7 +26,8 @@ from swift.common.wsgi import run_wsgi
 from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID, \
     RingBuilderManager
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
-    DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, NormalTimestamp
+    DEFAULT_RING_ARTIFACT_DIR, DEFAULT_RING_BUILDER_DIR, \
+    DEFAULT_RING_MANAGER_STATE_DIR, NormalTimestamp
 from swift.ring_manager.controllers import ring as ring_controller
 from swift.ring_manager import http, routing
 from swift.ring_manager.store import RingManagerStore
@@ -58,7 +59,10 @@ class RingManagerApplication(object):
         self.anonymization_salt = conf.get('log_anonymization_salt', '')
         state_dir = conf.get(
             'ring_manager_state_dir', DEFAULT_RING_MANAGER_STATE_DIR)
-        self.store = store or RingManagerStore(state_dir=state_dir)
+        ring_artifact_dir = conf.get(
+            'ring_artifact_dir', DEFAULT_RING_ARTIFACT_DIR)
+        self.store = store or RingManagerStore(
+            state_dir=state_dir, ring_artifact_dir=ring_artifact_dir)
         self.ring_builder_dir = conf.get(
             'ring_builder_dir', DEFAULT_RING_BUILDER_DIR)
         self.builder_lock_timeout = non_negative_float(conf.get(
@@ -157,6 +161,8 @@ class RingManagerApplication(object):
         return {
             'status': '/api/v1/ring_manager/status/',
             'rings': '/api/v1/rings/',
+            'ring_versions': '/api/v1/rings/releases/',
+            'latest_ring_version': '/api/v1/rings/releases/latest/',
         }
 
     def _service_document(self, api_version=None):

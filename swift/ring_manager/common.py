@@ -21,8 +21,51 @@ from swift.common.utils.timestamp import NormalTimestamp
 DEFAULT_SWIFT_DIR = '/etc/swift'
 DEFAULT_RING_MANAGER_STATE_DIR = os.path.join(
     DEFAULT_SWIFT_DIR, 'ring-manager-state')
+DEFAULT_RING_ARTIFACT_DIR = os.path.join(
+    DEFAULT_SWIFT_DIR, 'ring-manager-artifacts')
 DEFAULT_RING_BUILDER_DIR = DEFAULT_SWIFT_DIR
 DEFAULT_BUILDER_LOCK_TIMEOUT = 600
+RESERVED_ARTIFACT_VERSION_IDS = frozenset(('desired', 'latest'))
+
+
+def validate_path_component(value, field_name):
+    if value in (None, ''):
+        raise ValueError('%s must be a non-empty path component' %
+                         field_name)
+    value = str(value)
+    if value in ('.', '..'):
+        raise ValueError('%s must be a non-empty path component' %
+                         field_name)
+    if os.path.isabs(value) or '/' in value or '\\' in value:
+        raise ValueError('%s must not contain path separators' % field_name)
+    return value
+
+
+def validate_artifact_version_id(value, field_name='version'):
+    value = validate_path_component(value, field_name)
+    if value in RESERVED_ARTIFACT_VERSION_IDS:
+        raise ValueError('%s %r is reserved' % (field_name, value))
+    return value
+
+
+def resolve_artifact_path(root, path, field_name='artifact path'):
+    if not root:
+        raise ValueError('ring_artifact_dir is required')
+    if path in (None, ''):
+        raise ValueError('%s is required' % field_name)
+    root = os.path.realpath(root)
+    path = str(path)
+    if os.path.isabs(path):
+        resolved = os.path.realpath(path)
+    else:
+        resolved = os.path.realpath(os.path.join(root, path))
+    try:
+        common_path = os.path.commonpath([root, resolved])
+    except ValueError:
+        common_path = None
+    if common_path != root:
+        raise ValueError('%s escapes ring_artifact_dir' % field_name)
+    return resolved
 
 
 def _configured(value):

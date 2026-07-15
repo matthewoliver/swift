@@ -49,6 +49,12 @@ Server options
     Root of the directory-backed JSON state.
     The default is ``/etc/swift/ring-manager-state``.
 
+``ring_artifact_dir``
+    Root directory for immutable ring artefacts referenced by release manifests.
+    The default is ``/etc/swift/ring-manager-artifacts``.
+    A manifest path must resolve below this directory, including after symbolic links are resolved.
+    Local artefact paths are never included in public API responses.
+
 ``ring_builder_dir``
     Root directory for Swift builder files.
     The default is ``/etc/swift``.

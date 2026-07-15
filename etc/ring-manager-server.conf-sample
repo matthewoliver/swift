@@ -31,6 +31,10 @@ use = egg:swift#ring_manager
 # its own JSON file and updates are written atomically and durably.
 # ring_manager_state_dir = /etc/swift/ring-manager-state
 #
+# Root directory for relative immutable ring artefact paths referenced by
+# release manifests. Local paths are never exposed by the API.
+# ring_artifact_dir = /etc/swift/ring-manager-artifacts
+#
 # Root directory for Swift ring-builder files. Standard account, container,
 # and object builder names are derived here unless a ring names one builder.
 # ring_builder_dir = /etc/swift
