@@ -17,8 +17,8 @@ import sys
 from swift import __version__ as swift_version
 from swift.common.concurrency import GreenPool, Timeout
 from swift.common.swob import HTTPBadRequest, HTTPException, \
-    HTTPInternalServerError, HTTPMethodNotAllowed, HTTPNotFound, Request, \
-    Response, wsgi_to_str
+    HTTPForbidden, HTTPInternalServerError, HTTPMethodNotAllowed, \
+    HTTPNotFound, Request, Response, wsgi_to_str
 from swift.common.utils import config_true_value, get_log_line, get_logger, \
     config_positive_float_value, config_positive_int_value, \
     LOG_LINE_DEFAULT_FORMAT, non_negative_float, parse_options
@@ -41,6 +41,8 @@ RING_MANAGER_API_VERSION = 'v1'
 RING_MANAGER_API_PREFIX = '/api/%s' % RING_MANAGER_API_VERSION
 DEFAULT_MAX_JSON_REQUEST_BODY_SIZE = 1024 * 1024
 DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS = 1000
+RING_MANAGER_MODES = ('primary', 'readonly', 'standby')
+READONLY_RING_MANAGER_MODES = ('readonly', 'standby')
 
 
 class RingManagerApplication(object):
@@ -88,6 +90,11 @@ class RingManagerApplication(object):
             builder_manager=self.builder_manager,
             builder_lock_timeout=self.builder_lock_timeout,
             logger=self.logger)
+        self.mode = (conf.get('ring_manager_mode') or 'primary').lower()
+        if self.mode not in RING_MANAGER_MODES:
+            raise ValueError(
+                'ring_manager_mode must be one of: %s' %
+                ', '.join(RING_MANAGER_MODES))
         self.ring_build_executor = (conf.get(
             'ring_build_executor', DEFAULT_RING_BUILD_EXECUTOR) or
             DEFAULT_RING_BUILD_EXECUTOR).lower()
@@ -119,6 +126,10 @@ class RingManagerApplication(object):
                 self.max_partitions_at_risk_selectors))
         self.routes = self._make_routes()
 
+    @property
+    def writable(self):
+        return self.mode not in READONLY_RING_MANAGER_MODES
+
     def _make_routes(self):
         return [
             routing.Route(r'^/?$', ('GET',), self.root),
@@ -144,6 +155,12 @@ class RingManagerApplication(object):
                 'Server': '%s/%s' % (self.server_type, swift_version),
             })
 
+    def _readonly_response(self, req):
+        return http.json_error(
+            req, HTTPForbidden,
+            'ring-manager is running in %s mode; mutating requests are '
+            'disabled' % self.mode)
+
     def _dispatch(self, req):
         path = wsgi_to_str(req.path_info)
         for route in self.routes:
@@ -157,6 +174,9 @@ class RingManagerApplication(object):
                     request=req,
                     headers={'Allow': ', '.join(
                         self._allowed_methods(route))})
+            if (not self.writable and
+                    req.method not in route.read_only_methods):
+                return self._readonly_response(req)
             return route.handler(req, **match.groupdict())
         return HTTPNotFound(request=req)
 
@@ -206,6 +226,8 @@ class RingManagerApplication(object):
                 'id': RING_MANAGER_API_VERSION,
                 'url': '%s/' % RING_MANAGER_API_PREFIX,
             }],
+            'mode': self.mode,
+            'writable': self.writable,
             'links': self._api_links(),
         }
         if api_version is not None:
@@ -224,6 +246,9 @@ class RingManagerApplication(object):
             'service': self.server_type,
             'version': swift_version,
             'status': 'ok',
+            'mode': self.mode,
+            'writable': self.writable,
+            'latest_ring_version': self.store.get_latest_ring_version_id(),
             'ring_build_executor': self.ring_build_executor,
             'build_job_lease_timeout': self.build_job_lease_timeout,
             'ring_builds': self.store.ring_build_queue_stats(

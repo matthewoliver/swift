@@ -19,6 +19,14 @@ The service framework provides:
 * directory-backed JSON state with locked, atomic, durable writes; and
 * normal Swift process management through ``swift-init``.
 
+High availability starts with one writable ``primary`` and any number of
+``readonly`` or ``standby`` replicas.
+Replicas serve read-only routes from synchronized state and artefact
+directories, while the primary remains the only service that can change
+builder state, queue builds, or publish releases.
+The bulk partition-risk POST is analysis rather than a mutation and is
+available on replicas too.
+
 Ring-specific resources are owned by an internal controller.
 This keeps HTTP dispatch and process lifecycle in the WSGI application while
 allowing each ring capability to add its routes and state together.

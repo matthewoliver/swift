@@ -40,8 +40,8 @@ Discovery
 ``GET /``
 ---------
 
-Returns the service name, Swift version, supported API versions, and a link to
-the status resource.
+Returns the service name, Swift version, supported API versions, service mode,
+and a link to the status resource.
 
 Example response::
 
@@ -56,9 +56,22 @@ Example response::
         "rings": "/api/v1/rings/",
         "status": "/api/v1/ring_manager/status/"
       },
+      "mode": "primary",
       "service": "ring-manager-server",
-      "version": "<swift version>"
+      "version": "<swift version>",
+      "writable": true
     }
+
+Service modes
+=============
+
+``primary`` accepts every supported request method.
+``readonly`` and ``standby`` accept each route's read-only methods and reject
+other supported methods with ``403 Forbidden``.
+This permits replicas to serve discovery, status, published releases, and
+artifact downloads while retaining one authoritative writer.
+The bulk ``POST .../partitions_at_risk/`` analysis route is explicitly
+read-only and therefore remains available in these modes.
 
 Ring resources
 ==============
@@ -520,15 +533,18 @@ Service status
 ``GET /api/v1/ring_manager/status/``
 ------------------------------------
 
-Returns the service name, Swift version, executor mode, and build queue
-summary including stale leases observed by the server.
+Returns the service mode, the latest published release, executor mode, and
+build queue summary including stale leases observed by the server.
 
 Example response::
 
     {
       "service": "ring-manager-server",
+      "mode": "primary",
       "status": "ok",
-      "version": "<swift version>"
+      "version": "<swift version>",
+      "writable": true,
+      "latest_ring_version": "release-42"
     }
 
 Method negotiation

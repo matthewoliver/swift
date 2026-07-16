@@ -252,6 +252,22 @@ class TestRingManagerApplication(unittest.TestCase):
         app = app_factory({}, ring_manager_state_dir=self.state_dir)
         self.assertIsInstance(app, RingManagerApplication)
         self.assertEqual(self.state_dir, app.store.state_dir)
+        self.assertEqual('primary', app.mode)
+        self.assertTrue(app.writable)
+
+        app = app_factory(
+            {}, ring_manager_state_dir=self.state_dir,
+            ring_manager_mode='readonly')
+        self.assertEqual('readonly', app.mode)
+        self.assertFalse(app.writable)
+
+    def test_invalid_ring_manager_mode(self):
+        with self.assertRaises(ValueError) as caught:
+            RingManagerApplication(
+                {'ring_manager_mode': 'active-active'},
+                logger=debug_logger())
+        self.assertIn(
+            'ring_manager_mode must be one of', str(caught.exception))
 
     def test_app_factory_uses_sample_config_defaults(self):
         app = app_factory({})
@@ -288,17 +304,71 @@ class TestRingManagerApplication(unittest.TestCase):
                          body['links']['ring_versions'])
         self.assertEqual('/api/v1/rings/releases/latest/',
                          body['links']['latest_ring_version'])
+        self.assertEqual('primary', body['mode'])
+        self.assertTrue(body['writable'])
 
         resp, body = self.get_json('/api/v1/')
         self.assertEqual(200, resp.status_int)
         self.assertEqual('v1', body['api_version'])
+        self.assertEqual('primary', body['mode'])
+        self.assertTrue(body['writable'])
 
     def test_status(self):
         resp, body = self.get_json('/api/v1/ring_manager/status/')
         self.assertEqual(200, resp.status_int)
         self.assertEqual('ok', body['status'])
+        self.assertEqual('primary', body['mode'])
+        self.assertTrue(body['writable'])
+        self.assertEqual(self.latest_version, body['latest_ring_version'])
         self.assertEqual('external', body['ring_build_executor'])
         self.assertEqual(0, body['ring_builds']['total'])
+
+    def test_readonly_modes_reject_mutations(self):
+        for mode in ('readonly', 'standby'):
+            app = RingManagerApplication(
+                {
+                    'ring_manager_state_dir': self.state_dir,
+                    'ring_artifact_dir': self.artifact_dir,
+                    'ring_builder_dir': self.testdir,
+                    'ring_manager_mode': mode,
+                }, logger=debug_logger())
+
+            resp, body = self.get_json('/api/v1/rings/', app=app)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual(2, body['meta']['total_count'])
+
+            resp, body = self.get_json('/api/v1/ring_manager/status/',
+                                       app=app)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual(mode, body['mode'])
+            self.assertFalse(body['writable'])
+
+            resp, body = self.json_request('/api/v1/rings/', 'POST', {
+                'name': 'Blocked',
+                'ring_type': 'object',
+                'storage_policy_index': 9,
+            }, app=app)
+            self.assertEqual(403, resp.status_int)
+            self.assertIn(mode, body['error'])
+            self.assertIn('mutating requests are disabled', body['error'])
+
+            resp, body = self.json_request('/api/v1/rings/1/', 'PATCH', {
+                'name': 'Blocked',
+            }, app=app)
+            self.assertEqual(403, resp.status_int)
+            self.assertIn(mode, body['error'])
+
+            resp, body = self.json_request(
+                '/api/v1/rings/1/partitions_at_risk/', 'POST', {
+                    'node_ips': ['10.0.0.0'],
+                }, app=app)
+            self.assertEqual(200, resp.status_int)
+            self.assertEqual(['10.0.0.0'], body['selectors']['node_ips'])
+
+            resp, body = self.get_json('/api/v1/rings/', method='OPTIONS',
+                                       app=app)
+            self.assertEqual(200, resp.status_int)
+            self.assertIsNone(body)
 
     def test_route_contract(self):
         self.assertEqual([

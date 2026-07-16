@@ -45,6 +45,11 @@ Server options
     Whether the application writes native Swift access-log lines.
     The default is ``true``.
 
+``ring_manager_mode``
+    Service mode.
+    The default ``primary`` accepts reads and writes.
+    ``readonly`` and ``standby`` accept read-only routes and reject mutations.
+
 ``ring_manager_state_dir``
     Root of the directory-backed JSON state.
     The default is ``/etc/swift/ring-manager-state``.
@@ -104,6 +109,17 @@ the scoped FIFO queue keep overlapping work safe.
     The default is ``1000``.
     The request is rejected before a builder is loaded when this limit is
     exceeded.
+
+High availability modes
+=======================
+
+``primary`` is the authoritative writer and accepts every supported method.
+``readonly`` and ``standby`` serve read-only routes from synchronized state
+and artefact directories, but return ``403 Forbidden`` for mutations.
+The bulk ``POST .../partitions_at_risk/`` analysis route is explicitly
+read-only, so it remains available to these replicas.
+This keeps ring authoring ordered while allowing clients to use replicas for
+discovery, status, manifests, and immutable artefact downloads.
 
 Authentication options
 ======================
