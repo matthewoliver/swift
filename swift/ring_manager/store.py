@@ -263,6 +263,7 @@ class RingManagerStore(object):
                 collection, self._safe_id(obj['id']))
         if collection == 'rings' and 'id' in obj:
             obj = self._strip_builder_owned_ring_fields(obj)
+            obj['disabled'] = self.ring_is_disabled(obj)
             obj.setdefault(
                 'devices_url',
                 '/api/v1/rings/%s/devices/' % self._safe_id(obj['id']))
@@ -335,6 +336,14 @@ class RingManagerStore(object):
             ring.pop(key, None)
         return ring
 
+    def ring_is_disabled(self, ring):
+        return config_true_value(str(ring.get('disabled', False)))
+
+    def _normalize_ring_for_save(self, ring):
+        ring = self._strip_builder_owned_ring_fields(ring)
+        ring['disabled'] = self.ring_is_disabled(ring)
+        return ring
+
     def _next_id(self, objects):
         next_id = 1
         for obj in objects:
@@ -371,7 +380,7 @@ class RingManagerStore(object):
     def create_ring(self, ring):
         ring = copy.deepcopy(ring)
         ring.pop('resource_uri', None)
-        ring = self._strip_builder_owned_ring_fields(ring)
+        ring = self._normalize_ring_for_save(ring)
         ring.setdefault('id', self._default_ring_id(ring))
         try:
             self._load_dir_object('rings', ring['id'], RingNotFound)
@@ -393,7 +402,7 @@ class RingManagerStore(object):
             ring.update(updates)
         ring['id'] = existing['id']
         ring.pop('resource_uri', None)
-        ring = self._strip_builder_owned_ring_fields(ring)
+        ring = self._normalize_ring_for_save(ring)
         self._save_dir_object('rings', ring)
         return self._with_resource_uri(ring, 'rings')
 
@@ -443,6 +452,180 @@ class RingManagerStore(object):
             and self._ring_build_scopes_overlap(
                 self._ring_build_scope(build), ring_scope)
         ]
+
+    def _ring_artifact_version_id(self, version):
+        return str(version.get(
+            'swift_ring_version', version.get('version', version.get('id'))))
+
+    def _ring_artifact_version_uri(self, ring_id, version):
+        return '/api/v1/rings/%s/versions/%s/' % (
+            self._safe_id(ring_id),
+            self._safe_id(self._ring_artifact_version_id(version)))
+
+    def _ring_artifact_version_file_url(self, ring_id, version, file_info):
+        return '%sfiles/%s' % (
+            self._ring_artifact_version_uri(ring_id, version),
+            self._safe_id(file_info['name']))
+
+    def _public_ring_artifact_version_file(self, ring_id, version,
+                                           file_info):
+        public_file = copy.deepcopy(file_info)
+        validate_path_component(public_file.get('name'), 'artifact file name')
+        for key in ('path', 'artifact_dir', '_artifact_root'):
+            public_file.pop(key, None)
+        public_file['url'] = self._ring_artifact_version_file_url(
+            ring_id, version, file_info)
+        return public_file
+
+    def _public_ring_artifact_version(self, ring_id, version, latest=False):
+        public_version = copy.deepcopy(version)
+        for key in ('_artifact_root', 'artifact_dir'):
+            public_version.pop(key, None)
+        public_version['ring_id'] = ring_id
+        public_version['version'] = self._ring_artifact_version_id(version)
+        public_version.setdefault(
+            'swift_ring_version', public_version['version'])
+        public_version['resource_uri'] = self._ring_artifact_version_uri(
+            ring_id, version)
+        public_version['latest'] = latest or bool(version.get('latest'))
+        public_version['files'] = [
+            self._public_ring_artifact_version_file(
+                ring_id, version, file_info)
+            for file_info in version.get('files', [])]
+        return public_version
+
+    def _ring_artifact_versions_dir(self, ring_id):
+        return self._state_dir_path('ring-versions', self._safe_id(ring_id))
+
+    def _ring_artifact_version_file(self, ring_id, version_id):
+        directory = self._ring_artifact_versions_dir(ring_id)
+        if directory is None:
+            return None
+        return os.path.join(directory, '%s.json' % self._safe_id(version_id))
+
+    def _ring_artifact_versions(self, ring_id):
+        directory = self._ring_artifact_versions_dir(ring_id)
+        if directory is None:
+            return []
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError as err:
+            if err.errno == errno.ENOENT:
+                return []
+            raise
+        versions = []
+        for name in names:
+            if not name.endswith('.json'):
+                continue
+            path = os.path.join(directory, name)
+            version = self._read_json_file(path)
+            if version is None:
+                continue
+            if not isinstance(version, dict):
+                raise ValueError('%s must be a JSON object' % path)
+            version.setdefault('ring_id', ring_id)
+            if str(version['ring_id']) != str(ring_id):
+                raise ValueError(
+                    'ring artifact version ring_id %r does not match %r' % (
+                        version['ring_id'], ring_id))
+            version_id = validate_artifact_version_id(
+                self._ring_artifact_version_id(version),
+                'ring artifact version')
+            path_id = unquote(name[:-5])
+            if version_id != path_id:
+                raise ValueError(
+                    'ring artifact version %r does not match state path %r' %
+                    (version_id, path_id))
+            version['_artifact_root'] = directory
+            versions.append(version)
+        return versions
+
+    def _find_ring_artifact_version(self, ring_id, version_id):
+        if version_id == 'latest':
+            return self._find_latest_ring_artifact_version(ring_id)
+        version_id = str(version_id)
+        for version in self._ring_artifact_versions(ring_id):
+            if self._ring_artifact_version_id(version) == version_id:
+                return version
+        raise RingVersionNotFound(version_id)
+
+    def _find_latest_ring_artifact_version(self, ring_id):
+        ring = self.get_ring(ring_id)
+        for key in ('latest_swift_ring_version', 'latest_version'):
+            if ring.get(key) is not None:
+                return self._find_ring_artifact_version(ring_id, ring[key])
+        for version in self._ring_artifact_versions(ring_id):
+            if version.get('latest'):
+                return version
+        raise RingVersionNotFound('latest')
+
+    def list_ring_artifact_versions(self, ring_id):
+        self.get_ring(ring_id)
+        try:
+            latest_id = self._ring_artifact_version_id(
+                self._find_latest_ring_artifact_version(ring_id))
+        except RingVersionNotFound:
+            latest_id = None
+        return [
+            self._public_ring_artifact_version(
+                ring_id, version,
+                latest=self._ring_artifact_version_id(version) == latest_id)
+            for version in self._ring_artifact_versions(ring_id)]
+
+    def get_ring_artifact_version(self, ring_id, version_id):
+        latest = version_id == 'latest'
+        version = self._find_ring_artifact_version(ring_id, version_id)
+        if not latest:
+            try:
+                latest = self._ring_artifact_version_id(version) == \
+                    self._ring_artifact_version_id(
+                        self._find_latest_ring_artifact_version(ring_id))
+            except RingVersionNotFound:
+                latest = False
+        return self._public_ring_artifact_version(
+            ring_id, version, latest=latest)
+
+    def get_ring_artifact_version_record(self, ring_id, version_id):
+        version = copy.deepcopy(
+            self._find_ring_artifact_version(ring_id, version_id))
+        version.pop('_artifact_root', None)
+        return version
+
+    def get_concrete_ring_artifact_version_id(self, ring_id, version_id):
+        return self._ring_artifact_version_id(
+            self._find_ring_artifact_version(ring_id, version_id))
+
+    def ring_artifact_version_exists(self, ring_id, version_id):
+        try:
+            self._find_ring_artifact_version(ring_id, version_id)
+        except RingVersionNotFound:
+            return False
+        return True
+
+    def get_ring_artifact_version_file(self, ring_id, version_id, file_name):
+        version = self._find_ring_artifact_version(ring_id, version_id)
+        for file_info in version.get('files', []):
+            if file_info.get('name') == file_name:
+                file_info = copy.deepcopy(file_info)
+                file_info['path'] = self._resolve_artifact_path(
+                    version, file_info)
+                return version, file_info
+        raise RingVersionFileNotFound(file_name)
+
+    def save_ring_artifact_version(self, ring_id, version):
+        self.get_ring(ring_id)
+        version = copy.deepcopy(version)
+        version.setdefault('ring_id', ring_id)
+        version_id = validate_artifact_version_id(
+            self._ring_artifact_version_id(version),
+            'ring artifact version')
+        if self.ring_artifact_version_exists(ring_id, version_id):
+            raise ValueError(
+                'ring %s artifact version %s already exists' % (
+                    ring_id, version_id))
+        self._write_json_file(
+            self._ring_artifact_version_file(ring_id, version_id), version)
+        return self._public_ring_artifact_version(ring_id, version)
 
     def _ring_versions(self):
         releases_dir = self._state_dir_path('releases')
@@ -566,6 +749,32 @@ class RingManagerStore(object):
                     version, file_info)
                 return version, file_info
         raise RingVersionFileNotFound(file_name)
+
+    def ring_version_exists(self, version_id):
+        try:
+            self._find_ring_version(version_id)
+        except RingVersionNotFound:
+            return False
+        return True
+
+    def save_ring_version(self, version):
+        version = copy.deepcopy(version)
+        version_id = validate_artifact_version_id(
+            self._ring_version_id(version), 'release version')
+        if self.ring_version_exists(version_id):
+            raise ValueError(
+                'published ring version %s already exists' % version_id)
+        self._write_json_file(
+            self._state_dir_path(
+                'releases', self._safe_id(version_id), 'manifest.json'),
+            version)
+        return self._public_ring_version(version)
+
+    def set_latest_ring_version(self, version_id):
+        index = self._state_index()
+        index['latest_ring_version'] = str(version_id)
+        self._write_json_file(self._state_dir_path('index.json'), index)
+        return copy.deepcopy(index)
 
     def _timestamp_float(self, obj, keys=('created_at', 'updated_at')):
         for key in keys:

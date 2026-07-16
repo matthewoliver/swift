@@ -14,6 +14,7 @@
 
 import argparse
 import errno
+import hashlib
 import json
 import math
 import os
@@ -24,6 +25,7 @@ import urllib.request as urllib_request
 from urllib.parse import quote, urlencode, urljoin
 
 from swift.common.ring.utils import parse_add_value, parse_search_value
+from swift.common.utils import mkdirs
 from swift.ring_manager.common import load_secret
 
 
@@ -354,6 +356,8 @@ def _ring_payload_from_args(args):
             payload[key] = value
     if args.builder_file:
         payload['builder_files'] = args.builder_file
+    if args.disabled is not None:
+        payload['disabled'] = args.disabled
     payload.update(_parse_key_values(args.set_values))
     if not payload:
         raise RingManagerCLIError('No ring fields specified')
@@ -634,6 +638,117 @@ def _rings_part_power_action(client, args):
             quote(args.ring_id, safe=''), args.part_power_action))
 
 
+def _rings_build_payload(args):
+    payload = {}
+    if args.seed is not None:
+        payload['seed'] = args.seed
+    if args.format_version is not None:
+        payload['format_version'] = args.format_version
+    payload.update(_parse_key_values(args.set_values))
+    return payload
+
+
+def _rings_build(client, args):
+    return _request_or_dry_run(
+        client, args, 'POST', '/api/v1/rings/%s/versions/' %
+        quote(args.ring_id, safe=''), _rings_build_payload(args))
+
+
+def _versions_list(client, args):
+    return client.request('GET', '/api/v1/rings/releases/')
+
+
+def _versions_publish_payload(args):
+    payload = {}
+    if args.version is not None:
+        payload['version'] = args.version
+    if args.ring:
+        payload['rings'] = args.ring
+    if args.seed is not None:
+        payload['seed'] = args.seed
+    if args.format_version is not None:
+        payload['format_version'] = args.format_version
+    payload.update(_parse_key_values(args.set_values))
+    return payload
+
+
+def _versions_publish(client, args):
+    return _request_or_dry_run(
+        client, args, 'POST', '/api/v1/rings/releases/',
+        _versions_publish_payload(args))
+
+
+def _versions_show(client, args):
+    version = args.version or 'latest'
+    return client.request(
+        'GET', '/api/v1/rings/releases/%s/' % quote(version, safe=''))
+
+
+def _versions_manifest(client, args):
+    version = args.version or 'latest'
+    return client.request(
+        'GET', '/api/v1/rings/releases/%s/manifest/' %
+        quote(version, safe=''))
+
+
+def _artifact_name(file_info):
+    name = file_info.get('name')
+    if not name:
+        raise RingManagerCLIError('Manifest file entry is missing name')
+    return os.path.basename(name)
+
+
+def _verify_artifact(body, file_info, path):
+    expected_bytes = file_info.get('bytes')
+    if expected_bytes is not None and len(body) != expected_bytes:
+        raise RingManagerCLIError(
+            '%s has %d bytes, expected %d' % (
+                path, len(body), expected_bytes))
+    expected_sha256 = file_info.get('sha256')
+    if expected_sha256 is not None:
+        actual = hashlib.sha256(body).hexdigest()
+        if actual != expected_sha256:
+            raise RingManagerCLIError(
+                '%s sha256 mismatch: got %s, expected %s' % (
+                    path, actual, expected_sha256))
+
+
+def _write_artifact(output_dir, file_info, body):
+    mkdirs(output_dir)
+    path = os.path.join(output_dir, _artifact_name(file_info))
+    temp_path = '%s.tmp' % path
+    with open(temp_path, 'wb') as fp:
+        fp.write(body)
+    os.rename(temp_path, path)
+    return path
+
+
+def _versions_download(client, args):
+    version = args.version or 'latest'
+    manifest = client.request(
+        'GET', '/api/v1/rings/releases/%s/manifest/' %
+        quote(version, safe=''))
+    files = _require_list(manifest.get('files'), 'manifest files')
+    downloaded = []
+    for file_info in files:
+        _require_object(file_info, 'manifest file')
+        url = file_info.get('url')
+        if not url:
+            concrete_version = manifest.get('version', version)
+            url = '/api/v1/rings/releases/%s/files/%s' % (
+                quote(str(concrete_version), safe=''),
+                quote(_artifact_name(file_info), safe=''))
+        body, _headers = client.request('GET', url, parse_json=False)
+        path = os.path.join(args.output_dir, _artifact_name(file_info))
+        _verify_artifact(body, file_info, path)
+        downloaded.append(_write_artifact(args.output_dir, file_info, body))
+    return {
+        'version': manifest.get('version', version),
+        'output_dir': args.output_dir,
+        'files': downloaded,
+    }
+
+
 def _devices_list(client, args):
     return client.request(
         'GET', '/api/v1/rings/%s/devices/' % quote(args.ring_id, safe=''))
@@ -769,6 +884,13 @@ def _add_ring_payload_args(parser):
     parser.add_argument(
         '--policy-type',
         help='Storage policy type, such as replication or erasure_coding.')
+    disabled_group = parser.add_mutually_exclusive_group()
+    disabled_group.add_argument(
+        '--disabled', action='store_true', default=None,
+        help='Exclude this ring from published cluster manifests.')
+    disabled_group.add_argument(
+        '--enabled', dest='disabled', action='store_false', default=None,
+        help='Include this ring in future published cluster manifests.')
     parser.add_argument(
         '--part-power', type=int,
         help='Ring partition power.')
@@ -895,6 +1017,21 @@ def make_parser():
         help='Required acknowledgement that this deletes a logical ring '
              'metadata record.')
     rings_delete.set_defaults(func=_rings_delete)
+    rings_build = ring_sub.add_parser(
+        'build',
+        help='Build an artifact for one logical ring without a release.')
+    rings_build.add_argument(
+        'ring_id',
+        help='Ring ID to build without publishing a cluster manifest.')
+    rings_build.add_argument(
+        '--seed', help='Seed value passed to RingBuilder.rebalance.')
+    rings_build.add_argument(
+        '--format-version', type=int, choices=(1, 2),
+        help='Serialized ring format version. Default: Swift default.')
+    rings_build.add_argument(
+        '--set', dest='set_values', action='append', default=[],
+        help='Set an arbitrary JSON field as KEY=VALUE.')
+    rings_build.set_defaults(func=_rings_build)
 
     devices = subparsers.add_parser(
         'devices', help='Manage ring device membership metadata.')
@@ -967,6 +1104,51 @@ def make_parser():
         '--details', action='store_true', default=None,
         help='Include partition ID lists in partitions_at_risk output.')
     analyze.set_defaults(func=_analyze)
+
+    versions = subparsers.add_parser(
+        'versions', help='Manage published ring release manifests.')
+    ver_sub = versions.add_subparsers(dest='versions_command')
+    ver_sub.required = True
+    versions_list = ver_sub.add_parser('list', help='List published releases.')
+    versions_list.set_defaults(func=_versions_list)
+    versions_publish = ver_sub.add_parser(
+        'publish', help='Build artifacts and publish a complete release.')
+    versions_publish.add_argument(
+        '--version',
+        help='Immutable release version ID. Defaults to generated.')
+    versions_publish.add_argument(
+        '--ring', action='append',
+        help='Ring ID to rebuild. May be repeated. Other enabled rings are '
+             'carried forward.')
+    versions_publish.add_argument(
+        '--seed', help='Seed value passed to RingBuilder.rebalance.')
+    versions_publish.add_argument(
+        '--format-version', type=int, choices=(1, 2),
+        help='Serialized ring format version. Default: Swift default.')
+    versions_publish.add_argument(
+        '--set', dest='set_values', action='append', default=[],
+        help='Set an arbitrary JSON field as KEY=VALUE.')
+    versions_publish.set_defaults(func=_versions_publish)
+    versions_show = ver_sub.add_parser('show', help='Show one release.')
+    versions_show.add_argument(
+        'version', nargs='?', help='Release version. Defaults to latest.')
+    versions_show.set_defaults(func=_versions_show)
+    versions_latest = ver_sub.add_parser(
+        'latest', help='Show the latest published release.')
+    versions_latest.set_defaults(func=_versions_show, version='latest')
+    versions_manifest = ver_sub.add_parser(
+        'manifest', help='Show a release manifest.')
+    versions_manifest.add_argument(
+        'version', nargs='?', help='Release version. Defaults to latest.')
+    versions_manifest.set_defaults(func=_versions_manifest)
+    versions_download = ver_sub.add_parser(
+        'download', help='Download and verify all release artifacts.')
+    versions_download.add_argument(
+        'version', nargs='?', help='Release version. Defaults to latest.')
+    versions_download.add_argument(
+        '--output-dir', required=True,
+        help='Directory where ring artifacts are written.')
+    versions_download.set_defaults(func=_versions_download)
 
     return parser
 

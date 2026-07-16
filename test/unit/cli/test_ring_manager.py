@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import io
 import json
 import os
@@ -402,6 +403,71 @@ nodes:
         self.assertEqual('', stderr)
         self.assertEqual('prepared', json.loads(stdout)
                          ['partition_power_increase_state'])
+
+    def test_rings_build_posts_artifact_only_request(self):
+        opener = FakeOpener({
+            ('POST', '/api/v1/rings/object-1/versions/'):
+            json_response({'ring_id': 'object-1', 'version': '7'}),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'rings', 'build', 'object-1', '--seed', '1',
+            '--format-version', '1',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual({'format_version': 1, 'seed': '1'},
+                         json.loads(
+                             opener.requests[0]['body'].decode('ascii')))
+        self.assertEqual('object-1', json.loads(stdout)['ring_id'])
+
+    def test_versions_publish_posts_complete_release_request(self):
+        opener = FakeOpener({
+            ('POST', '/api/v1/rings/releases/'):
+            json_response({'version': 'release-demo'}),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'versions', 'publish', '--version', 'release-demo',
+            '--ring', 'account', '--ring', 'container', '--seed', '1',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual({
+            'rings': ['account', 'container'],
+            'seed': '1',
+            'version': 'release-demo',
+        }, json.loads(opener.requests[0]['body'].decode('ascii')))
+        self.assertEqual('release-demo', json.loads(stdout)['version'])
+
+    def test_versions_download_verifies_release_artifacts(self):
+        artifact_body = b'object ring bytes'
+        artifact_sha256 = hashlib.sha256(artifact_body).hexdigest()
+        opener = FakeOpener({
+            ('GET', '/api/v1/rings/releases/latest/manifest/'):
+            json_response({
+                'version': 'release-1',
+                'files': [{
+                    'name': 'object.ring.gz',
+                    'url': '/api/v1/rings/releases/release-1/files/'
+                    'object.ring.gz',
+                    'bytes': len(artifact_body),
+                    'sha256': artifact_sha256,
+                }],
+            }),
+            ('GET', '/api/v1/rings/releases/release-1/files/object.ring.gz'):
+            FakeResponse(artifact_body),
+        })
+        output_dir = os.path.join(self.testdir, 'rings')
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'versions', 'download', 'latest', '--output-dir', output_dir,
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('release-1', json.loads(stdout)['version'])
+        with open(os.path.join(output_dir, 'object.ring.gz'), 'rb') as fp:
+            self.assertEqual(artifact_body, fp.read())
 
     def test_analysis_options_are_encoded_in_query(self):
         opener = FakeOpener({

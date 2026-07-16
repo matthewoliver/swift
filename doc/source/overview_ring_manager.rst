@@ -13,6 +13,7 @@ The service framework provides:
 * service status at ``/api/v1/ring_manager/status/``;
 * ring metadata and builder-backed device management at
   ``/api/v1/rings/``;
+* synchronous ring publication and per-ring artifact builds;
 * immutable release and builder downloads with conditional and range support;
 * separate read and administrator authentication keys;
 * directory-backed JSON state with locked, atomic, durable writes; and
@@ -114,6 +115,22 @@ Builder metadata and builder-file downloads require the administrator credential
 The service verifies that a builder resolves below ``ring_builder_dir`` and streams a private snapshot so an in-progress response is stable across concurrent builder replacement.
 The temporary snapshot is removed when the response closes.
 
+Publication
+===========
+
+``POST /api/v1/rings/releases/`` builds a release synchronously in this first
+publication workflow.
+The request either rebuilds all enabled rings or uses ``rings`` as its rebuild
+set.
+Unchanged enabled rings are carried forward from their latest immutable
+per-ring artifacts, so every release manifest remains a complete cluster
+snapshot.
+Disabled rings remain editable but are omitted from releases and cannot be
+selected for publication.
+``POST /api/v1/rings/<ring_id>/versions/`` builds one artifact without
+creating a cluster release or changing the latest release pointer.
+This permits controlled testing of disabled rings.
+
 Ring resources and builder authority
 ====================================
 
@@ -193,6 +210,7 @@ See :doc:`config/ring_server` for the server and authentication options.
 See :doc:`api/ring_manager` for ring resources, device operations, and
 response conventions.
 The ``swift-ring-manager`` CLI provides status, ring and device management,
-partition-power lifecycle actions, and read-only analysis over the same API.
+publication, release downloads, partition-power lifecycle actions, and
+read-only analysis over the same API.
 Its device commands accept ``swift-ring-builder`` shorthand or the inventory
 shape in ``etc/ring-manager-devices.yaml-sample``.

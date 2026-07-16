@@ -66,6 +66,8 @@ Ring JSON stores logical metadata only.
 Builder-owned settings and devices are read from and written to the Swift
 builder file.
 Mutating a ring or its devices does not rebalance or publish it.
+Set ``disabled: true`` on a logical ring to keep it editable while excluding it
+from cluster release manifests.
 Partition power on an existing object builder changes only through the
 explicit lifecycle actions described below.
 
@@ -121,7 +123,8 @@ Immutable release downloads
 
 Release manifests are read from ``ring_manager_state_dir/releases``.
 They describe immutable ring files below ``ring_artifact_dir`` without exposing local paths.
-This API can serve releases written by an external publication process; it does not create or select releases.
+Publishing a release synchronously rebalances its selected rings and records a
+complete enabled-ring snapshot.
 
 ``GET /api/v1/rings/releases/``
 --------------------------------
@@ -129,6 +132,18 @@ This API can serve releases written by an external publication process; it does 
 Lists known releases in the standard collection envelope.
 The optional ``cluster_id`` query parameter filters the collection.
 File entries include a download URL, byte count, MD5 digest when present, and SHA-256 integrity digest when present.
+
+``POST /api/v1/rings/releases/``
+---------------------------------
+
+Builds the selected ``rings`` and creates one immutable release manifest.
+When ``rings`` is omitted, all enabled rings are rebuilt.
+When it is supplied, unchanged enabled rings are carried forward from their
+latest per-ring artifact versions so the manifest remains complete.
+Disabled rings are omitted and cannot be selected for a release build.
+Every selected ring and every carry-forward artifact is validated before the
+first builder is modified.
+Reusing a release version returns ``400 Bad Request``.
 
 ``GET /api/v1/rings/releases/<version>/``
 ------------------------------------------------
@@ -156,6 +171,32 @@ The server resolves the manifest path below ``ring_artifact_dir`` and rejects le
 The response uses the file's MD5 digest as the HTTP ETag and exposes its SHA-256 digest in ``X-Checksum-Sha256``.
 HEAD, ``If-None-Match``, and single or multiple byte ranges use Swift's normal conditional response handling.
 The ``.../latest/files/<file_name>`` selector redirects to the concrete immutable version URL.
+
+Per-ring artifact builds
+========================
+
+``GET /api/v1/rings/<ring_id>/versions/``
+------------------------------------------
+
+Lists immutable artifact versions built for one logical ring.
+
+``POST /api/v1/rings/<ring_id>/versions/``
+-------------------------------------------
+
+Builds one ring artifact without creating a cluster release manifest or
+changing the top-level ``latest`` release pointer.
+This is useful for validating a builder and is also allowed for disabled
+rings.
+The resulting artifact version is the Swift builder version, not a caller
+supplied release version.
+
+``GET /api/v1/rings/<ring_id>/versions/<version>/``
+-----------------------------------------------------
+
+Returns one per-ring artifact record.
+The matching ``files/<file_name>`` resource streams its immutable artifact.
+The ``latest`` selectors resolve to a concrete artifact version before serving
+the file.
 
 Builder downloads
 =================

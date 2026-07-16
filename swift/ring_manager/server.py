@@ -30,6 +30,7 @@ from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
     DEFAULT_RING_MANAGER_STATE_DIR, NormalTimestamp
 from swift.ring_manager.controllers import ring as ring_controller
 from swift.ring_manager import http, routing
+from swift.ring_manager.publisher import RingBuilderPublisher
 from swift.ring_manager.store import RingManagerStore
 
 
@@ -79,9 +80,15 @@ class RingManagerApplication(object):
             self.ring_builder_dir,
             max_explicit_device_id=self.max_explicit_device_id,
             builder_lock_timeout=self.builder_lock_timeout)
+        self.publisher = RingBuilderPublisher(
+            self.store, ring_artifact_dir=ring_artifact_dir,
+            builder_manager=self.builder_manager,
+            builder_lock_timeout=self.builder_lock_timeout,
+            logger=self.logger)
         self.ring_controller = controller or ring_controller.RingController(
             store=self.store, builder_manager=self.builder_manager,
             ring_builder_dir=self.ring_builder_dir,
+            publisher=self.publisher,
             max_json_request_body_size=self.max_json_request_body_size,
             max_partitions_at_risk_selectors=(
                 self.max_partitions_at_risk_selectors))

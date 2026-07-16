@@ -84,11 +84,20 @@ List logical Swift rings.
 \fBrings show\fR \fIRING_ID\fR
 Show one logical Swift ring.
 .TP
+.B rings build
+.I RING_ID
+[\fB\-\-seed\fR \fISEED\fR]
+[\fB\-\-format-version\fR 1|2]
+Build one immutable per-ring artifact without creating a cluster release or
+changing the top-level \fBlatest\fR release pointer.
+This is also available for disabled rings.
+.TP
 \fBrings create\fR [ring field options]
 Create a logical Swift ring.
 Common fields include \fB\-\-type\fR, \fB\-\-policy-index\fR,
 \fB\-\-policy-type\fR, \fB\-\-part-power\fR, \fB\-\-replicas\fR,
-\fB\-\-min-part-hours\fR, and \fB\-\-builder-file\fR.
+\fB\-\-min-part-hours\fR, \fB\-\-builder-file\fR, \fB\-\-disabled\fR,
+and \fB\-\-enabled\fR.
 .TP
 \fBrings update\fR \fIRING_ID\fR [\fB\-\-replace\fR] [ring field options]
 Patch a logical Swift ring.
@@ -129,6 +138,39 @@ Use repeated \fB\-\-node-ip\fR, \fB\-\-replication-ip\fR, or
 \fB\-\-device-id\fR options, or pass a JSON or YAML selector body with
 \fB\-\-from-file\fR.
 Use \fB\-\-details\fR to include partition IDs.
+
+.TP
+.B versions list
+List published immutable cluster releases.
+.TP
+.B versions publish
+[\fB\-\-version\fR \fIVERSION\fR]
+[\fB\-\-ring\fR \fIRING_ID\fR]
+[\fB\-\-seed\fR \fISEED\fR]
+[\fB\-\-format-version\fR 1|2]
+Build a complete enabled-ring release manifest.
+\fB\-\-ring\fR may be repeated to select the rings to rebuild.
+Other enabled rings are carried forward from their latest per-ring artifact.
+Release version IDs cannot be reused.
+.TP
+.B versions show
+[\fIVERSION\fR]
+Show one release record.
+Defaults to \fBlatest\fR.
+.TP
+.B versions latest
+Show the latest published release.
+.TP
+.B versions manifest
+[\fIVERSION\fR]
+Show one release manifest.
+Defaults to \fBlatest\fR.
+.TP
+.B versions download
+[\fIVERSION\fR]
+\fB\-\-output-dir\fR \fIDIR\fR
+Download every artifact in a release after verifying byte counts and SHA-256
+checksums.
 
 .SH DEVICE INVENTORIES
 .PP

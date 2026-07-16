@@ -174,6 +174,23 @@ class TestRingManagerApplication(unittest.TestCase):
         })
         return builder_path
 
+    def _make_publishable_object_ring(self, ring_id, policy_index):
+        builder_path = os.path.join(self.testdir, '%s.builder' % ring_id)
+        self._make_builder(builder_path)
+        self._write_json('rings/%s.json' % ring_id, {
+            'id': ring_id,
+            'name': 'Policy %s' % policy_index,
+            'ring_type': 'object',
+            'storage_policy_index': policy_index,
+            'policy_type': 'replication',
+            'builder_files': [builder_path],
+        })
+        return builder_path
+
+    def _disable_initial_rings(self):
+        self.app.store.update_ring('1', {'disabled': True})
+        self.app.store.update_ring('2', {'disabled': True})
+
     def _write_json(self, relpath, value):
         path = os.path.join(self.state_dir, relpath)
         directory = os.path.dirname(path)
@@ -275,7 +292,8 @@ class TestRingManagerApplication(unittest.TestCase):
             ('^/api/v1/rings/membership/device/'
              '(?P<device_id>[0-9]+)/?$', ('GET',),
              'ring_membership_device'),
-            ('^/api/v1/rings/releases/?$', ('GET',), 'ring_versions'),
+            ('^/api/v1/rings/releases/?$', ('GET', 'POST'),
+             'ring_versions'),
             ('^/api/v1/rings/releases/latest/?$',
              ('GET',), 'latest_ring_version'),
             ('^/api/v1/rings/releases/latest/manifest/?$',
@@ -290,6 +308,19 @@ class TestRingManagerApplication(unittest.TestCase):
             ('^/api/v1/rings/releases/(?P<version>[^/]+)/files/'
              '(?P<file_name>[^/]+)/?$',
              ('GET',), 'ring_version_file'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/versions/?$',
+             ('GET', 'POST'), 'ring_artifact_versions'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/versions/latest/?$',
+             ('GET',), 'latest_ring_artifact_version'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/versions/latest/'
+             'files/(?P<file_name>[^/]+)/?$', ('GET',),
+             'latest_ring_artifact_version_file'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/versions/'
+             '(?P<version>[^/]+)/?$', ('GET',),
+             'ring_artifact_version_detail'),
+            ('^/api/v1/rings/(?P<ring_id>[^/]+)/versions/'
+             '(?P<version>[^/]+)/files/(?P<file_name>[^/]+)/?$',
+             ('GET',), 'ring_artifact_version_file'),
             ('^/api/v1/rings/(?P<ring_id>[^/]+)/?$',
              ('GET', 'PUT', 'PATCH', 'DELETE'), 'ring_detail'),
             ('^/api/v1/rings/(?P<ring_id>[^/]+)/devices/?$',
@@ -386,6 +417,114 @@ class TestRingManagerApplication(unittest.TestCase):
             '/api/v1/rings/releases/%s/files/%s' % (
                 quote(self.latest_version, safe=''), self.artifact_name),
             latest['files'][0]['url'])
+
+    def test_publish_release_builds_ring_artifact(self):
+        self._disable_initial_rings()
+        builder_path = self._make_publishable_object_ring('object-0', 0)
+
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-demo',
+            'rings': ['object-0'],
+            'seed': '1',
+        })
+        self.assertEqual(201, resp.status_int)
+        self.assertEqual('release-demo', body['version'])
+        self.assertTrue(body['latest'])
+        self.assertEqual([{
+            'ring_id': 'object-0',
+            'swift_ring_version': body['rings'][0]['swift_ring_version'],
+        }], body['rings'])
+        self.assertTrue(os.path.exists(os.path.join(
+            self.artifact_dir, 'release-demo', 'object.ring.gz')))
+        self.assertTrue(os.path.exists(builder_path))
+
+        resp, artifact = self.get_json(
+            '/api/v1/rings/object-0/versions/latest/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('object-0', artifact['ring_id'])
+        self.assertTrue(artifact['latest'])
+        self.assertEqual('object.ring.gz', artifact['files'][0]['name'])
+
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-demo',
+            'rings': ['object-0'],
+            'force': True,
+        })
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('already exists', body['error'])
+
+    def test_publish_release_carries_enabled_rings_forward(self):
+        self._disable_initial_rings()
+        self._make_publishable_object_ring('object-0', 0)
+        self._make_publishable_object_ring('object-1', 1)
+
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-one',
+            'rings': ['object-0', 'object-1'],
+            'seed': '1',
+        })
+        self.assertEqual(201, resp.status_int)
+        first_versions = dict(
+            (ring['ring_id'], ring['swift_ring_version'])
+            for ring in body['rings'])
+
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-two',
+            'rings': ['object-0'],
+            'seed': '2',
+        })
+        self.assertEqual(201, resp.status_int)
+        self.assertEqual(['object-0', 'object-1'], [
+            ring['ring_id'] for ring in body['rings']])
+        second_versions = dict(
+            (ring['ring_id'], ring['swift_ring_version'])
+            for ring in body['rings'])
+        self.assertEqual(first_versions['object-1'],
+                         second_versions['object-1'])
+
+    def test_publish_rejects_disabled_and_missing_rings_before_building(self):
+        self._disable_initial_rings()
+        builder_path = self._make_publishable_object_ring('object-0', 0)
+        before = RingBuilder.load(builder_path).version
+        self.app.store.update_ring('object-0', {'disabled': True})
+
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-disabled',
+            'rings': ['object-0'],
+        })
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('object-0 is disabled', body['error'])
+
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-missing',
+            'rings': ['missing-ring'],
+        })
+        self.assertEqual(404, resp.status_int)
+        self.assertIsNone(body)
+        self.assertEqual(before, RingBuilder.load(builder_path).version)
+        self.assertFalse(self.app.store.ring_version_exists('release-missing'))
+
+    def test_artifact_only_build_allows_disabled_ring(self):
+        self._disable_initial_rings()
+        self._make_publishable_object_ring('object-0', 0)
+        self.app.store.update_ring('object-0', {'disabled': True})
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-0/versions/', 'POST', {'seed': '1'})
+        self.assertEqual(201, resp.status_int)
+        self.assertEqual('object-0', body['ring_id'])
+        self.assertTrue(body['latest'])
+        self.assertEqual('object.ring.gz', body['files'][0]['name'])
+        self.assertEqual(self.latest_version,
+                         self.app.store.get_latest_ring_version_id())
+
+    def test_release_endpoint_rejects_artifact_only_request(self):
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'artifact_only': True,
+            'ring_id': '1',
+        })
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('/api/v1/rings/<ring_id>/versions/', body['error'])
 
     def test_ring_versions_cluster_filter(self):
         resp, body = self.get_json(
