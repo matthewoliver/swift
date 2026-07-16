@@ -26,6 +26,9 @@ directories, while the primary remains the only service that can change
 builder state, queue builds, or publish releases.
 The bulk partition-risk POST is analysis rather than a mutation and is
 available on replicas too.
+swift-ring-manager-sync pulls the primary's latest complete release and its
+immutable artefacts into a replica, then records the result through
+/recon/ring_manager when the recon middleware is in the pipeline.
 
 Ring-specific resources are owned by an internal controller.
 This keeps HTTP dispatch and process lifecycle in the WSGI application while

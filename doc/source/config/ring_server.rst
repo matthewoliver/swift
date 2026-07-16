@@ -12,7 +12,7 @@ Paste pipeline
 A minimal authenticated pipeline is::
 
     [pipeline:main]
-    pipeline = catch_errors healthcheck ring-manager-auth ring-manager-server
+    pipeline = catch_errors healthcheck recon ring-manager-auth ring-manager-server
 
     [app:ring-manager-server]
     use = egg:swift#ring_manager
@@ -22,6 +22,9 @@ A minimal authenticated pipeline is::
 
     [filter:healthcheck]
     use = egg:swift#healthcheck
+
+    [filter:recon]
+    use = egg:swift#recon
 
     [filter:catch_errors]
     use = egg:swift#catch_errors
@@ -120,6 +123,26 @@ The bulk ``POST .../partitions_at_risk/`` analysis route is explicitly
 read-only, so it remains available to these replicas.
 This keeps ring authoring ordered while allowing clients to use replicas for
 discovery, status, manifests, and immutable artefact downloads.
+
+swift-ring-manager-sync pulls one primary's latest published release into
+a read-only or standby server.
+It verifies the declared byte count and SHA-256 digest before recording each
+immutable artefact, then writes the local release manifest and advances
+latest_ring_version only after the full pull succeeds.
+
+For example::
+
+    swift-ring-manager-sync https://primary.example.com:6205 \
+        --ring-manager-state-dir /etc/swift/ring-manager-state \
+        --ring-artifact-dir /etc/swift/ring-manager-artifacts \
+        --admin-key changeme
+
+The source URL is supplied explicitly in this initial utility.
+Source failover and configuration-file support are separate follow-on work.
+The command records its latest attempt in ring-manager.recon below the
+recon cache directory.
+Place recon before ring-manager-auth to expose /recon/ring_manager without an
+operator credential.
 
 Authentication options
 ======================

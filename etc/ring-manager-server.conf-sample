@@ -17,7 +17,7 @@ bind_port = 6205
 # log_format = {remote_addr} - - [{time.d}/{time.b}/{time.Y}:{time.H}:{time.M}:{time.S} +0000] "{method} {path}" {status} {content_length} "{referer}" "{txn_id}" "{user_agent}" {trans_time:.4f} "{additional_info}" {pid} {policy_index}
 
 [pipeline:main]
-pipeline = catch_errors healthcheck ring-manager-auth ring-manager-server
+pipeline = catch_errors healthcheck recon ring-manager-auth ring-manager-server
 
 [app:ring-manager-server]
 use = egg:swift#ring_manager
@@ -90,6 +90,10 @@ use = egg:swift#ring_manager_auth
 [filter:healthcheck]
 use = egg:swift#healthcheck
 # disable_path =
+
+[filter:recon]
+use = egg:swift#recon
+# recon_cache_path = /var/cache/swift
 
 [filter:catch_errors]
 use = egg:swift#catch_errors

@@ -244,6 +244,24 @@ The response uses the file's MD5 digest as the HTTP ETag and exposes its SHA-256
 HEAD, ``If-None-Match``, and single or multiple byte ranges use Swift's normal conditional response handling.
 The ``.../latest/files/<file_name>`` selector redirects to the concrete immutable version URL.
 
+Replica pull workflow
+=====================
+
+swift-ring-manager-sync pulls the primary's
+/api/v1/rings/releases/latest/manifest/ document, each immutable release
+artefact, ring metadata, and the referenced per-ring version records.
+It validates the supplied byte counts and SHA-256 digests.
+The command records local paths rather than source URLs, writes the release
+manifest, and advances the mutable latest_ring_version pointer only after the
+pull completes.
+Existing valid artefacts use If-None-Match and may receive 304 Not Modified.
+
+The initial command accepts one explicit primary URL.
+It does not make source-fallback, freshness, promotion, or transaction
+guarantees beyond advancing the local latest pointer last.
+Its latest success or error is available from /recon/ring_manager when the
+recon middleware is configured.
+
 Per-ring artifact builds
 ========================
 

@@ -26,7 +26,7 @@ from swift.common.swob import Request, Response
 from swift.common.utils import get_logger, SWIFT_CONF_FILE, md5_hash_for_file
 from swift.common.recon import RECON_OBJECT_FILE, RECON_CONTAINER_FILE, \
     RECON_ACCOUNT_FILE, RECON_DRIVE_FILE, RECON_RELINKER_FILE, \
-    DEFAULT_RECON_CACHE_PATH
+    RECON_RING_MANAGER_FILE, DEFAULT_RECON_CACHE_PATH
 
 
 class ReconMiddleware(object):
@@ -60,6 +60,8 @@ class ReconMiddleware(object):
                                               RECON_DRIVE_FILE)
         self.relink_recon_cache = os.path.join(self.recon_cache_path,
                                                RECON_RELINKER_FILE)
+        self.ring_manager_recon_cache = os.path.join(
+            self.recon_cache_path, RECON_RING_MANAGER_FILE)
         self.account_ring_path = os.path.join(swift_dir, 'account.ring.gz')
         self.container_ring_path = os.path.join(swift_dir, 'container.ring.gz')
 
@@ -361,6 +363,13 @@ class ReconMiddleware(object):
                                       self.relink_recon_cache,
                                       ignore_missing=True)
 
+    def get_ring_manager_info(self):
+        """get ring-manager sync info, if any"""
+
+        return self._from_recon_cache(['ring_manager_sync'],
+                                      self.ring_manager_recon_cache,
+                                      ignore_missing=True)
+
     def GET(self, req):
         root, rcheck, rtype = req.split_path(1, 3, True)
         all_rtypes = ['account', 'container', 'object']
@@ -407,6 +416,8 @@ class ReconMiddleware(object):
             content = self.get_sharding_info()
         elif rcheck == "relinker":
             content = self.get_relinker_info()
+        elif rcheck == "ring_manager":
+            content = self.get_ring_manager_info()
         elif rcheck == "reconstruction" and rtype == 'object':
             content = self.get_reconstruction_info()
         else:
