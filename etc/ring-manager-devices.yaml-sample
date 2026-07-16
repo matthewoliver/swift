@@ -1,0 +1,29 @@
+# Example inventory for swift-ring-manager devices add/replace.
+#
+# Each device listed under a node expands into one ring device.
+
+nodes:
+  - id: node-42
+    region: 2
+    zone: 7
+    ip: 10.0.7.42
+    port: 6200
+    replication_ip: 10.1.7.42
+    replication_port: 6200
+    devices:
+      - name: sdb
+        weight: 100.0
+      - name: sdc
+        weight: 100.0
+  - id: node-43
+    region: 2
+    zone: 8
+    ip: 10.0.8.43
+    port: 6200
+    replication_ip: 10.1.8.43
+    replication_port: 6200
+    devices:
+      - name: sdb
+        weight: 100.0
+      - name: sdc
+        weight: 100.0

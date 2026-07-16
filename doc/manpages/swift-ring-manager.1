@@ -1,0 +1,174 @@
+.\"
+.\" Licensed under the Apache License, Version 2.0 (the "License");
+.\" you may not use this file except in compliance with the License.
+.\" You may obtain a copy of the License at
+.\"
+.\"    http://www.apache.org/licenses/LICENSE-2.0
+.\"
+.\" Unless required by applicable law or agreed to in writing, software
+.\" distributed under the License is distributed on an "AS IS" BASIS,
+.\" WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+.\" implied.
+.\" See the License for the specific language governing permissions and
+.\" limitations under the License.
+.\"
+.TH SWIFT-RING-MANAGER "1" "July 2026" "OpenStack Swift"
+
+.SH NAME
+swift\-ring\-manager \- manage a Swift ring-manager service over HTTP
+
+.SH SYNOPSIS
+.B swift\-ring\-manager
+[\fIglobal-options\fR] \fIcommand\fR [\fIcommand-options\fR]
+
+.SH DESCRIPTION
+.PP
+.B swift-ring-manager
+is an operator CLI for the Swift ring-manager control-plane API.
+It manages ring metadata and builder-backed device membership, and reports
+ring analysis.
+It talks to a running
+.B swift-ring-manager-server
+and follows its read and write restrictions.
+Mutating commands must target a server in
+.B primary
+mode.
+
+.SH GLOBAL OPTIONS
+.TP
+\fB\-\-url\fR \fIURL\fR
+Ring-manager base URL.
+If omitted, the tool uses \fBSWIFT_RING_MANAGER_URL\fR or
+\fBRING_MANAGER_URL\fR.
+.TP
+\fB\-\-admin-key\fR \fIKEY\fR
+Value to send in \fBX-Ring-Manager-Admin-Key\fR.
+The environment alternatives are \fBSWIFT_RING_MANAGER_ADMIN_KEY\fR and
+\fBRING_MANAGER_ADMIN_KEY\fR.
+.TP
+\fB\-\-admin-key-file\fR \fIPATH\fR
+File containing the admin key.
+.TP
+\fB\-\-read-key\fR \fIKEY\fR
+Value to send in \fBX-Ring-Manager-Read-Key\fR for read requests.
+.TP
+\fB\-\-read-key-file\fR \fIPATH\fR
+File containing the read key.
+.TP
+\fB\-\-auth-token\fR \fITOKEN\fR
+Value to send in \fBX-Auth-Token\fR for requests using the admin credential.
+.TP
+\fB\-\-read-auth-token\fR \fITOKEN\fR
+Value to send in \fBX-Auth-Token\fR for requests using the read credential.
+.TP
+\fB\-\-timeout\fR \fISECONDS\fR
+HTTP request timeout.
+The default is 30 seconds.
+.TP
+\fB\-\-json\fR
+Print complete command results as JSON.
+List commands print compact tables by default.
+.TP
+\fB\-\-dry-run\fR
+For mutating commands, print the HTTP method, path, and body without sending
+the request.
+
+.SH COMMANDS
+.TP
+\fBstatus\fR
+Show ring-manager service status.
+.TP
+\fBrings list\fR
+List logical Swift rings.
+.TP
+\fBrings show\fR \fIRING_ID\fR
+Show one logical Swift ring.
+.TP
+\fBrings create\fR [ring field options]
+Create a logical Swift ring.
+Common fields include \fB\-\-type\fR, \fB\-\-policy-index\fR,
+\fB\-\-policy-type\fR, \fB\-\-part-power\fR, \fB\-\-replicas\fR,
+\fB\-\-min-part-hours\fR, and \fB\-\-builder-file\fR.
+.TP
+\fBrings update\fR \fIRING_ID\fR [\fB\-\-replace\fR] [ring field options]
+Patch a logical Swift ring.
+With \fB\-\-replace\fR, use PUT instead of PATCH.
+.TP
+\fBrings delete\fR \fIRING_ID\fR \fB\-\-confirm\fR
+Delete a logical Swift ring metadata record.
+The explicit confirmation prevents an accidental destructive invocation.
+.TP
+\fBrings part-power\fR \fIprepare|increase|cancel|finish\fR \fIRING_ID\fR
+Run one step in an object-ring partition-power-increase lifecycle.
+Publishing and relinking remain separate operator actions.
+.TP
+\fBdevices list\fR \fIRING_ID\fR
+List builder device records for a ring.
+.TP
+\fBdevices add\fR \fIRING_ID\fR [\fB\-\-from-file\fR \fIFILE\fR|\fIDEVICE_SPEC WEIGHT\fR ...]
+Add builder device records from a JSON or YAML inventory, or from
+swift-ring-builder-style shorthand.
+.TP
+\fBdevices remove\fR \fIRING_ID\fR [\fB\-\-from-file\fR \fIFILE\fR|\fIDEVICE_SELECTOR\fR ...]
+Mark matching builder devices for removal.
+Selectors use the same shorthand accepted by \fBswift-ring-builder\fR, such
+as \fBd0\fR or \fB/sdb\fR.
+.TP
+\fBdevices replace\fR \fIRING_ID\fR [\fB\-\-from-file\fR \fIFILE\fR|\fIDEVICE_SPEC WEIGHT\fR ...]
+Replace the active builder device set for a ring.
+.TP
+\fBanalyze parts|rebalance|dispersion|at_risk|count_parts\fR \fIRING_ID\fR
+Request the matching read-only analysis endpoint.
+\fBanalyze dispersion\fR accepts \fB\-\-level\fR.
+\fBanalyze count_parts\fR accepts repeated \fB\-\-replication-ip\fR values
+and \fB\-\-risk-count\fR.
+.TP
+\fBanalyze partitions_at_risk\fR \fIRING_ID\fR [selectors]
+Check a down-node or down-device scenario without modifying a builder.
+Use repeated \fB\-\-node-ip\fR, \fB\-\-replication-ip\fR, or
+\fB\-\-device-id\fR options, or pass a JSON or YAML selector body with
+\fB\-\-from-file\fR.
+Use \fB\-\-details\fR to include partition IDs.
+
+.SH DEVICE INVENTORIES
+.PP
+Device add and replace accept a direct API payload with a top-level
+\fBdevices\fR list, or an inventory with a top-level \fBnodes\fR list.
+Node inventories expand each disk into an explicit Swift device record.
+See \fIetc/ring-manager-devices.yaml-sample\fR for an example.
+
+.SH EXAMPLES
+.TP
+Show status:
+.IP
+.nf
+swift-ring-manager --url http://ring.example.com:6205 status
+.fi
+.TP
+Create an object ring:
+.IP
+.nf
+swift-ring-manager --url http://ring.example.com:6205 \\
+  rings create --type object --policy-index 0 \\
+  --policy-type replication --part-power 18 --replicas 3 \\
+  --min-part-hours 1 --builder-file object.builder
+.fi
+.TP
+Add a device using ring-builder shorthand:
+.IP
+.nf
+swift-ring-manager --url http://ring.example.com:6205 \\
+  devices add object-0 r1z1-10.0.0.1:6200/sdb 100
+.fi
+.TP
+Check the effect of a failed node:
+.IP
+.nf
+swift-ring-manager --url http://ring.example.com:6205 \\
+  analyze partitions_at_risk object-0 --node-ip 10.0.0.1
+.fi
+
+.SH DOCUMENTATION
+.LP
+More documentation about OpenStack Swift is available at
+.BI https://docs.openstack.org/swift/latest/

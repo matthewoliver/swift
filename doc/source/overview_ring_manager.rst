@@ -192,3 +192,7 @@ Configuration and API references
 See :doc:`config/ring_server` for the server and authentication options.
 See :doc:`api/ring_manager` for ring resources, device operations, and
 response conventions.
+The ``swift-ring-manager`` CLI provides status, ring and device management,
+partition-power lifecycle actions, and read-only analysis over the same API.
+Its device commands accept ``swift-ring-builder`` shorthand or the inventory
+shape in ``etc/ring-manager-devices.yaml-sample``.

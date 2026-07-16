@@ -1,0 +1,1008 @@
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import errno
+import json
+import math
+import os
+import socket
+import sys
+import urllib.request as urllib_request
+
+from urllib.parse import quote, urlencode, urljoin
+
+from swift.common.ring.utils import parse_add_value, parse_search_value
+from swift.ring_manager.common import load_secret
+
+
+USER_AGENT = 'swift-ring-manager'
+
+
+class RingManagerCLIError(Exception):
+    pass
+
+
+class RingManagerClient(object):
+    def __init__(self, url, admin_key=None, admin_key_file=None,
+                 auth_token=None, read_key=None, read_key_file=None,
+                 read_auth_token=None, timeout=30, opener=None):
+        if not url:
+            raise RingManagerCLIError(
+                'Ring manager URL is required. Use --url or set '
+                'SWIFT_RING_MANAGER_URL.')
+        self.url = url.rstrip('/')
+        try:
+            self.admin_key = load_secret(
+                admin_key, 'admin_key', admin_key_file, 'admin_key_file')
+            self.read_key = load_secret(
+                read_key, 'read_key', read_key_file, 'read_key_file')
+        except ValueError as err:
+            raise RingManagerCLIError(str(err))
+        self.auth_token = auth_token
+        self.read_auth_token = read_auth_token
+        self.timeout = timeout
+        self.opener = opener or urllib_request.urlopen
+
+    def _url(self, path_or_url):
+        return urljoin(self.url + '/', path_or_url)
+
+    def _headers(self, method, headers=None, admin=False, read_only=False):
+        request_headers = {'User-Agent': USER_AGENT}
+        read_only = (read_only or method in ('GET', 'HEAD')) and not admin
+        has_read_credentials = read_only and (
+            self.read_key or self.read_auth_token)
+        if admin and self.admin_key:
+            request_headers['X-Ring-Manager-Admin-Key'] = self.admin_key
+        elif read_only and self.read_key:
+            request_headers['X-Ring-Manager-Read-Key'] = self.read_key
+        elif not has_read_credentials and self.admin_key:
+            request_headers['X-Ring-Manager-Admin-Key'] = self.admin_key
+        if admin and self.auth_token:
+            request_headers['X-Auth-Token'] = self.auth_token
+        elif read_only and self.read_auth_token:
+            request_headers['X-Auth-Token'] = self.read_auth_token
+        elif not has_read_credentials and self.auth_token:
+            request_headers['X-Auth-Token'] = self.auth_token
+        if headers:
+            request_headers.update(headers)
+        return request_headers
+
+    def request(self, method, path_or_url, body=None, headers=None,
+                parse_json=True, admin=False, read_only=False,
+                acceptable_statuses=None):
+        acceptable_statuses = set(acceptable_statuses or ())
+        data = None
+        if body is not None:
+            data = json.dumps(body, sort_keys=True).encode('ascii')
+            headers = dict(headers or {})
+            headers.setdefault('Content-Type', 'application/json')
+        url = self._url(path_or_url)
+        request_headers = self._headers(
+            method, headers, admin=admin, read_only=read_only)
+        req = urllib_request.Request(
+            url, data=data, headers=request_headers, method=method)
+        try:
+            resp = self.opener(req, timeout=self.timeout)
+        except urllib_request.HTTPError as err:
+            err_body = err.read()
+            if err.code in acceptable_statuses:
+                if not parse_json:
+                    return err_body, err.headers
+                return self._response_body(
+                    method, url, err.code, err_body, parse_json)
+            message = err_body.decode('utf-8', 'replace')
+            raise RingManagerCLIError(
+                '%s %s failed with HTTP %s: %s' % (
+                    method, url, err.code, message))
+        except (urllib_request.URLError, socket.timeout) as err:
+            raise RingManagerCLIError(
+                '%s %s failed: %s' % (method, url, err))
+
+        status = getattr(resp, 'status', None)
+        if status is None:
+            status = getattr(resp, 'code', None)
+        if status is None and hasattr(resp, 'getcode'):
+            status = resp.getcode()
+        if status is None:
+            status = 200
+        resp_body = resp.read()
+        if (status < 200 or status >= 300) and \
+                status not in acceptable_statuses:
+            raise RingManagerCLIError(
+                '%s %s failed with HTTP %s: %s' % (
+                    method, url, status,
+                    resp_body.decode('utf-8', 'replace')))
+        if not parse_json:
+            return resp_body, resp.info()
+        return self._response_body(
+            method, url, status, resp_body, parse_json)
+
+    def _response_body(self, method, url, status, resp_body, parse_json):
+        if not resp_body:
+            return None
+        try:
+            return json.loads(resp_body.decode('utf-8'))
+        except (TypeError, ValueError, UnicodeDecodeError) as err:
+            raise RingManagerCLIError(
+                '%s %s returned invalid JSON: %s' % (method, url, err))
+
+
+def _load_yaml(path):
+    try:
+        import yaml
+    except ImportError:
+        raise RingManagerCLIError(
+            'PyYAML is required to read %s. Install PyYAML or use JSON.' %
+            path)
+    try:
+        with open(path, 'r') as fp:
+            value = yaml.safe_load(fp)
+    except IOError as err:
+        raise RingManagerCLIError('Unable to read %s: %s' % (path, err))
+    except yaml.YAMLError as err:
+        raise RingManagerCLIError('Invalid YAML in %s: %s' % (path, err))
+    return value
+
+
+def load_structured_file(path):
+    try:
+        with open(path, 'r') as fp:
+            body = fp.read()
+    except IOError as err:
+        raise RingManagerCLIError('Unable to read %s: %s' % (path, err))
+    try:
+        value = json.loads(body)
+    except ValueError:
+        return _load_yaml(path)
+    return value
+
+
+def _require_object(value, name):
+    if not isinstance(value, dict):
+        raise RingManagerCLIError('%s must be an object' % name)
+    return value
+
+
+def _require_list(value, name):
+    if not isinstance(value, list) or not value:
+        raise RingManagerCLIError('%s must be a non-empty list' % name)
+    return value
+
+
+def _json_scalar(value):
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def _parse_key_values(values):
+    parsed = {}
+    for item in values or []:
+        if '=' not in item:
+            raise RingManagerCLIError(
+                '--set values must use KEY=VALUE syntax: %s' % item)
+        key, value = item.split('=', 1)
+        if not key:
+            raise RingManagerCLIError('--set values require a key')
+        parsed[key] = _json_scalar(value)
+    return parsed
+
+
+def _node_id(node):
+    return node.get('id', node.get('node_id'))
+
+
+def _expand_node_inventory(data):
+    if 'devices' in data:
+        devices = _require_list(data['devices'], 'devices')
+        for device in devices:
+            if isinstance(device, dict):
+                if not device.get('label'):
+                    raise RingManagerCLIError(
+                        'device entries require label')
+            elif not device:
+                raise RingManagerCLIError(
+                    'device entries cannot be empty')
+        return {'devices': devices}
+
+    nodes = _require_list(data.get('nodes'), 'nodes')
+    devices = []
+    node_keys = (
+        'region', 'zone', 'ip', 'port', 'replication_ip',
+        'replication_port')
+    for node in nodes:
+        _require_object(node, 'node')
+        node_id = _node_id(node)
+        node_devices = _require_list(node.get('devices'), 'node devices')
+        for item in node_devices:
+            _require_object(item, 'node device')
+            device_name = item.get('device', item.get('name'))
+            if not device_name:
+                raise RingManagerCLIError(
+                    'node device entries require name or device')
+            device = {}
+            if node_id is not None:
+                device['node_id'] = node_id
+            for key in node_keys:
+                if node.get(key) is not None:
+                    device[key] = node[key]
+            device.update(dict(
+                (key, value) for key, value in item.items()
+                if key != 'name'))
+            device.setdefault('device', device_name)
+            device.setdefault('label', '%s:%s' % (
+                node_id, device_name) if node_id is not None else device_name)
+            if device.get('weight') is None and node.get('weight') is not None:
+                device['weight'] = node['weight']
+            devices.append(device)
+    return {'devices': devices}
+
+
+def load_devices_payload(path):
+    return _expand_node_inventory(
+        _require_object(load_structured_file(path), path))
+
+
+def parse_device_add_value(value):
+    original_value = value
+    device_id = None
+    if value.startswith('d'):
+        index = 1
+        while index < len(value) and value[index].isdigit():
+            index += 1
+        if index == 1:
+            raise RingManagerCLIError(
+                'Invalid device id in %s' % original_value)
+        device_id = int(value[1:index])
+        value = value[index:]
+    try:
+        device = parse_add_value(value)
+    except ValueError as err:
+        raise RingManagerCLIError(str(err))
+    if device.get('region') is None:
+        device['region'] = 1
+    if device.get('replication_ip') is None:
+        device['replication_ip'] = device['ip']
+    if device.get('replication_port') is None:
+        device['replication_port'] = device['port']
+    if device_id is not None:
+        device['id'] = device_id
+    return device
+
+
+def parse_device_add_values(values):
+    values = list(values or [])
+    if not values or len(values) % 2:
+        raise RingManagerCLIError(
+            'device shorthand requires DEVICE_SPEC WEIGHT pairs')
+    devices = []
+    for index in range(0, len(values), 2):
+        device_spec = values[index]
+        weight_value = values[index + 1]
+        device = parse_device_add_value(device_spec)
+        try:
+            weight = float(weight_value)
+        except (TypeError, ValueError):
+            raise RingManagerCLIError(
+                'Invalid weight value for %s: %s' % (
+                    device_spec, weight_value))
+        if not math.isfinite(weight) or weight < 0:
+            raise RingManagerCLIError(
+                'Invalid weight value for %s: %s' % (
+                    device_spec, weight_value))
+        device['weight'] = weight
+        devices.append(device)
+    return {'devices': devices}
+
+
+def parse_device_search_values(values):
+    values = list(values or [])
+    if not values:
+        raise RingManagerCLIError('No device selectors specified')
+    devices = []
+    for value in values:
+        try:
+            device = parse_search_value(value)
+        except ValueError as err:
+            raise RingManagerCLIError(str(err))
+        if not device:
+            raise RingManagerCLIError('Device selector cannot be empty')
+        devices.append(device)
+    return {'devices': devices}
+
+
+def load_devices_payload_from_args(args, add_values=False):
+    device_values = getattr(args, 'device_values', None) or []
+    if args.from_file and device_values:
+        raise RingManagerCLIError(
+            'Use either --from-file or device shorthand arguments, not both')
+    if args.from_file:
+        return load_devices_payload(args.from_file)
+    if add_values:
+        return parse_device_add_values(device_values)
+    return parse_device_search_values(device_values)
+
+
+def _ring_payload_from_args(args):
+    payload = {}
+    if args.from_file:
+        payload.update(_require_object(
+            load_structured_file(args.from_file), args.from_file))
+    for key in ('id', 'name', 'policy_type'):
+        value = getattr(args, key, None)
+        if value is not None:
+            payload[key] = value
+    if args.ring_type is not None:
+        payload['ring_type'] = args.ring_type
+    for key in ('storage_policy_index', 'part_power',
+                'num_replicas', 'min_part_hours'):
+        value = getattr(args, key, None)
+        if value is not None:
+            payload[key] = value
+    if args.builder_file:
+        payload['builder_files'] = args.builder_file
+    payload.update(_parse_key_values(args.set_values))
+    if not payload:
+        raise RingManagerCLIError('No ring fields specified')
+    return payload
+
+
+def _request_or_dry_run(client, args, method, path, body=None,
+                        parse_json=True):
+    if args.dry_run and method not in ('GET', 'HEAD'):
+        return {'method': method, 'path': path, 'body': body}
+    return client.request(method, path, body=body, parse_json=parse_json)
+
+
+def _require_confirm(args, action):
+    if not args.confirm:
+        raise RingManagerCLIError('%s requires --confirm' % action)
+
+
+def _table_value(value):
+    if value is None:
+        return ''
+    if isinstance(value, bool):
+        return 'yes' if value else 'no'
+    if isinstance(value, (list, tuple)):
+        return ','.join(_table_value(item) for item in value)
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, separators=(',', ':'))
+    return str(value)
+
+
+def _table_column_value(row, column):
+    _heading, getter = column
+    if callable(getter):
+        value = getter(row)
+    else:
+        value = row.get(getter)
+    return _table_value(value)
+
+
+def _format_table(rows, columns):
+    rows = rows or []
+    table = [[heading for heading, _getter in columns]]
+    for row in rows:
+        table.append([
+            _table_column_value(row, column)
+            for column in columns])
+    widths = [
+        max(len(row[index]) for row in table)
+        for index in range(len(columns))]
+    lines = [
+        '  '.join(
+            table[0][index].ljust(widths[index])
+            for index in range(len(columns))),
+        '  '.join('-' * width for width in widths),
+    ]
+    lines.extend(
+        '  '.join(
+            row[index].ljust(widths[index])
+            for index in range(len(columns)))
+        for row in table[1:])
+    return '\n'.join(lines) + '\n'
+
+
+def _collection_rows(value):
+    if isinstance(value, dict):
+        return value.get('objects', [])
+    return []
+
+
+def _device_rows(value):
+    if isinstance(value, dict):
+        return value.get('devices', [])
+    return []
+
+
+def _ring_type(row):
+    return row.get('ring_type') or row.get('type') or ''
+
+
+def _policy(row):
+    policy_index = row.get('storage_policy_index')
+    policy_type = row.get('policy_type')
+    if policy_index is None:
+        return policy_type
+    if policy_type:
+        return '%s/%s' % (policy_index, policy_type)
+    return policy_index
+
+
+def _endpoint(row, ip_key='ip', port_key='port'):
+    ip = row.get(ip_key)
+    port = row.get(port_key)
+    if ip is None:
+        return ''
+    if port is None:
+        return ip
+    return '%s:%s' % (ip, port)
+
+
+def _device_state(row):
+    if row.get('pending_removal'):
+        return 'removing'
+    return 'active'
+
+
+def _format_rings_list(value):
+    return _format_table(_collection_rows(value), (
+        ('ID', 'id'),
+        ('NAME', 'name'),
+        ('TYPE', _ring_type),
+        ('POLICY', _policy),
+        ('DEVICES', 'device_count'),
+    ))
+
+
+def _format_devices_list(value):
+    return _format_table(_device_rows(value), (
+        ('ID', 'id'),
+        ('REGION', 'region'),
+        ('ZONE', 'zone'),
+        ('ENDPOINT', _endpoint),
+        ('REPLICATION', lambda row: _endpoint(
+            row, 'replication_ip', 'replication_port')),
+        ('DEVICE', 'device'),
+        ('WEIGHT', 'weight'),
+        ('STATE', _device_state),
+        ('META', 'meta'),
+    ))
+
+
+def _format_list(value):
+    if not value:
+        return 'none'
+    if isinstance(value, (list, tuple)):
+        return ','.join(str(item) for item in value)
+    return str(value)
+
+
+def _partition_group_rows(value):
+    if not isinstance(value, dict):
+        return []
+    rows = []
+    for builder in value.get('builder_summaries') or []:
+        grouped = builder.get('partitions_by_down_replica_count') or {}
+        for count, partitions in grouped.items():
+            rows.append({
+                'builder': builder.get('builder'),
+                'down_replicas': count,
+                'partition_count': len(partitions or []),
+                'partitions': partitions,
+            })
+    return sorted(
+        rows, key=lambda row: (row.get('builder') or '',
+                               -int(row['down_replicas']),
+                               row['partition_count']))
+
+
+def _builder_summary_rows(value):
+    if not isinstance(value, dict):
+        return []
+    rows = []
+    for builder in value.get('builder_summaries') or []:
+        rows.append({
+            'builder': builder.get('builder'),
+            'matched_devices': builder.get('matched_devices', 0),
+            'affected_partitions': builder.get('affected_partitions', 0),
+            'at_risk_partitions': builder.get('at_risk_partitions', 0),
+            'max_down_replicas': builder.get('max_down_replicas', 0),
+            'placement_available': builder.get('placement_available'),
+        })
+    return rows
+
+
+def _format_partitions_at_risk(value):
+    if not isinstance(value, dict):
+        return '%s\n' % value
+    summary = value.get('summary') or {}
+    selectors = value.get('selectors') or {}
+    lines = [
+        'Risk count: %s' % value.get('risk_count', ''),
+        'Node IPs: %s' % _format_list(selectors.get('node_ips')),
+        'Replication IPs: %s' % _format_list(
+            selectors.get('replication_ips')),
+        'Device IDs: %s' % _format_list(selectors.get('device_ids')),
+        'Matched devices: %s' % summary.get('matched_devices', 0),
+        'Affected partitions: %s' % summary.get('affected_partitions', 0),
+        'At-risk partitions: %s' % summary.get('at_risk_partitions', 0),
+        'Max down replicas: %s' % summary.get('max_down_replicas', 0),
+    ]
+    builder_rows = _builder_summary_rows(value)
+    if builder_rows:
+        lines.extend(('', 'Builder summaries:',
+                      _format_table(builder_rows, (
+                          ('BUILDER', 'builder'),
+                          ('MATCHED', 'matched_devices'),
+                          ('AFFECTED', 'affected_partitions'),
+                          ('AT_RISK', 'at_risk_partitions'),
+                          ('MAX_DOWN', 'max_down_replicas'),
+                          ('PLACEMENT', 'placement_available'),
+                      )).rstrip()))
+    matched_devices = value.get('matched_devices') or []
+    if matched_devices:
+        lines.extend(('', 'Matched devices:',
+                      _format_table(matched_devices, (
+                          ('BUILDER', 'builder'),
+                          ('ID', 'id'),
+                          ('REGION', 'region'),
+                          ('ZONE', 'zone'),
+                          ('ENDPOINT', _endpoint),
+                          ('REPLICATION', lambda row: _endpoint(
+                              row, 'replication_ip', 'replication_port')),
+                          ('DEVICE', 'device'),
+                      )).rstrip()))
+    rows = _partition_group_rows(value)
+    if rows:
+        lines.extend(('', 'At-risk partition groups:',
+                      _format_table(rows, (
+                          ('BUILDER', 'builder'),
+                          ('DOWN_REPLICAS', 'down_replicas'),
+                          ('COUNT', 'partition_count'),
+                          ('PARTITIONS', 'partitions'),
+                      )).rstrip()))
+    return '\n'.join(lines) + '\n'
+
+
+def _print(value, stdout, json_output=False, formatter=None):
+    if value is None:
+        return
+    if isinstance(value, bytes):
+        stdout.write(value.decode('utf-8', 'replace'))
+        if not value.endswith(b'\n'):
+            stdout.write('\n')
+        return
+    if formatter and not json_output:
+        stdout.write(formatter(value))
+        return
+    if json_output or isinstance(value, (dict, list)):
+        stdout.write(json.dumps(value, sort_keys=True, indent=2))
+        stdout.write('\n')
+    else:
+        stdout.write('%s\n' % value)
+
+
+def _rings_list(client, args):
+    return client.request('GET', '/api/v1/rings/')
+
+
+def _rings_show(client, args):
+    return client.request(
+        'GET', '/api/v1/rings/%s/' % quote(args.ring_id, safe=''))
+
+
+def _rings_create(client, args):
+    return _request_or_dry_run(
+        client, args, 'POST', '/api/v1/rings/',
+        _ring_payload_from_args(args))
+
+
+def _rings_update(client, args):
+    method = 'PUT' if args.replace else 'PATCH'
+    return _request_or_dry_run(
+        client, args, method,
+        '/api/v1/rings/%s/' % quote(args.ring_id, safe=''),
+        _ring_payload_from_args(args))
+
+
+def _rings_delete(client, args):
+    _require_confirm(args, 'rings delete')
+    return _request_or_dry_run(
+        client, args, 'DELETE',
+        '/api/v1/rings/%s/' % quote(args.ring_id, safe=''))
+
+
+def _rings_part_power_action(client, args):
+    return _request_or_dry_run(
+        client, args, 'POST',
+        '/api/v1/rings/%s/partition_power_increase/%s/' % (
+            quote(args.ring_id, safe=''), args.part_power_action))
+
+
+def _devices_list(client, args):
+    return client.request(
+        'GET', '/api/v1/rings/%s/devices/' % quote(args.ring_id, safe=''))
+
+
+def _devices_add(client, args):
+    return _request_or_dry_run(
+        client, args, 'POST',
+        '/api/v1/rings/%s/devices/add/' % quote(args.ring_id, safe=''),
+        load_devices_payload_from_args(args, add_values=True))
+
+
+def _devices_remove(client, args):
+    return _request_or_dry_run(
+        client, args, 'POST',
+        '/api/v1/rings/%s/devices/remove/' % quote(args.ring_id, safe=''),
+        load_devices_payload_from_args(args))
+
+
+def _devices_replace(client, args):
+    return _request_or_dry_run(
+        client, args, 'PUT',
+        '/api/v1/rings/%s/devices/' % quote(args.ring_id, safe=''),
+        load_devices_payload_from_args(args, add_values=True))
+
+
+def _append_payload_values(payload, key, values):
+    values = [value for value in values or [] if value not in (None, '')]
+    if not values:
+        return
+    existing = payload.get(key)
+    if existing in (None, ''):
+        payload[key] = values
+    elif isinstance(existing, list):
+        existing.extend(values)
+    else:
+        payload[key] = [existing] + values
+
+
+def _partitions_at_risk_payload_from_args(args):
+    payload = {}
+    if args.from_file:
+        payload = _require_object(
+            load_structured_file(args.from_file), args.from_file)
+    _append_payload_values(payload, 'node_ips', args.node_ip)
+    _append_payload_values(payload, 'node_ips', args.ip)
+    _append_payload_values(payload, 'replication_ips', args.replication_ip)
+    _append_payload_values(payload, 'device_ids', args.device_id)
+    if args.risk_count is not None:
+        payload['risk_count'] = args.risk_count
+    if args.details is not None:
+        payload['details'] = bool(args.details)
+    return payload
+
+
+def _partitions_at_risk_has_selector(payload):
+    for key in ('node_ip', 'node_ips', 'ip', 'ips',
+                'replication_ip', 'replication_ips',
+                'device_id', 'device_ids'):
+        value = payload.get(key)
+        if value in (None, ''):
+            continue
+        if isinstance(value, list):
+            if any(item not in (None, '') for item in value):
+                return True
+        else:
+            return True
+    return False
+
+
+def _analyze(client, args):
+    path = '/api/v1/rings/%s/%s/' % (
+        quote(args.ring_id, safe=''), args.analysis)
+    params = []
+    if args.from_file and args.analysis != 'partitions_at_risk':
+        raise RingManagerCLIError(
+            '--from-file is only supported for partitions_at_risk')
+    if args.analysis == 'dispersion' and args.level:
+        params.append(('level', args.level))
+    if args.analysis == 'count_parts':
+        for ip in args.replication_ip or []:
+            params.append(('replication_ip', ip))
+        if args.risk_count is not None:
+            params.append(('risk_count', args.risk_count))
+    if args.analysis == 'partitions_at_risk':
+        args.formatter = _format_partitions_at_risk
+        payload = _partitions_at_risk_payload_from_args(args)
+        if not _partitions_at_risk_has_selector(payload):
+            raise RingManagerCLIError(
+                'partitions_at_risk requires at least one down selector')
+        if args.from_file:
+            return client.request('POST', path, body=payload, read_only=True)
+        for ip in args.node_ip or []:
+            params.append(('node_ip', ip))
+        for ip in args.ip or []:
+            params.append(('ip', ip))
+        for ip in args.replication_ip or []:
+            params.append(('replication_ip', ip))
+        for device_id in args.device_id or []:
+            params.append(('device_id', device_id))
+        if args.risk_count is not None:
+            params.append(('risk_count', args.risk_count))
+        include_details = args.details
+        if include_details is None:
+            include_details = False
+        params.append(('details', 'true' if include_details else 'false'))
+    if params:
+        path = '%s?%s' % (path, urlencode(params))
+    return client.request('GET', path)
+
+
+def _status(client, args):
+    return client.request('GET', '/api/v1/ring_manager/status/')
+
+
+def _add_ring_payload_args(parser):
+    parser.add_argument(
+        '--from-file',
+        help='Read ring fields from a JSON or YAML object file.')
+    parser.add_argument(
+        '--id',
+        help='Explicit ring ID. If omitted, the server derives one.')
+    parser.add_argument(
+        '--name',
+        help='Human-readable ring name.')
+    parser.add_argument(
+        '--type', dest='ring_type',
+        choices=('account', 'container', 'object'),
+        help='Swift ring type.')
+    parser.add_argument(
+        '--policy-index', dest='storage_policy_index', type=int,
+        help='Storage policy index for object rings.')
+    parser.add_argument(
+        '--policy-type',
+        help='Storage policy type, such as replication or erasure_coding.')
+    parser.add_argument(
+        '--part-power', type=int,
+        help='Ring partition power.')
+    parser.add_argument(
+        '--replicas', '--num-replicas', dest='num_replicas', type=float,
+        help='Ring replica count.')
+    parser.add_argument(
+        '--min-part-hours', type=int,
+        help='Minimum hours before a partition can move again.')
+    parser.add_argument(
+        '--builder-file', action='append',
+        help='Builder file path. May be repeated.')
+    parser.add_argument(
+        '--set', dest='set_values', action='append', default=[],
+        help='Set an arbitrary JSON field as KEY=VALUE.')
+
+
+def make_parser():
+    parser = argparse.ArgumentParser(
+        prog='swift-ring-manager',
+        description='Manage a Swift ring-manager service over HTTP.')
+    parser.add_argument(
+        '--url',
+        default=os.environ.get('SWIFT_RING_MANAGER_URL') or
+        os.environ.get('RING_MANAGER_URL'),
+        help='Ring-manager base URL. Default: SWIFT_RING_MANAGER_URL')
+    parser.add_argument(
+        '--admin-key',
+        default=os.environ.get('SWIFT_RING_MANAGER_ADMIN_KEY') or
+        os.environ.get('RING_MANAGER_ADMIN_KEY'),
+        help='Value for X-Ring-Manager-Admin-Key.')
+    parser.add_argument(
+        '--admin-key-file',
+        default=os.environ.get('SWIFT_RING_MANAGER_ADMIN_KEY_FILE') or
+        os.environ.get('RING_MANAGER_ADMIN_KEY_FILE'),
+        help='File containing X-Ring-Manager-Admin-Key value.')
+    parser.add_argument(
+        '--read-key',
+        default=os.environ.get('SWIFT_RING_MANAGER_READ_KEY') or
+        os.environ.get('RING_MANAGER_READ_KEY'),
+        help='Value for X-Ring-Manager-Read-Key.')
+    parser.add_argument(
+        '--read-key-file',
+        default=os.environ.get('SWIFT_RING_MANAGER_READ_KEY_FILE') or
+        os.environ.get('RING_MANAGER_READ_KEY_FILE'),
+        help='File containing X-Ring-Manager-Read-Key value.')
+    parser.add_argument(
+        '--auth-token',
+        default=os.environ.get('SWIFT_RING_MANAGER_AUTH_TOKEN') or
+        os.environ.get('RING_MANAGER_AUTH_TOKEN'),
+        help='Value for X-Auth-Token.')
+    parser.add_argument(
+        '--read-auth-token',
+        default=os.environ.get('SWIFT_RING_MANAGER_READ_AUTH_TOKEN') or
+        os.environ.get('RING_MANAGER_READ_AUTH_TOKEN'),
+        help='Read-only value to send in X-Auth-Token.')
+    parser.add_argument(
+        '--timeout', type=float, default=30,
+        help='HTTP request timeout in seconds. Default: 30')
+    parser.add_argument(
+        '--json', action='store_true',
+        help='Print full command results as JSON. List commands print '
+             'tables by default.')
+    parser.add_argument(
+        '--dry-run', action='store_true',
+        help='For mutating commands, print the request without sending it.')
+
+    subparsers = parser.add_subparsers(dest='command')
+    subparsers.required = True
+
+    status = subparsers.add_parser(
+        'status', help='Show ring-manager service status.')
+    status.set_defaults(func=_status)
+
+    rings = subparsers.add_parser(
+        'rings', help='Manage logical Swift ring metadata.')
+    ring_sub = rings.add_subparsers(dest='rings_command')
+    ring_sub.required = True
+    rings_list = ring_sub.add_parser('list', help='List logical Swift rings.')
+    rings_list.set_defaults(func=_rings_list, formatter=_format_rings_list)
+    rings_show = ring_sub.add_parser(
+        'show', help='Show one logical Swift ring.')
+    rings_show.add_argument(
+        'ring_id',
+        help='Ring ID, such as account, container, object-0, or object-1.')
+    rings_show.set_defaults(func=_rings_show)
+    rings_part_power = ring_sub.add_parser(
+        'part-power',
+        help='Run an object-ring partition power increase lifecycle action.')
+    part_power_sub = rings_part_power.add_subparsers(
+        dest='part_power_action')
+    part_power_sub.required = True
+    for command, help_text in (
+            ('prepare',
+             'Prepare an object ring for a partition power increase.'),
+            ('increase',
+             'Apply a prepared object-ring partition power increase.'),
+            ('cancel',
+             'Cancel a prepared object-ring partition power increase.'),
+            ('finish',
+             'Finish cleanup for a partition power increase or '
+             'cancellation.')):
+        part_power_cmd = part_power_sub.add_parser(command, help=help_text)
+        part_power_cmd.add_argument(
+            'ring_id',
+            help='Object ring ID, such as object-0 or object-1.')
+        part_power_cmd.set_defaults(func=_rings_part_power_action)
+    rings_create = ring_sub.add_parser(
+        'create', help='Create a logical Swift ring.')
+    _add_ring_payload_args(rings_create)
+    rings_create.set_defaults(func=_rings_create)
+    rings_update = ring_sub.add_parser(
+        'update', help='Update a logical Swift ring.')
+    rings_update.add_argument('ring_id', help='Ring ID to update.')
+    rings_update.add_argument(
+        '--replace', action='store_true', help='Use PUT instead of PATCH.')
+    _add_ring_payload_args(rings_update)
+    rings_update.set_defaults(func=_rings_update)
+    rings_delete = ring_sub.add_parser(
+        'delete', help='Delete a logical Swift ring metadata record.')
+    rings_delete.add_argument('ring_id', help='Ring ID to delete.')
+    rings_delete.add_argument(
+        '--confirm', action='store_true',
+        help='Required acknowledgement that this deletes a logical ring '
+             'metadata record.')
+    rings_delete.set_defaults(func=_rings_delete)
+
+    devices = subparsers.add_parser(
+        'devices', help='Manage ring device membership metadata.')
+    dev_sub = devices.add_subparsers(dest='devices_command')
+    dev_sub.required = True
+    devices_list = dev_sub.add_parser(
+        'list', help='List device records for a ring.')
+    devices_list.add_argument('ring_id', help='Ring ID whose devices to list.')
+    devices_list.set_defaults(
+        func=_devices_list, formatter=_format_devices_list)
+    for command, func in (('add', _devices_add),
+                          ('remove', _devices_remove),
+                          ('replace', _devices_replace)):
+        dev_cmd = dev_sub.add_parser(
+            command,
+            help='%s device records for a ring.' % command.title())
+        dev_cmd.add_argument(
+            'ring_id', help='Ring ID whose devices should be changed.')
+        dev_cmd.add_argument(
+            '--from-file',
+            help='Read devices from a JSON or YAML inventory file.')
+        if command == 'remove':
+            dev_cmd.add_argument(
+                'device_values', nargs='*', metavar='DEVICE_SELECTOR',
+                help='Device selector shorthand, such as d0, /sdb, or '
+                     'r1z1-127.0.0.1:6200/sdb.')
+        else:
+            dev_cmd.add_argument(
+                'device_values', nargs='*',
+                metavar='DEVICE_SPEC_OR_WEIGHT',
+                help='Device shorthand as DEVICE_SPEC WEIGHT pairs, such as '
+                     'r1z1-127.0.0.1:6200/sdb 100. DEVICE_SPEC may include '
+                     'leading d<ID> and R<replication_ip>:'
+                     '<replication_port>.')
+        dev_cmd.set_defaults(func=func)
+
+    analyze = subparsers.add_parser(
+        'analyze', help='Run ring analysis endpoints.')
+    analyze.add_argument(
+        'analysis',
+        choices=('parts', 'rebalance', 'dispersion', 'at_risk',
+                 'count_parts', 'partitions_at_risk'),
+        help='Analysis endpoint to query.')
+    analyze.add_argument('ring_id', help='Ring ID to analyze.')
+    analyze.add_argument(
+        '--level', choices=('region', 'zone', 'ip', 'device'),
+        help='Dispersion aggregation level.')
+    analyze.add_argument(
+        '--replication-ip', action='append',
+        help='Replication IP for count_parts or partitions_at_risk. May be '
+             'repeated.')
+    analyze.add_argument(
+        '--node-ip', action='append',
+        help='Node/server IP considered down for partitions_at_risk. May be '
+             'repeated.')
+    analyze.add_argument('--ip', action='append',
+                         help='Short alias for --node-ip.')
+    analyze.add_argument(
+        '--device-id', action='append', type=int,
+        help='Swift ring device ID considered down for partitions_at_risk. '
+             'May be repeated.')
+    analyze.add_argument(
+        '--from-file',
+        help='JSON or YAML selector body for partitions_at_risk.')
+    analyze.add_argument(
+        '--risk-count', type=int,
+        help='Minimum down replica count for count_parts or '
+             'partitions_at_risk.')
+    analyze.add_argument(
+        '--details', action='store_true', default=None,
+        help='Include partition ID lists in partitions_at_risk output.')
+    analyze.set_defaults(func=_analyze)
+
+    return parser
+
+
+def main(argv=None, opener=None, stdout=None, stderr=None):
+    stdout = stdout or sys.stdout
+    stderr = stderr or sys.stderr
+    parser = make_parser()
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        if getattr(args, 'from_file', None) and \
+                hasattr(args, 'device_values'):
+            args.device_values.extend(unknown)
+        else:
+            parser.error('unrecognized arguments: %s' % ' '.join(unknown))
+    try:
+        client = RingManagerClient(
+            args.url, admin_key=args.admin_key,
+            admin_key_file=args.admin_key_file, auth_token=args.auth_token,
+            read_key=args.read_key, read_key_file=args.read_key_file,
+            read_auth_token=args.read_auth_token, timeout=args.timeout,
+            opener=opener)
+        result = args.func(client, args)
+        _print(result, stdout, json_output=args.json,
+               formatter=getattr(args, 'formatter', None))
+        if getattr(args, 'exit_status', 0):
+            return args.exit_status
+    except RingManagerCLIError as err:
+        stderr.write('ERROR: %s\n' % err)
+        return 1
+    except IOError as err:
+        if err.errno == errno.EPIPE:
+            return 0
+        raise
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
