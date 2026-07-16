@@ -26,6 +26,7 @@ from swift.common.concurrency import socket, urllib_request
 from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
     RECON_RING_MANAGER_FILE
 from swift.common.utils import NullLogger, dump_recon_cache, get_logger, mkdirs
+from swift.common.utils import md5
 
 
 USER_AGENT = 'swift-ring-manager-sync'
@@ -166,12 +167,7 @@ class RingManagerSync(object):
         return os.path.join(
             self._safe_id(version), self._safe_id(file_info['name']))
 
-    def _verify_artifact(self, path, file_info):
-        try:
-            with open(path, 'rb') as fp:
-                body = fp.read()
-        except IOError:
-            return False
+    def _body_matches(self, body, file_info):
         expected_bytes = file_info.get('bytes')
         if expected_bytes is not None and len(body) != expected_bytes:
             return False
@@ -181,6 +177,16 @@ class RingManagerSync(object):
             if actual != expected_sha256:
                 return False
         return True
+
+    def _verified_artifact_etag(self, path, file_info):
+        try:
+            with open(path, 'rb') as fp:
+                body = fp.read()
+        except IOError:
+            return None
+        if not self._body_matches(body, file_info):
+            return None
+        return md5(body, usedforsecurity=False).hexdigest()
 
     def _verify_download(self, body, file_info, url):
         expected_bytes = file_info.get('bytes')
@@ -201,9 +207,10 @@ class RingManagerSync(object):
 
     def _download_file(self, file_info, default_url, local_path):
         headers = {}
-        if file_info.get('sha256') and self._verify_artifact(
-                local_path, file_info):
-            headers['If-None-Match'] = file_info['sha256']
+        if file_info.get('sha256'):
+            etag = self._verified_artifact_etag(local_path, file_info)
+            if etag:
+                headers['If-None-Match'] = etag
         url = self._file_url(file_info, default_url)
         status, body, _headers = self._request(url, headers=headers)
         if status == 304:

@@ -539,6 +539,13 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(
             self.artifact_dir, 'release-demo', 'object.ring.gz')))
         self.assertTrue(os.path.exists(builder_path))
+        with open(os.path.join(
+                self.artifact_dir, 'release-demo', 'object.ring.gz'),
+                'rb') as fp:
+            artifact_body = fp.read()
+        self.assertEqual(
+            md5(artifact_body, usedforsecurity=False).hexdigest(),
+            body['files'][0]['md5'])
 
         resp, artifact = self.get_json(
             '/api/v1/rings/object-0/versions/latest/')
@@ -546,6 +553,9 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual('object-0', artifact['ring_id'])
         self.assertTrue(artifact['latest'])
         self.assertEqual('object.ring.gz', artifact['files'][0]['name'])
+        self.assertEqual(
+            md5(artifact_body, usedforsecurity=False).hexdigest(),
+            artifact['files'][0]['md5'])
 
         resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
             'version': 'release-demo',

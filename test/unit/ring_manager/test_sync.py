@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 from swift.common.recon import RECON_RING_MANAGER_FILE
 from swift.common.swob import Request
+from swift.common.utils import md5
 from swift.ring_manager.server import RingManagerApplication
 from swift.ring_manager.sync import RingManagerSync, RingManagerSyncError
 from test.debug_logger import debug_logger
@@ -77,6 +78,8 @@ class TestRingManagerSync(unittest.TestCase):
         self.artifact_dir = os.path.join(self.testdir, 'artifacts')
         self.recon_cache_path = os.path.join(self.testdir, 'recon')
         self.artifact_body = b'account ring bytes'
+        self.artifact_md5 = md5(
+            self.artifact_body, usedforsecurity=False).hexdigest()
         self.artifact_sha256 = hashlib.sha256(
             self.artifact_body).hexdigest()
         self.manifest = {
@@ -93,6 +96,7 @@ class TestRingManagerSync(unittest.TestCase):
                     'url': '/api/v1/rings/releases/release-1/files/'
                     'account.ring.gz',
                     'bytes': len(self.artifact_body),
+                    'md5': self.artifact_md5,
                     'sha256': self.artifact_sha256,
                 },
             ],
@@ -127,6 +131,7 @@ class TestRingManagerSync(unittest.TestCase):
                     'url': '/api/v1/rings/account/versions/12/files/'
                     'account.ring.gz',
                     'bytes': len(self.artifact_body),
+                    'md5': self.artifact_md5,
                     'sha256': self.artifact_sha256,
                 },
             ],
@@ -138,7 +143,7 @@ class TestRingManagerSync(unittest.TestCase):
     def _routes(self):
         def artifact(request):
             if request['headers'].get('If-none-match'.lower()) == \
-                    self.artifact_sha256:
+                    self.artifact_md5:
                 return FakeResponse(status=304)
             return FakeResponse(self.artifact_body)
 
@@ -269,7 +274,7 @@ class TestRingManagerSync(unittest.TestCase):
             if req['path'].endswith('/files/account.ring.gz')]
         self.assertEqual(2, len(file_requests))
         for req in file_requests:
-            self.assertEqual(self.artifact_sha256,
+            self.assertEqual(self.artifact_md5,
                              req['headers']['if-none-match'])
             self.assertEqual('secret',
                              req['headers']['x-ring-manager-admin-key'])

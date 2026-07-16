@@ -19,7 +19,7 @@ import re
 
 from swift.common import exceptions as swift_exceptions
 from swift.common.ring.ring import DEFAULT_RING_FORMAT_VERSION, RING_CODECS
-from swift.common.utils import config_true_value, lock_file, mkdirs
+from swift.common.utils import config_true_value, lock_file, md5, mkdirs
 from swift.ring_manager.builder import RingBuilderManager, \
     RingBuilderManagerError, save_builder_durable
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
@@ -114,6 +114,7 @@ class RingBuilderPublisher(object):
 
     def _artifact_info(self, publish_version, file_name, path):
         checksum = hashlib.sha256()
+        etag = md5(usedforsecurity=False)
         byte_count = 0
         with open(path, 'rb') as fp:
             while True:
@@ -122,10 +123,12 @@ class RingBuilderPublisher(object):
                     break
                 byte_count += len(body)
                 checksum.update(body)
+                etag.update(body)
         return {
             'name': file_name,
             'path': os.path.join(publish_version, file_name),
             'bytes': byte_count,
+            'md5': etag.hexdigest(),
             'sha256': checksum.hexdigest(),
         }
 
