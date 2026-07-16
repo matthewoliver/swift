@@ -654,6 +654,16 @@ def _rings_build(client, args):
         quote(args.ring_id, safe=''), _rings_build_payload(args))
 
 
+def _builds_list(client, args):
+    return client.request('GET', '/api/v1/rings/builds/')
+
+
+def _builds_show(client, args):
+    return client.request(
+        'GET', '/api/v1/rings/builds/%s/' %
+        quote(args.build_id, safe=''))
+
+
 def _versions_list(client, args):
     return client.request('GET', '/api/v1/rings/releases/')
 
@@ -1104,6 +1114,16 @@ def make_parser():
         '--details', action='store_true', default=None,
         help='Include partition ID lists in partitions_at_risk output.')
     analyze.set_defaults(func=_analyze)
+
+    builds = subparsers.add_parser(
+        'builds', help='Inspect queued and completed ring build jobs.')
+    build_sub = builds.add_subparsers(dest='builds_command')
+    build_sub.required = True
+    builds_list = build_sub.add_parser('list', help='List ring build jobs.')
+    builds_list.set_defaults(func=_builds_list)
+    builds_show = build_sub.add_parser('show', help='Show one ring build job.')
+    builds_show.add_argument('build_id', help='Build job ID.')
+    builds_show.set_defaults(func=_builds_show)
 
     versions = subparsers.add_parser(
         'versions', help='Manage published ring release manifests.')

@@ -1,0 +1,23 @@
+[DEFAULT]
+# user = swift
+# swift_dir = /etc/swift
+#
+# log_name = swift
+# log_facility = LOG_LOCAL0
+# log_level = INFO
+# log_address = /dev/log
+
+[ring-manager-builder]
+# Poll interval when no queued build job is available.
+# interval = 5
+#
+# Builder locks serialize work on one Swift builder file. The queue still
+# preserves FIFO order for overlapping build requests.
+# concurrency = 1
+# builder_lock_timeout = 600
+# build_job_lease_timeout = 3600
+#
+# This state and artifact configuration must match ring-manager-server.
+# ring_manager_state_dir = /etc/swift/ring-manager-state
+# ring_artifact_dir = /etc/swift/ring-manager-artifacts
+# ring_builder_dir = /etc/swift

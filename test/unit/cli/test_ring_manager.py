@@ -440,6 +440,21 @@ nodes:
         }, json.loads(opener.requests[0]['body'].decode('ascii')))
         self.assertEqual('release-demo', json.loads(stdout)['version'])
 
+    def test_builds_show_fetches_build_job(self):
+        opener = FakeOpener({
+            ('GET', '/api/v1/rings/builds/build-1/'):
+            json_response({'id': 'build-1', 'state': 'completed'}),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'builds', 'show', 'build-1',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('/api/v1/rings/builds/build-1/',
+                         opener.requests[0]['path'])
+        self.assertEqual('completed', json.loads(stdout)['state'])
+
     def test_versions_download_verifies_release_artifacts(self):
         artifact_body = b'object ring bytes'
         artifact_sha256 = hashlib.sha256(artifact_body).hexdigest()

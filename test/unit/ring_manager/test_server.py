@@ -26,12 +26,16 @@ from swift.common.swob import Request, Response
 from swift.common.utils import md5
 from swift.ring_manager import routing
 from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID
+from swift.ring_manager.builder_daemon import RingBuildWorker, \
+    RingManagerBuilder
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
-    DEFAULT_RING_ARTIFACT_DIR, DEFAULT_RING_BUILDER_DIR, \
-    DEFAULT_RING_MANAGER_STATE_DIR, NormalTimestamp
+    DEFAULT_RING_ARTIFACT_DIR, DEFAULT_RING_BUILD_EXECUTOR, \
+    DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
+    NormalTimestamp
 from swift.ring_manager.server import app_factory, \
     DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS, RingManagerApplication
 from swift.ring_manager.middleware.auth import RingManagerAuthMiddleware
+from swift.ring_manager.publisher import RingBuilderPublisherDeferred
 from swift.ring_manager.store import RingManagerStore, RingNotFound
 from test.debug_logger import debug_logger
 
@@ -235,6 +239,12 @@ class TestRingManagerApplication(unittest.TestCase):
             body = None
         return resp, body
 
+    def process_next_build(self):
+        worker = RingBuildWorker(
+            self.app.store, self.app.publisher, builder_id='test-builder',
+            logger=debug_logger(), lease_refresh_interval=3600)
+        return worker.process_job()
+
     def test_app_factory(self):
         app = app_factory({}, ring_manager_state_dir=self.state_dir)
         self.assertIsInstance(app, RingManagerApplication)
@@ -252,6 +262,8 @@ class TestRingManagerApplication(unittest.TestCase):
                          app.max_partitions_at_risk_selectors)
         self.assertEqual(DEFAULT_BUILDER_LOCK_TIMEOUT,
                          app.builder_lock_timeout)
+        self.assertEqual(DEFAULT_RING_BUILD_EXECUTOR,
+                         app.ring_build_executor)
 
     def test_controller_receives_store(self):
         self.assertIs(self.app.store, self.app.ring_controller._store)
@@ -267,6 +279,8 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(
             '/api/v1/ring_manager/status/', body['links']['status'])
         self.assertEqual('/api/v1/rings/', body['links']['rings'])
+        self.assertEqual('/api/v1/rings/builds/',
+                         body['links']['ring_builds'])
         self.assertEqual('/api/v1/rings/releases/',
                          body['links']['ring_versions'])
         self.assertEqual('/api/v1/rings/releases/latest/',
@@ -280,6 +294,8 @@ class TestRingManagerApplication(unittest.TestCase):
         resp, body = self.get_json('/api/v1/ring_manager/status/')
         self.assertEqual(200, resp.status_int)
         self.assertEqual('ok', body['status'])
+        self.assertEqual('external', body['ring_build_executor'])
+        self.assertEqual(0, body['ring_builds']['total'])
 
     def test_route_contract(self):
         self.assertEqual([
@@ -292,6 +308,9 @@ class TestRingManagerApplication(unittest.TestCase):
             ('^/api/v1/rings/membership/device/'
              '(?P<device_id>[0-9]+)/?$', ('GET',),
              'ring_membership_device'),
+            ('^/api/v1/rings/builds/?$', ('GET',), 'ring_builds'),
+            ('^/api/v1/rings/builds/(?P<build_id>[^/]+)/?$', ('GET',),
+             'ring_build_detail'),
             ('^/api/v1/rings/releases/?$', ('GET', 'POST'),
              'ring_versions'),
             ('^/api/v1/rings/releases/latest/?$',
@@ -427,7 +446,13 @@ class TestRingManagerApplication(unittest.TestCase):
             'rings': ['object-0'],
             'seed': '1',
         })
-        self.assertEqual(201, resp.status_int)
+        self.assertEqual(202, resp.status_int)
+        self.assertEqual('queued', body['state'])
+        self.assertTrue(resp.headers['Location'].endswith(
+            body['resource_uri']))
+        build = self.process_next_build()
+        self.assertEqual('completed', build['state'])
+        body = build['result']
         self.assertEqual('release-demo', body['version'])
         self.assertTrue(body['latest'])
         self.assertEqual([{
@@ -463,7 +488,10 @@ class TestRingManagerApplication(unittest.TestCase):
             'rings': ['object-0', 'object-1'],
             'seed': '1',
         })
-        self.assertEqual(201, resp.status_int)
+        self.assertEqual(202, resp.status_int)
+        first = self.process_next_build()
+        self.assertEqual('completed', first['state'])
+        body = first['result']
         first_versions = dict(
             (ring['ring_id'], ring['swift_ring_version'])
             for ring in body['rings'])
@@ -473,7 +501,10 @@ class TestRingManagerApplication(unittest.TestCase):
             'rings': ['object-0'],
             'seed': '2',
         })
-        self.assertEqual(201, resp.status_int)
+        self.assertEqual(202, resp.status_int)
+        second = self.process_next_build()
+        self.assertEqual('completed', second['state'])
+        body = second['result']
         self.assertEqual(['object-0', 'object-1'], [
             ring['ring_id'] for ring in body['rings']])
         second_versions = dict(
@@ -511,12 +542,127 @@ class TestRingManagerApplication(unittest.TestCase):
 
         resp, body = self.json_request(
             '/api/v1/rings/object-0/versions/', 'POST', {'seed': '1'})
-        self.assertEqual(201, resp.status_int)
+        self.assertEqual(202, resp.status_int)
+        build = self.process_next_build()
+        self.assertEqual('completed', build['state'])
+        body = build['result']
         self.assertEqual('object-0', body['ring_id'])
         self.assertTrue(body['latest'])
         self.assertEqual('object.ring.gz', body['files'][0]['name'])
         self.assertEqual(self.latest_version,
                          self.app.store.get_latest_ring_version_id())
+
+    def test_ring_builds_are_fifo_and_exclude_duplicate_versions(self):
+        self._disable_initial_rings()
+        self._make_publishable_object_ring('object-0', 0)
+
+        resp, first = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-queued',
+            'rings': ['object-0'],
+        })
+        self.assertEqual(202, resp.status_int)
+        self.assertEqual(1, first['sequence'])
+        self.assertTrue(first['id'].startswith('0000000000000001-'))
+
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-queued',
+            'rings': ['object-0'],
+        })
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('active ring build', body['error'])
+
+        resp, body = self.get_json('/api/v1/rings/builds/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(
+            [first['id']], [item['id'] for item in body['objects']])
+
+    def test_deferred_job_allows_disjoint_ring_claim(self):
+        first = self.app.store.create_ring_build({
+            'rings': ['object-0'],
+        }, NormalTimestamp(1000).internal)
+        second = self.app.store.create_ring_build({
+            'rings': ['object-1'],
+        }, NormalTimestamp(1001).internal)
+        self.app.store._update_ring_build(first['id'], {
+            'state': 'deferred',
+            'deferred_until': NormalTimestamp(2000).internal,
+        }, NormalTimestamp(1002).internal)
+
+        claimed = self.app.store.claim_ring_build(
+            'builder-b', NormalTimestamp(1003).internal)
+        self.assertEqual(second['id'], claimed['id'])
+
+    def test_claim_leases_require_current_owner(self):
+        job = self.app.store.create_ring_build({
+            'rings': ['object-0'],
+        }, NormalTimestamp(1000).internal)
+        claimed = self.app.store.claim_ring_build(
+            'builder-a', NormalTimestamp(1000).internal, lease_timeout=5)
+        self.assertEqual(job['id'], claimed['id'])
+        self.assertIsNone(self.app.store.refresh_ring_build_lease(
+            job['id'], 'builder-a', 'wrong-claim',
+            NormalTimestamp(1001).internal, lease_timeout=5))
+        self.assertIsNone(self.app.store.update_claimed_ring_build(
+            job['id'], 'builder-a', 'wrong-claim', {'state': 'completed'},
+            NormalTimestamp(1001).internal))
+        refreshed = self.app.store.refresh_ring_build_lease(
+            job['id'], 'builder-a', claimed['claimed_at'],
+            NormalTimestamp(1001).internal, lease_timeout=5)
+        self.assertEqual(NormalTimestamp(1006).internal,
+                         refreshed['lease_expires_at'])
+
+        recovered = self.app.store.claim_ring_build(
+            'builder-b', NormalTimestamp(1006).internal, lease_timeout=5)
+        self.assertEqual(job['id'], recovered['id'])
+        self.assertEqual(2, recovered['attempts'])
+
+    def test_old_persisted_build_fails_closed(self):
+        self._write_json('ring_builds/old-build.json', {
+            'id': 'old-build',
+            'state': 'queued',
+        })
+        self.assertIsNone(self.app.store.claim_ring_build(
+            'builder-a', NormalTimestamp(1000).internal))
+        build = self.app.store.get_ring_build('old-build')
+        self.assertEqual('failed', build['state'])
+        self.assertIn('lacks a durable request', build['error'])
+
+    def test_worker_defers_and_preserves_fifo_scope(self):
+        job = self.app.store.create_ring_build({
+            'rings': ['object-0'],
+        }, NormalTimestamp(1000).internal)
+        publisher = mock.Mock()
+        publisher.publish.side_effect = RingBuilderPublisherDeferred(
+            'wait for min_part_hours', reason='min_part_hours',
+            retry_after=60, ring_id='object-0')
+        worker = RingBuildWorker(
+            self.app.store, publisher, builder_id='test-builder',
+            time_func=lambda: NormalTimestamp(1000),
+            lease_refresh_interval=3600)
+
+        deferred = worker.process_job()
+        self.assertEqual('deferred', deferred['state'])
+        self.assertEqual('min_part_hours', deferred['defer_reason'])
+        self.assertEqual('object-0', deferred['deferred_ring_id'])
+        self.assertIsNone(self.app.store.claim_ring_build(
+            'other-builder', NormalTimestamp(1001).internal))
+        self.assertEqual(job['id'], deferred['id'])
+
+    def test_builder_daemon_marks_bad_job_failed(self):
+        job = self.app.store.create_ring_build({
+            'version': 'release-missing',
+            'rings': ['missing'],
+        }, NormalTimestamp(1000).internal)
+        builder = RingManagerBuilder({
+            'ring_manager_state_dir': self.state_dir,
+            'ring_artifact_dir': self.artifact_dir,
+            'ring_builder_dir': self.testdir,
+        })
+        self.assertEqual(1, builder.run_once())
+
+        build = self.app.store.get_ring_build(job['id'])
+        self.assertEqual('failed', build['state'])
+        self.assertIn('missing', build['error'])
 
     def test_release_endpoint_rejects_artifact_only_request(self):
         resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {

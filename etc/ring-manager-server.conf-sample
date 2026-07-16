@@ -47,6 +47,15 @@ use = egg:swift#ring_manager
 # builder-setting updates.
 # builder_lock_timeout = 600
 #
+# Build requests are queued for swift-ring-manager-builder by default.
+# Set manager only for development and tests, where this WSGI process claims
+# jobs with a small in-process worker pool.
+# ring_build_executor = external
+# ring_build_manager_workers = 1
+#
+# Claimed build jobs expire if their worker stops refreshing this lease.
+# build_job_lease_timeout = 3600
+#
 # Maximum JSON request body size for ring-manager API requests.
 # max_json_request_body_size = 1048576
 #

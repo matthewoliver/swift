@@ -88,8 +88,8 @@ Show one logical Swift ring.
 .I RING_ID
 [\fB\-\-seed\fR \fISEED\fR]
 [\fB\-\-format-version\fR 1|2]
-Build one immutable per-ring artifact without creating a cluster release or
-changing the top-level \fBlatest\fR release pointer.
+Queue one immutable per-ring artifact build without creating a cluster release
+or changing the top-level \fBlatest\fR release pointer.
 This is also available for disabled rings.
 .TP
 \fBrings create\fR [ring field options]
@@ -152,6 +152,14 @@ Build a complete enabled-ring release manifest.
 \fB\-\-ring\fR may be repeated to select the rings to rebuild.
 Other enabled rings are carried forward from their latest per-ring artifact.
 Release version IDs cannot be reused.
+The command returns a queued build job; use \fBbuilds show\fR to inspect it.
+.TP
+.B builds list
+List queued, building, deferred, completed, and failed ring build jobs.
+.TP
+.B builds show
+.I BUILD_ID
+Show one persistent ring build job and its result or failure detail.
 .TP
 .B versions show
 [\fIVERSION\fR]

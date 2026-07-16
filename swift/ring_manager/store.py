@@ -17,13 +17,14 @@ import errno
 import json
 import os
 import tempfile
+import uuid
 
 from urllib.parse import quote, unquote
 
 from swift.common.utils import config_true_value, fsync, fsync_dir, lock_path
-from swift.ring_manager.common import normal_timestamp_float, \
-    resolve_artifact_path, validate_artifact_version_id, \
-    validate_path_component
+from swift.ring_manager.common import DEFAULT_BUILD_JOB_LEASE_TIMEOUT, \
+    normal_timestamp_float, normal_timestamp_internal, resolve_artifact_path, \
+    validate_artifact_version_id, validate_path_component
 
 
 class RingNotFound(KeyError):
@@ -42,7 +43,29 @@ class RingVersionFileNotFound(KeyError):
     pass
 
 
+class RingBuildNotFound(KeyError):
+    pass
+
+
+class RingBuildPublishedVersionConflict(Exception):
+    def __init__(self, version):
+        self.version = version
+        super(RingBuildPublishedVersionConflict, self).__init__(
+            'published ring version %s already exists' % version)
+
+
+class RingBuildVersionConflict(Exception):
+    def __init__(self, version, build):
+        self.version = version
+        self.build = build
+        super(RingBuildVersionConflict, self).__init__(
+            'active ring build %s in state %s already exists for '
+            'version %s' % (
+                build.get('id'), build.get('state', 'unknown'), version))
+
+
 TERMINAL_RING_BUILD_STATES = ('completed', 'failed', 'cancelled')
+READY_RING_BUILD_STATES = ('queued', 'deferred')
 
 
 class RingManagerStore(object):
@@ -442,6 +465,21 @@ class RingManagerStore(object):
             return True
         return bool(first & second)
 
+    def _ring_build_is_ready(self, build, timestamp):
+        state = build.get('state')
+        if state == 'queued':
+            return True
+        if state != 'deferred':
+            return False
+        deferred_until = build.get('deferred_until')
+        if deferred_until in (None, ''):
+            return True
+        try:
+            return normal_timestamp_float(deferred_until) <= \
+                normal_timestamp_float(timestamp)
+        except (TypeError, ValueError):
+            return False
+
     def active_ring_builds_for_ring(self, ring_id, timestamp=None):
         ring_scope = set([str(ring_id)])
         builds = self._list_dir_objects('ring_builds')
@@ -452,6 +490,305 @@ class RingManagerStore(object):
             and self._ring_build_scopes_overlap(
                 self._ring_build_scope(build), ring_scope)
         ]
+
+    def _ring_build_uri(self, build):
+        return '/api/v1/rings/builds/%s/' % self._safe_id(build['id'])
+
+    def _public_ring_build(self, build):
+        build = copy.deepcopy(build)
+        if 'id' in build:
+            build['resource_uri'] = self._ring_build_uri(build)
+        return build
+
+    def _ring_build_version(self, build):
+        version = build.get('version')
+        if version is not None:
+            return str(version)
+        request = build.get('request')
+        if isinstance(request, dict) and request.get('version') is not None:
+            return str(request['version'])
+        return None
+
+    def _ring_build_is_current(self, build):
+        try:
+            return int(build.get('sequence')) > 0 and isinstance(
+                build.get('request'), dict)
+        except (TypeError, ValueError):
+            return False
+
+    def _active_ring_build_for_version(self, builds, version):
+        for build in builds:
+            if build.get('state') in TERMINAL_RING_BUILD_STATES:
+                continue
+            if self._ring_build_version(build) == str(version):
+                return build
+        return None
+
+    def _ring_build_lease_expires_at(self, timestamp, lease_timeout):
+        return normal_timestamp_internal(
+            normal_timestamp_float(timestamp) + float(lease_timeout))
+
+    def _ring_build_lease_expired(self, build, timestamp,
+                                  lease_timeout=None):
+        if build.get('state') != 'building':
+            return False
+        timestamp = normal_timestamp_float(timestamp)
+        lease_timeout = (DEFAULT_BUILD_JOB_LEASE_TIMEOUT
+                         if lease_timeout is None else float(lease_timeout))
+        lease_expires_at = build.get('lease_expires_at')
+        if lease_expires_at is not None:
+            try:
+                return normal_timestamp_float(lease_expires_at) <= timestamp
+            except (TypeError, ValueError):
+                return True
+        for key in ('claimed_at', 'started_at', 'updated_at'):
+            claimed_at = build.get(key)
+            if claimed_at is None:
+                continue
+            try:
+                return normal_timestamp_float(
+                    claimed_at) + lease_timeout <= timestamp
+            except (TypeError, ValueError):
+                return True
+        return True
+
+    def _recover_stale_ring_build(self, build, timestamp):
+        stale_claims = copy.deepcopy(build.get('stale_claims', []))
+        stale_claims.append({
+            'builder_id': build.get('builder_id'),
+            'claimed_at': build.get('claimed_at') or build.get('started_at'),
+            'lease_expires_at': build.get('lease_expires_at'),
+            'recovered_at': timestamp,
+        })
+        build.update({
+            'state': 'queued',
+            'updated_at': timestamp,
+            'stale_claims': stale_claims,
+            'stale_recovered_at': timestamp,
+            'stale_recovered_count': int(
+                build.get('stale_recovered_count', 0)) + 1,
+        })
+        for key in ('builder_id', 'claimed_at', 'started_at',
+                    'lease_expires_at', 'lease_refreshed_at',
+                    'lease_timeout'):
+            build.pop(key, None)
+        self._save_dir_object('ring_builds', build)
+
+    def list_ring_builds(self):
+        builds = self._list_dir_objects('ring_builds')
+        builds.sort(key=self._ring_build_sort_key)
+        return [self._public_ring_build(build) for build in builds]
+
+    def get_ring_build(self, build_id):
+        build = self._load_dir_object(
+            'ring_builds', build_id, RingBuildNotFound)
+        return self._public_ring_build(build)
+
+    def create_ring_build(self, request, timestamp):
+        directory = self._collection_dir('ring_builds')
+        if directory is None:
+            raise ValueError(
+                'ring_manager_state_dir is required for build requests')
+        request = copy.deepcopy(request)
+        with lock_path(directory, name='ring-build-queue'):
+            existing_builds = self._list_dir_objects('ring_builds')
+            artifact_only = config_true_value(str(
+                request.get('artifact_only', 'false')))
+            if not artifact_only and request.get('version') is not None:
+                version = str(request['version'])
+                if self.ring_version_exists(version):
+                    raise RingBuildPublishedVersionConflict(version)
+                conflict = self._active_ring_build_for_version(
+                    existing_builds, version)
+                if conflict is not None:
+                    raise RingBuildVersionConflict(
+                        version, self._public_ring_build(conflict))
+            sequences = []
+            for existing in existing_builds:
+                try:
+                    sequences.append(int(existing.get('sequence')))
+                except (TypeError, ValueError):
+                    continue
+            sequence = max(sequences or [0]) + 1
+            build = {
+                'id': '%016d-%s' % (sequence, uuid.uuid4().hex),
+                'sequence': sequence,
+                'state': 'queued',
+                'created_at': normal_timestamp_internal(timestamp),
+                'updated_at': normal_timestamp_internal(timestamp),
+                'request': request,
+            }
+            if artifact_only:
+                build['artifact_only'] = True
+                build['ring_id'] = request.get('ring_id')
+            if request.get('version') is not None:
+                build['version'] = str(request['version'])
+            if request.get('rings') is not None:
+                build['rings'] = copy.deepcopy(request['rings'])
+            self._save_dir_object('ring_builds', build)
+            return self._public_ring_build(build)
+
+    def _update_ring_build(self, build_id, updates, timestamp):
+        existing = self._load_dir_object(
+            'ring_builds', build_id, RingBuildNotFound)
+        if 'id' in updates and str(updates['id']) != str(build_id):
+            raise ValueError('Request body id does not match build id')
+        build = copy.deepcopy(existing)
+        build.update(copy.deepcopy(updates))
+        build['id'] = existing['id']
+        build['updated_at'] = normal_timestamp_internal(timestamp)
+        build.pop('resource_uri', None)
+        if build.get('state') != 'building':
+            for key in ('lease_expires_at', 'lease_refreshed_at',
+                        'lease_timeout'):
+                build.pop(key, None)
+        self._save_dir_object('ring_builds', build)
+        return self._public_ring_build(build)
+
+    def update_claimed_ring_build(self, build_id, builder_id, claimed_at,
+                                  updates, timestamp):
+        directory = self._collection_dir('ring_builds')
+        if directory is None:
+            raise ValueError(
+                'ring_manager_state_dir is required for build requests')
+        timestamp = normal_timestamp_internal(timestamp)
+        try:
+            claimed_at = normal_timestamp_internal(claimed_at)
+        except (TypeError, ValueError):
+            return None
+        with lock_path(directory, name='ring-build-queue'):
+            existing = self._load_dir_object(
+                'ring_builds', build_id, RingBuildNotFound)
+            if (existing.get('state') != 'building' or
+                    str(existing.get('builder_id')) != str(builder_id) or
+                    str(existing.get('claimed_at')) != str(claimed_at) or
+                    self._ring_build_lease_expired(existing, timestamp)):
+                return None
+            return self._update_ring_build(build_id, updates, timestamp)
+
+    def claim_ring_build(self, builder_id, timestamp, build_id=None,
+                         lease_timeout=None):
+        directory = self._collection_dir('ring_builds')
+        if directory is None:
+            raise ValueError(
+                'ring_manager_state_dir is required for build requests')
+        timestamp = normal_timestamp_internal(timestamp)
+        lease_timeout = (DEFAULT_BUILD_JOB_LEASE_TIMEOUT
+                         if lease_timeout is None else float(lease_timeout))
+        with lock_path(directory, name='ring-build-queue'):
+            builds = self._list_dir_objects('ring_builds')
+            builds.sort(key=self._ring_build_sort_key)
+            unclaimable_scopes = []
+            for candidate in builds:
+                state = candidate.get('state')
+                if state in TERMINAL_RING_BUILD_STATES:
+                    continue
+                if state == 'building':
+                    if self._ring_build_lease_expired(
+                            candidate, timestamp,
+                            lease_timeout=lease_timeout):
+                        self._recover_stale_ring_build(candidate, timestamp)
+                        state = candidate.get('state')
+                    else:
+                        return None
+                if state not in READY_RING_BUILD_STATES:
+                    candidate.update({
+                        'state': 'failed',
+                        'completed_at': timestamp,
+                        'error': 'unsupported persisted ring build state',
+                    })
+                    self._save_dir_object('ring_builds', candidate)
+                    continue
+                if not self._ring_build_is_current(candidate):
+                    candidate.update({
+                        'state': 'failed',
+                        'completed_at': timestamp,
+                        'error': 'persisted ring build lacks a durable '
+                                 'request or sequence',
+                    })
+                    self._save_dir_object('ring_builds', candidate)
+                    continue
+                candidate_scope = self._ring_build_scope(candidate)
+                blocked = any(self._ring_build_scopes_overlap(
+                    candidate_scope, scope) for scope in unclaimable_scopes)
+                if (not self._ring_build_is_ready(candidate, timestamp) or
+                        blocked):
+                    unclaimable_scopes.append(candidate_scope)
+                    if (build_id is not None and
+                            str(candidate.get('id')) == str(build_id)):
+                        return None
+                    continue
+                if (build_id is not None and
+                        str(candidate.get('id')) != str(build_id)):
+                    return None
+                candidate.update({
+                    'state': 'building',
+                    'builder_id': builder_id,
+                    'claimed_at': timestamp,
+                    'started_at': timestamp,
+                    'updated_at': timestamp,
+                    'lease_expires_at': self._ring_build_lease_expires_at(
+                        timestamp, lease_timeout),
+                    'lease_timeout': lease_timeout,
+                    'attempts': int(candidate.get('attempts', 0)) + 1,
+                })
+                for key in ('deferred_at', 'deferred_until', 'defer_reason',
+                            'deferred_ring_id', 'error'):
+                    candidate.pop(key, None)
+                self._save_dir_object('ring_builds', candidate)
+                return self._public_ring_build(candidate)
+        return None
+
+    def refresh_ring_build_lease(self, build_id, builder_id, claimed_at,
+                                 timestamp, lease_timeout=None):
+        directory = self._collection_dir('ring_builds')
+        if directory is None:
+            raise ValueError(
+                'ring_manager_state_dir is required for build requests')
+        timestamp = normal_timestamp_internal(timestamp)
+        try:
+            claimed_at = normal_timestamp_internal(claimed_at)
+        except (TypeError, ValueError):
+            return None
+        lease_timeout = (DEFAULT_BUILD_JOB_LEASE_TIMEOUT
+                         if lease_timeout is None else float(lease_timeout))
+        with lock_path(directory, name='ring-build-queue'):
+            build = self._load_dir_object(
+                'ring_builds', build_id, RingBuildNotFound)
+            if (build.get('state') != 'building' or
+                    str(build.get('builder_id')) != str(builder_id) or
+                    str(build.get('claimed_at')) != str(claimed_at) or
+                    self._ring_build_lease_expired(build, timestamp)):
+                return None
+            return self._update_ring_build(build_id, {
+                'lease_refreshed_at': timestamp,
+                'lease_expires_at': self._ring_build_lease_expires_at(
+                    timestamp, lease_timeout),
+                'lease_timeout': lease_timeout,
+            }, timestamp)
+
+    def ring_build_queue_stats(self, timestamp=None, lease_timeout=None):
+        timestamp = normal_timestamp_internal(timestamp)
+        states = {}
+        stale_building = 0
+        stale_recovered = 0
+        builds = self._list_dir_objects('ring_builds')
+        for build in builds:
+            state = str(build.get('state', 'unknown'))
+            states[state] = states.get(state, 0) + 1
+            if self._ring_build_lease_expired(
+                    build, timestamp, lease_timeout=lease_timeout):
+                stale_building += 1
+            try:
+                stale_recovered += int(build.get('stale_recovered_count', 0))
+            except (TypeError, ValueError):
+                continue
+        return {
+            'total': len(builds),
+            'states': states,
+            'stale_building': stale_building,
+            'stale_recovered': stale_recovered,
+        }
 
     def _ring_artifact_version_id(self, version):
         return str(version.get(

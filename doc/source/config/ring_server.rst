@@ -70,6 +70,30 @@ Server options
     Seconds to wait for a ring builder's exclusive mutation lock.
     The default is ``600``.
 
+``ring_build_executor``
+    Controls who consumes persistent build jobs.
+    The default ``external`` requires ``swift-ring-manager-builder``.
+    ``manager`` runs an in-process worker for development and tests only.
+
+``ring_build_manager_workers``
+    Number of in-process workers when ``ring_build_executor`` is ``manager``.
+    The default is ``1``.
+
+``build_job_lease_timeout``
+    Seconds for which a claimed job remains owned without a worker refresh.
+    Expired jobs are recovered safely into the queue.
+    The default is ``3600``.
+
+Builder worker configuration
+----------------------------
+
+``swift-ring-manager-builder`` reads ``ring-manager-builder.conf``.
+Its state, artifact, builder-directory, builder-lock, and lease settings must
+match the server.
+``concurrency`` controls concurrent claim attempts, while builder locks and
+the scoped FIFO queue keep overlapping work safe.
+``interval`` is the idle poll interval and defaults to ``5`` seconds.
+
 ``max_json_request_body_size``
     Maximum JSON request size in bytes for ring-manager API requests.
     The default is ``1048576``.

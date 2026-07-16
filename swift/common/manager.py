@@ -41,7 +41,7 @@ ALL_SERVERS = ['account-auditor', 'account-server', 'container-auditor',
                'object-expirer', 'object-replicator',
                'object-reconstructor', 'object-updater',
                'proxy-server', 'account-replicator', 'account-reaper',
-               'ring-manager-server']
+               'ring-manager-builder', 'ring-manager-server']
 MAIN_SERVERS = ['proxy-server', 'account-server', 'container-server',
                 'object-server']
 CONTROL_SERVERS = ['ring-manager-server']
@@ -55,7 +55,7 @@ SEAMLESS_SHUTDOWN_SERVERS = MAIN_SERVERS + CONTROL_SERVERS
 START_ONCE_SERVERS = REST_SERVERS
 # These are servers that match a type (account-*, container-*, object-*) but
 # don't use that type-server.conf file and instead use their own.
-STANDALONE_SERVERS = ['container-reconciler']
+STANDALONE_SERVERS = ['container-reconciler', 'ring-manager-builder']
 
 KILL_WAIT = 15  # seconds to wait for servers to die (by default)
 WARNING_WAIT = 3  # seconds to wait after message that may just be a warning

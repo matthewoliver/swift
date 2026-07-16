@@ -13,7 +13,7 @@ The service framework provides:
 * service status at ``/api/v1/ring_manager/status/``;
 * ring metadata and builder-backed device management at
   ``/api/v1/rings/``;
-* synchronous ring publication and per-ring artifact builds;
+* persistent ring build jobs and a separate publication worker;
 * immutable release and builder downloads with conditional and range support;
 * separate read and administrator authentication keys;
 * directory-backed JSON state with locked, atomic, durable writes; and
@@ -118,8 +118,8 @@ The temporary snapshot is removed when the response closes.
 Publication
 ===========
 
-``POST /api/v1/rings/releases/`` builds a release synchronously in this first
-publication workflow.
+``POST /api/v1/rings/releases/`` creates a persistent build job and returns
+quickly with its status URL.
 The request either rebuilds all enabled rings or uses ``rings`` as its rebuild
 set.
 Unchanged enabled rings are carried forward from their latest immutable
@@ -127,9 +127,15 @@ per-ring artifacts, so every release manifest remains a complete cluster
 snapshot.
 Disabled rings remain editable but are omitted from releases and cannot be
 selected for publication.
-``POST /api/v1/rings/<ring_id>/versions/`` builds one artifact without
-creating a cluster release or changing the latest release pointer.
+``POST /api/v1/rings/<ring_id>/versions/`` also creates a persistent job.
+The builder worker builds one artifact without creating a cluster release or
+changing the latest release pointer.
 This permits controlled testing of disabled rings.
+Jobs are assigned a durable monotonic sequence and are claimed by
+``swift-ring-manager-builder``.
+The queue preserves FIFO ordering for overlapping ring scopes.
+A build blocked by ``min_part_hours`` is recorded as deferred until it can
+make a useful ring change instead of publishing a no-op artifact.
 
 Ring resources and builder authority
 ====================================

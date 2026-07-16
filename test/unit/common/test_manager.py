@@ -86,6 +86,10 @@ class TestManagerModule(unittest.TestCase):
         self.assertIn('ring-manager-server', manager.CONTROL_SERVERS)
         self.assertNotIn('ring-manager-server', manager.REST_SERVERS)
         self.assertNotIn('ring-manager-server', manager.START_ONCE_SERVERS)
+        self.assertIn('ring-manager-builder', manager.REST_SERVERS)
+        self.assertIn('ring-manager-builder', manager.START_ONCE_SERVERS)
+        self.assertIn('ring-manager-builder', manager.STANDALONE_SERVERS)
+        self.assertNotIn('ring-manager-builder', manager.CONTROL_SERVERS)
         self.assertIn('ring-manager-server',
                       manager.GRACEFUL_SHUTDOWN_SERVERS)
         self.assertIn('ring-manager-server',
@@ -357,6 +361,10 @@ class TestServer(unittest.TestCase):
         self.assertEqual(server.server, 'ring-manager-server')
         self.assertEqual(server.type, 'ring-manager')
         self.assertEqual(server.cmd, 'swift-ring-manager-server')
+        server = manager.Server('ring-manager-builder')
+        self.assertEqual(server.server, 'ring-manager-builder')
+        self.assertEqual(server.type, 'ring-manager')
+        self.assertEqual(server.cmd, 'swift-ring-manager-builder')
 
     def test_server_to_string(self):
         server = manager.Server('Proxy')
@@ -394,6 +402,10 @@ class TestServer(unittest.TestCase):
         server = manager.Server('ring-manager-server')
         conf_file = self.join_swift_dir('ring-manager-server.conf')
         pid_file = self.join_run_dir('ring-manager-server.pid')
+        self.assertEqual(pid_file, server.get_pid_file_name(conf_file))
+        server = manager.Server('ring-manager-builder')
+        conf_file = self.join_swift_dir('ring-manager-builder.conf')
+        pid_file = self.join_run_dir('ring-manager-builder.pid')
         self.assertEqual(pid_file, server.get_pid_file_name(conf_file))
 
     def test_get_custom_pid_file_name(self):
@@ -438,6 +450,10 @@ class TestServer(unittest.TestCase):
         conf_file = self.join_swift_dir('ring-manager-server.conf')
         pid_file = self.join_run_dir('ring-manager-server.pid')
         self.assertEqual(conf_file, server.get_conf_file_name(pid_file))
+        server = manager.Server('ring-manager-builder')
+        conf_file = self.join_swift_dir('ring-manager-builder.conf')
+        pid_file = self.join_run_dir('ring-manager-builder.pid')
+        self.assertEqual(conf_file, server.get_conf_file_name(pid_file))
 
     def test_conf_files(self):
         # test get single conf file
@@ -464,6 +480,14 @@ class TestServer(unittest.TestCase):
             ring_manager_conf = self.join_swift_dir(
                 'ring-manager-server.conf')
             self.assertEqual(conf_file, ring_manager_conf)
+
+        with temptree(('ring-manager-builder.conf',)) as t:
+            manager.SWIFT_DIR = t
+            server = manager.Server('ring-manager-builder')
+            conf_files = server.conf_files()
+            self.assertEqual(1, len(conf_files))
+            self.assertEqual(self.join_swift_dir('ring-manager-builder.conf'),
+                             conf_files[0])
 
         # test multi server conf files & grouping of server-type config
         conf_files = (

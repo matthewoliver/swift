@@ -31,9 +31,11 @@ from swift.ring_manager.analysis import RingBuilderAnalysisError, \
 from swift.ring_manager.builder import RingBuilderManagerConflict, \
     RingBuilderManagerError
 from swift.ring_manager.publisher import RingBuilderPublisherError
+from swift.ring_manager.common import NormalTimestamp
 from swift.ring_manager.routing import Route
-from swift.ring_manager.store import RingAlreadyExists, RingNotFound, \
-    RingVersionFileNotFound, RingVersionNotFound
+from swift.ring_manager.store import RingAlreadyExists, RingBuildNotFound, \
+    RingBuildPublishedVersionConflict, RingBuildVersionConflict, \
+    RingNotFound, RingVersionFileNotFound, RingVersionNotFound
 
 
 RING_FIELDS = [
@@ -84,6 +86,7 @@ class RingController(object):
     """Own ring-specific routes and their orchestration."""
 
     def __init__(self, store, builder_manager, ring_builder_dir, publisher,
+                 ring_build_executor, build_pool, build_worker,
                  max_json_request_body_size,
                  max_partitions_at_risk_selectors,
                  file_iterable_factory=http.RingManagerFileIterable):
@@ -91,6 +94,9 @@ class RingController(object):
         self._builder_manager = builder_manager
         self._ring_builder_dir = ring_builder_dir
         self._publisher = publisher
+        self._ring_build_executor = ring_build_executor
+        self._build_pool = build_pool
+        self._build_worker = build_worker
         self._max_json_request_body_size = max_json_request_body_size
         self._max_partitions_at_risk_selectors = \
             max_partitions_at_risk_selectors
@@ -105,6 +111,10 @@ class RingController(object):
             Route(r'^/api/v1/rings/membership/device/'
                   r'(?P<device_id>[0-9]+)/?$',
                   ('GET',), self.ring_membership_device),
+            Route(r'^/api/v1/rings/builds/?$',
+                  ('GET',), self.ring_builds),
+            Route(r'^/api/v1/rings/builds/(?P<build_id>[^/]+)/?$',
+                  ('GET',), self.ring_build_detail),
             Route(r'^/api/v1/rings/releases/?$',
                   ('GET', 'POST'), self.ring_versions),
             Route(r'^/api/v1/rings/releases/latest/?$',
@@ -717,13 +727,20 @@ class RingController(object):
                     raise RingBuilderPublisherError(
                         'artifact-only builds must use '
                         '/api/v1/rings/<ring_id>/versions/')
-                version = self._publisher.publish(payload)
+                self._validate_release_build_request(payload)
+                build = self._enqueue_ring_build(payload)
             except RingNotFound:
                 return HTTPNotFound(request=req)
+            except RingBuildVersionConflict as err:
+                return self._json_error(req, HTTPConflict, str(err))
+            except RingBuildPublishedVersionConflict as err:
+                return self._json_error(req, HTTPBadRequest, str(err))
             except (RingBuilderPublisherError,
                     RingBuilderManagerError) as err:
                 return self._json_error(req, HTTPBadRequest, str(err))
-            return self._json_response(req, version, status=201)
+            return self._json_response(
+                req, build, status=202,
+                headers={'Location': build['resource_uri']})
         return self._collection_response(
             req,
             self._store.list_ring_versions(req.params.get('cluster_id')))
@@ -740,18 +757,61 @@ class RingController(object):
                         'ring artifact')
                 payload['ring_id'] = ring_id
                 payload['rings'] = [ring_id]
-                version = self._publisher.publish_artifact(payload)
+                payload['artifact_only'] = True
+                self._store.get_ring(ring_id)
+                build = self._enqueue_ring_build(payload)
             except RingNotFound:
                 return HTTPNotFound(request=req)
+            except RingBuildVersionConflict as err:
+                return self._json_error(req, HTTPConflict, str(err))
+            except RingBuildPublishedVersionConflict as err:
+                return self._json_error(req, HTTPBadRequest, str(err))
             except (RingBuilderPublisherError,
                     RingBuilderManagerError) as err:
                 return self._json_error(req, HTTPBadRequest, str(err))
-            return self._json_response(req, version, status=201)
+            return self._json_response(
+                req, build, status=202,
+                headers={'Location': build['resource_uri']})
         try:
             versions = self._store.list_ring_artifact_versions(ring_id)
         except RingNotFound:
             return HTTPNotFound(request=req)
         return self._collection_response(req, versions)
+
+    def _validate_release_build_request(self, payload):
+        ring_ids = payload.get('rings')
+        if ring_ids is None:
+            return
+        if not isinstance(ring_ids, list) or not ring_ids:
+            raise RingBuilderPublisherError('rings must be a non-empty list')
+        seen = set()
+        for ring_id in ring_ids:
+            ring = self._store.get_ring(ring_id)
+            if self._store.ring_is_disabled(ring):
+                raise RingBuilderPublisherError(
+                    'ring %s is disabled; enable it before publishing' %
+                    ring['id'])
+            if str(ring['id']) in seen:
+                raise RingBuilderPublisherError(
+                    'rings contains duplicate ring ids')
+            seen.add(str(ring['id']))
+
+    def _enqueue_ring_build(self, payload):
+        build = self._store.create_ring_build(
+            payload, NormalTimestamp.now().internal)
+        if self._ring_build_executor == 'manager':
+            self._build_pool.spawn_n(self._build_worker.process_jobs)
+        return build
+
+    def ring_builds(self, req):
+        return self._collection_response(req, self._store.list_ring_builds())
+
+    def ring_build_detail(self, req, build_id):
+        try:
+            build = self._store.get_ring_build(unquote(build_id))
+        except RingBuildNotFound:
+            return HTTPNotFound(request=req)
+        return self._json_response(req, build)
 
     def latest_ring_artifact_version(self, req, ring_id):
         ring_id = unquote(ring_id)

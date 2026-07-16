@@ -51,6 +51,7 @@ Example response::
       ],
       "links": {
         "latest_ring_version": "/api/v1/rings/releases/latest/",
+        "ring_builds": "/api/v1/rings/builds/",
         "ring_versions": "/api/v1/rings/releases/",
         "rings": "/api/v1/rings/",
         "status": "/api/v1/ring_manager/status/"
@@ -123,8 +124,28 @@ Immutable release downloads
 
 Release manifests are read from ``ring_manager_state_dir/releases``.
 They describe immutable ring files below ``ring_artifact_dir`` without exposing local paths.
-Publishing a release synchronously rebalances its selected rings and records a
-complete enabled-ring snapshot.
+Publishing creates a durable job; ``swift-ring-manager-builder`` performs the
+rebalance and records the immutable complete enabled-ring snapshot.
+
+Persistent build jobs
+=====================
+
+``GET /api/v1/rings/builds/``
+--------------------------------
+
+Lists persistent build jobs in monotonic ``sequence`` order.
+Jobs expose their state, request, attempt count, and result or failure detail.
+
+``GET /api/v1/rings/builds/<build_id>/``
+------------------------------------------
+
+Returns one queued, building, deferred, completed, or failed job.
+
+Workers claim jobs under a durable lease.
+An expired claim is recovered into FIFO order, while a worker with an old
+claim cannot update or refresh a newer claim.
+A deferred job blocks later overlapping scopes but permits disjoint explicit
+ring builds to proceed.
 
 ``GET /api/v1/rings/releases/``
 --------------------------------
@@ -136,14 +157,17 @@ File entries include a download URL, byte count, MD5 digest when present, and SH
 ``POST /api/v1/rings/releases/``
 ---------------------------------
 
-Builds the selected ``rings`` and creates one immutable release manifest.
+Creates a persistent job for the selected ``rings`` and returns
+``202 Accepted`` with a ``Location`` header for that job.
+The worker builds one immutable release manifest when it claims the job.
 When ``rings`` is omitted, all enabled rings are rebuilt.
 When it is supplied, unchanged enabled rings are carried forward from their
 latest per-ring artifact versions so the manifest remains complete.
 Disabled rings are omitted and cannot be selected for a release build.
 Every selected ring and every carry-forward artifact is validated before the
 first builder is modified.
-Reusing a release version returns ``400 Bad Request``.
+Reusing a published release version returns ``400 Bad Request``.
+An active job for the same explicit release version returns ``409 Conflict``.
 
 ``GET /api/v1/rings/releases/<version>/``
 ------------------------------------------------
@@ -183,8 +207,10 @@ Lists immutable artifact versions built for one logical ring.
 ``POST /api/v1/rings/<ring_id>/versions/``
 -------------------------------------------
 
-Builds one ring artifact without creating a cluster release manifest or
-changing the top-level ``latest`` release pointer.
+Creates a persistent artifact-only job and returns ``202 Accepted`` with its
+status URL.
+The worker builds one ring artifact without creating a cluster release manifest
+or changing the top-level ``latest`` release pointer.
 This is useful for validating a builder and is also allowed for disabled
 rings.
 The resulting artifact version is the Swift builder version, not a caller
@@ -455,7 +481,8 @@ Service status
 ``GET /api/v1/ring_manager/status/``
 ------------------------------------
 
-Returns the service name, Swift version, and basic process status.
+Returns the service name, Swift version, executor mode, and build queue
+summary including stale leases observed by the server.
 
 Example response::
 

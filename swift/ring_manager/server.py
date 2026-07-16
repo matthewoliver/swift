@@ -15,21 +15,24 @@
 import sys
 
 from swift import __version__ as swift_version
-from swift.common.concurrency import Timeout
+from swift.common.concurrency import GreenPool, Timeout
 from swift.common.swob import HTTPBadRequest, HTTPException, \
     HTTPInternalServerError, HTTPMethodNotAllowed, HTTPNotFound, Request, \
     Response, wsgi_to_str
 from swift.common.utils import config_true_value, get_log_line, get_logger, \
-    config_positive_int_value, LOG_LINE_DEFAULT_FORMAT, non_negative_float, \
-    parse_options
+    config_positive_float_value, config_positive_int_value, \
+    LOG_LINE_DEFAULT_FORMAT, non_negative_float, parse_options
 from swift.common.wsgi import run_wsgi
 from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID, \
     RingBuilderManager
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
-    DEFAULT_RING_ARTIFACT_DIR, DEFAULT_RING_BUILDER_DIR, \
-    DEFAULT_RING_MANAGER_STATE_DIR, NormalTimestamp
+    DEFAULT_BUILD_JOB_LEASE_TIMEOUT, DEFAULT_RING_ARTIFACT_DIR, \
+    DEFAULT_RING_BUILD_EXECUTOR, DEFAULT_RING_BUILD_MANAGER_WORKERS, \
+    DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
+    NormalTimestamp, RING_BUILD_EXECUTORS
 from swift.ring_manager.controllers import ring as ring_controller
 from swift.ring_manager import http, routing
+from swift.ring_manager.builder_daemon import RingBuildWorker
 from swift.ring_manager.publisher import RingBuilderPublisher
 from swift.ring_manager.store import RingManagerStore
 
@@ -85,10 +88,32 @@ class RingManagerApplication(object):
             builder_manager=self.builder_manager,
             builder_lock_timeout=self.builder_lock_timeout,
             logger=self.logger)
+        self.ring_build_executor = (conf.get(
+            'ring_build_executor', DEFAULT_RING_BUILD_EXECUTOR) or
+            DEFAULT_RING_BUILD_EXECUTOR).lower()
+        if self.ring_build_executor not in RING_BUILD_EXECUTORS:
+            raise ValueError(
+                'ring_build_executor must be one of: %s' %
+                ', '.join(RING_BUILD_EXECUTORS))
+        self.build_job_lease_timeout = config_positive_float_value(conf.get(
+            'build_job_lease_timeout', DEFAULT_BUILD_JOB_LEASE_TIMEOUT))
+        self.build_pool = None
+        self.build_worker = None
+        if self.ring_build_executor == 'manager':
+            build_workers = config_positive_int_value(conf.get(
+                'ring_build_manager_workers',
+                DEFAULT_RING_BUILD_MANAGER_WORKERS))
+            self.build_pool = GreenPool(size=build_workers)
+            self.build_worker = RingBuildWorker(
+                self.store, self.publisher, logger=self.logger,
+                lease_timeout=self.build_job_lease_timeout)
         self.ring_controller = controller or ring_controller.RingController(
             store=self.store, builder_manager=self.builder_manager,
             ring_builder_dir=self.ring_builder_dir,
             publisher=self.publisher,
+            ring_build_executor=self.ring_build_executor,
+            build_pool=self.build_pool,
+            build_worker=self.build_worker,
             max_json_request_body_size=self.max_json_request_body_size,
             max_partitions_at_risk_selectors=(
                 self.max_partitions_at_risk_selectors))
@@ -168,6 +193,7 @@ class RingManagerApplication(object):
         return {
             'status': '/api/v1/ring_manager/status/',
             'rings': '/api/v1/rings/',
+            'ring_builds': '/api/v1/rings/builds/',
             'ring_versions': '/api/v1/rings/releases/',
             'latest_ring_version': '/api/v1/rings/releases/latest/',
         }
@@ -198,6 +224,10 @@ class RingManagerApplication(object):
             'service': self.server_type,
             'version': swift_version,
             'status': 'ok',
+            'ring_build_executor': self.ring_build_executor,
+            'build_job_lease_timeout': self.build_job_lease_timeout,
+            'ring_builds': self.store.ring_build_queue_stats(
+                lease_timeout=self.build_job_lease_timeout),
         })
 
 

@@ -30,6 +30,14 @@ class RingBuilderPublisherError(RingBuilderManagerError):
     pass
 
 
+class RingBuilderPublisherDeferred(RingBuilderPublisherError):
+    def __init__(self, message, reason=None, retry_after=None, ring_id=None):
+        super(RingBuilderPublisherDeferred, self).__init__(message)
+        self.reason = reason
+        self.retry_after = retry_after
+        self.ring_id = ring_id
+
+
 class RingBuilderPublisher(object):
     """Build immutable ring artifacts and complete release manifests."""
 
@@ -65,7 +73,8 @@ class RingBuilderPublisher(object):
         ring_ids = payload.get('rings')
         if ring_ids is None:
             return [
-                ring['id'] for ring in self.store.list_rings()
+                ring['id'] for ring in self.store.list_rings(
+                    payload.get('cluster_id'))
                 if not self.store.ring_is_disabled(ring)]
         if not isinstance(ring_ids, list) or not ring_ids:
             raise RingBuilderPublisherError('rings must be a non-empty list')
@@ -129,6 +138,31 @@ class RingBuilderPublisher(object):
     def _builder_lock_path(self, builder_path):
         return '%s.lock' % builder_path
 
+    def _builder_needs_rebalance(self, builder):
+        if builder.devs_changed:
+            return True
+        # Removed devices may be reassigned even while movement is limited, so
+        # only the real rebalance attempt can decide that case safely.
+        if builder.dispersion is not None and builder.dispersion > 0:
+            return True
+        try:
+            balance = builder.get_balance()
+        except swift_exceptions.RingBuilderError:
+            return False
+        return balance > 5 and balance / 100.0 > builder.overload
+
+    def _defer_if_min_part_hours(self, ring, builder, retry_after=None):
+        if retry_after is None:
+            retry_after = builder.min_part_seconds_left
+        if retry_after <= 0 or not self._builder_needs_rebalance(builder):
+            return
+        ring_id = ring.get('id')
+        raise RingBuilderPublisherDeferred(
+            'ring %s build deferred until min_part_hours passes: '
+            '%s seconds remaining' % (ring_id, retry_after),
+            reason='min_part_hours', retry_after=retry_after,
+            ring_id=ring_id)
+
     def _preflight_ring(self, ring):
         try:
             builder = self.builder_manager.load_builder(ring)[1]
@@ -138,6 +172,7 @@ class RingBuilderPublisher(object):
         if not self.builder_manager.active_device_count(builder):
             raise RingBuilderPublisherError(
                 'ring %s has no builder devices to build' % ring.get('id'))
+        self._defer_if_min_part_hours(ring, builder)
 
     def _latest_artifact_version(self, ring):
         ring_id = ring['id']
@@ -190,9 +225,15 @@ class RingBuilderPublisher(object):
         if not self.builder_manager.active_device_count(builder):
             raise RingBuilderPublisherError(
                 'ring %s has no builder devices to build' % ring.get('id'))
+        needs_rebalance = self._builder_needs_rebalance(builder)
+        min_part_seconds_left = builder.min_part_seconds_left
         try:
             changed_parts, balance, removed_devs = builder.rebalance(
                 seed=seed)
+            if (needs_rebalance and min_part_seconds_left > 0 and
+                    not changed_parts and not removed_devs):
+                self._defer_if_min_part_hours(
+                    ring, builder, retry_after=min_part_seconds_left)
             builder.validate()
         except swift_exceptions.RingBuilderError as err:
             raise RingBuilderPublisherError(
