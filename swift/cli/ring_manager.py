@@ -655,13 +655,46 @@ def _rings_build(client, args):
 
 
 def _builds_list(client, args):
-    return client.request('GET', '/api/v1/rings/builds/')
+    params = []
+    if args.retry_of == '':
+        raise RingManagerCLIError('--retry-of must not be empty')
+    if args.retry_root == '':
+        raise RingManagerCLIError('--retry-root must not be empty')
+    if args.retry_of is not None:
+        params.append(('retry_of', args.retry_of))
+    if args.retry_root is not None:
+        params.append(('retry_root', args.retry_root))
+    path = '/api/v1/rings/builds/'
+    if params:
+        path = '%s?%s' % (path, urlencode(params))
+    return client.request('GET', path)
 
 
 def _builds_show(client, args):
     return client.request(
         'GET', '/api/v1/rings/builds/%s/' %
         quote(args.build_id, safe=''))
+
+
+def _builds_action_payload(args):
+    payload = {}
+    if args.reason is not None:
+        payload['reason'] = args.reason
+    return payload
+
+
+def _builds_cancel(client, args):
+    return _request_or_dry_run(
+        client, args, 'POST',
+        '/api/v1/rings/builds/%s/cancel/' % quote(args.build_id, safe=''),
+        _builds_action_payload(args))
+
+
+def _builds_retry(client, args):
+    return _request_or_dry_run(
+        client, args, 'POST',
+        '/api/v1/rings/builds/%s/retry/' % quote(args.build_id, safe=''),
+        _builds_action_payload(args))
 
 
 def _versions_list(client, args):
@@ -1116,14 +1149,34 @@ def make_parser():
     analyze.set_defaults(func=_analyze)
 
     builds = subparsers.add_parser(
-        'builds', help='Inspect queued and completed ring build jobs.')
+        'builds', help='Inspect persistent ring build jobs.')
     build_sub = builds.add_subparsers(dest='builds_command')
     build_sub.required = True
     builds_list = build_sub.add_parser('list', help='List ring build jobs.')
+    builds_list.add_argument(
+        '--retry-of',
+        help='List jobs directly retried from the given source build ID.')
+    builds_list.add_argument(
+        '--retry-root',
+        help='List all jobs in the retry chain rooted at the given source '
+             'build ID.')
     builds_list.set_defaults(func=_builds_list)
     builds_show = build_sub.add_parser('show', help='Show one ring build job.')
     builds_show.add_argument('build_id', help='Build job ID.')
     builds_show.set_defaults(func=_builds_show)
+    builds_cancel = build_sub.add_parser(
+        'cancel', help='Cancel a queued or deferred ring build job.')
+    builds_cancel.add_argument('build_id', help='Build job ID.')
+    builds_cancel.add_argument(
+        '--reason', help='Optional operator-visible cancellation reason.')
+    builds_cancel.set_defaults(func=_builds_cancel)
+    builds_retry = build_sub.add_parser(
+        'retry', help='Retry a failed or cancelled ring build job.')
+    builds_retry.add_argument(
+        'build_id', help='Failed or cancelled build job ID.')
+    builds_retry.add_argument(
+        '--reason', help='Optional operator-visible retry reason.')
+    builds_retry.set_defaults(func=_builds_retry)
 
     versions = subparsers.add_parser(
         'versions', help='Manage published ring release manifests.')

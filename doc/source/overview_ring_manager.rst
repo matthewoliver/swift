@@ -136,6 +136,11 @@ Jobs are assigned a durable monotonic sequence and are claimed by
 The queue preserves FIFO ordering for overlapping ring scopes.
 A build blocked by ``min_part_hours`` is recorded as deferred until it can
 make a useful ring change instead of publishing a no-op artifact.
+Operators may cancel only queued or deferred jobs.
+Cancellation records immutable terminal history and never interrupts an active
+rebalance or publication attempt.
+Failed and cancelled jobs may be retried as fresh FIFO jobs with queryable
+``retry_of`` and ``retry_root`` lineage.
 
 Ring resources and builder authority
 ====================================

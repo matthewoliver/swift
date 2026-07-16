@@ -64,6 +64,10 @@ class RingBuildVersionConflict(Exception):
                 build.get('id'), build.get('state', 'unknown'), version))
 
 
+class RingBuildStateConflict(Exception):
+    pass
+
+
 TERMINAL_RING_BUILD_STATES = ('completed', 'failed', 'cancelled')
 READY_RING_BUILD_STATES = ('queued', 'deferred')
 
@@ -574,9 +578,26 @@ class RingManagerStore(object):
             build.pop(key, None)
         self._save_dir_object('ring_builds', build)
 
-    def list_ring_builds(self):
+    def _ring_build_matches_filter(self, build, retry_of=None,
+                                   retry_root=None):
+        if retry_of is not None:
+            value = build.get('retry_of')
+            if value is None or str(value) != str(retry_of):
+                return False
+        if retry_root is not None:
+            value = build.get('retry_root')
+            if value is None or str(value) != str(retry_root):
+                return False
+        return True
+
+    def list_ring_builds(self, retry_of=None, retry_root=None):
         builds = self._list_dir_objects('ring_builds')
         builds.sort(key=self._ring_build_sort_key)
+        builds = [
+            build for build in builds
+            if self._ring_build_matches_filter(
+                build, retry_of=retry_of, retry_root=retry_root)
+        ]
         return [self._public_ring_build(build) for build in builds]
 
     def get_ring_build(self, build_id):
@@ -584,7 +605,7 @@ class RingManagerStore(object):
             'ring_builds', build_id, RingBuildNotFound)
         return self._public_ring_build(build)
 
-    def create_ring_build(self, request, timestamp):
+    def create_ring_build(self, request, timestamp, extra=None):
         directory = self._collection_dir('ring_builds')
         if directory is None:
             raise ValueError(
@@ -625,6 +646,12 @@ class RingManagerStore(object):
                 build['version'] = str(request['version'])
             if request.get('rings') is not None:
                 build['rings'] = copy.deepcopy(request['rings'])
+            if extra:
+                extra = copy.deepcopy(extra)
+                for key in ('id', 'sequence', 'state', 'created_at',
+                            'updated_at', 'request', 'resource_uri'):
+                    extra.pop(key, None)
+                build.update(extra)
             self._save_dir_object('ring_builds', build)
             return self._public_ring_build(build)
 
@@ -644,6 +671,33 @@ class RingManagerStore(object):
                 build.pop(key, None)
         self._save_dir_object('ring_builds', build)
         return self._public_ring_build(build)
+
+    def cancel_ring_build(self, build_id, timestamp, reason=None):
+        timestamp = normal_timestamp_internal(timestamp)
+        directory = self._collection_dir('ring_builds')
+        if directory is None:
+            raise ValueError(
+                'ring_manager_state_dir is required for build requests')
+        with lock_path(directory, name='ring-build-queue'):
+            existing = self._load_dir_object(
+                'ring_builds', build_id, RingBuildNotFound)
+            state = existing.get('state')
+            if state == 'cancelled':
+                return self._public_ring_build(existing), False
+            if state not in ('queued', 'deferred'):
+                raise RingBuildStateConflict(
+                    'build %s in state %s cannot be cancelled' %
+                    (build_id, state))
+            build = copy.deepcopy(existing)
+            build['state'] = 'cancelled'
+            build['cancelled_from'] = state
+            build['cancelled_at'] = timestamp
+            build['updated_at'] = timestamp
+            if reason not in (None, ''):
+                build['cancel_reason'] = str(reason)
+            build.pop('resource_uri', None)
+            self._save_dir_object('ring_builds', build)
+            return self._public_ring_build(build), True
 
     def update_claimed_ring_build(self, build_id, builder_id, claimed_at,
                                   updates, timestamp):

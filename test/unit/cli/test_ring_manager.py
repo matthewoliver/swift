@@ -455,6 +455,59 @@ nodes:
                          opener.requests[0]['path'])
         self.assertEqual('completed', json.loads(stdout)['state'])
 
+    def test_builds_actions_post_reason(self):
+        opener = FakeOpener({
+            ('POST', '/api/v1/rings/builds/build-1/cancel/'):
+            json_response({'id': 'build-1', 'state': 'cancelled'}),
+            ('POST', '/api/v1/rings/builds/build-1/retry/'):
+            json_response({'id': 'build-2', 'state': 'queued'}),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'builds', 'cancel', 'build-1', '--reason', 'superseded',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual({'reason': 'superseded'}, json.loads(
+            opener.requests[0]['body'].decode('ascii')))
+        self.assertEqual('cancelled', json.loads(stdout)['state'])
+
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'builds', 'retry', 'build-1', '--reason', 'transient failure',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('/api/v1/rings/builds/build-1/retry/',
+                         opener.requests[1]['path'])
+        self.assertEqual({'reason': 'transient failure'}, json.loads(
+            opener.requests[1]['body'].decode('ascii')))
+        self.assertEqual('queued', json.loads(stdout)['state'])
+
+    def test_builds_list_filters_retry_lineage(self):
+        opener = FakeOpener({
+            ('GET', '/api/v1/rings/builds/'):
+            json_response({'objects': []}),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'builds', 'list', '--retry-of', 'failed-1',
+            '--retry-root', 'root-1',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('retry_of=failed-1&retry_root=root-1',
+                         opener.requests[0]['query'])
+        self.assertEqual({'objects': []}, json.loads(stdout))
+
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'builds', 'list', '--retry-of', '',
+        ], FakeOpener({}))
+        self.assertEqual(1, status)
+        self.assertEqual('', stdout)
+        self.assertIn('--retry-of must not be empty', stderr)
+
     def test_versions_download_verifies_release_artifacts(self):
         artifact_body = b'object ring bytes'
         artifact_sha256 = hashlib.sha256(artifact_body).hexdigest()

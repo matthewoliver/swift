@@ -34,7 +34,8 @@ from swift.ring_manager.publisher import RingBuilderPublisherError
 from swift.ring_manager.common import NormalTimestamp
 from swift.ring_manager.routing import Route
 from swift.ring_manager.store import RingAlreadyExists, RingBuildNotFound, \
-    RingBuildPublishedVersionConflict, RingBuildVersionConflict, \
+    RingBuildPublishedVersionConflict, RingBuildStateConflict, \
+    RingBuildVersionConflict, \
     RingNotFound, RingVersionFileNotFound, RingVersionNotFound
 
 
@@ -113,6 +114,10 @@ class RingController(object):
                   ('GET',), self.ring_membership_device),
             Route(r'^/api/v1/rings/builds/?$',
                   ('GET',), self.ring_builds),
+            Route(r'^/api/v1/rings/builds/(?P<build_id>[^/]+)/cancel/?$',
+                  ('POST',), self.ring_build_cancel),
+            Route(r'^/api/v1/rings/builds/(?P<build_id>[^/]+)/retry/?$',
+                  ('POST',), self.ring_build_retry),
             Route(r'^/api/v1/rings/builds/(?P<build_id>[^/]+)/?$',
                   ('GET',), self.ring_build_detail),
             Route(r'^/api/v1/rings/releases/?$',
@@ -727,7 +732,6 @@ class RingController(object):
                     raise RingBuilderPublisherError(
                         'artifact-only builds must use '
                         '/api/v1/rings/<ring_id>/versions/')
-                self._validate_release_build_request(payload)
                 build = self._enqueue_ring_build(payload)
             except RingNotFound:
                 return HTTPNotFound(request=req)
@@ -796,15 +800,41 @@ class RingController(object):
                     'rings contains duplicate ring ids')
             seen.add(str(ring['id']))
 
-    def _enqueue_ring_build(self, payload):
+    def _validate_ring_build_request(self, payload):
+        if config_true_value(str(payload.get('artifact_only', 'false'))):
+            ring_id = payload.get('ring_id')
+            if ring_id in (None, ''):
+                raise RingBuilderPublisherError(
+                    'artifact-only builds require ring_id')
+            self._store.get_ring(ring_id)
+            if payload.get('version') is not None:
+                raise RingBuilderPublisherError(
+                    'artifact-only builds do not accept version; the Swift '
+                    'builder version identifies the resulting ring artifact')
+            return
+        self._validate_release_build_request(payload)
+
+    def _enqueue_ring_build(self, payload, timestamp=None, extra=None):
+        self._validate_ring_build_request(payload)
+        timestamp = NormalTimestamp.now().internal \
+            if timestamp is None else timestamp
         build = self._store.create_ring_build(
-            payload, NormalTimestamp.now().internal)
+            payload, timestamp, extra=extra)
         if self._ring_build_executor == 'manager':
             self._build_pool.spawn_n(self._build_worker.process_jobs)
         return build
 
     def ring_builds(self, req):
-        return self._collection_response(req, self._store.list_ring_builds())
+        retry_of = req.params.get('retry_of')
+        retry_root = req.params.get('retry_root')
+        for name, value in (('retry_of', retry_of),
+                            ('retry_root', retry_root)):
+            if value == '':
+                return self._json_error(
+                    req, HTTPBadRequest, '%s must not be empty' % name)
+        return self._collection_response(
+            req, self._store.list_ring_builds(
+                retry_of=retry_of, retry_root=retry_root))
 
     def ring_build_detail(self, req, build_id):
         try:
@@ -812,6 +842,75 @@ class RingController(object):
         except RingBuildNotFound:
             return HTTPNotFound(request=req)
         return self._json_response(req, build)
+
+    def ring_build_cancel(self, req, build_id):
+        payload = self._json_request_body(req)
+        try:
+            build, did_cancel = self._store.cancel_ring_build(
+                unquote(build_id), NormalTimestamp.now().internal,
+                reason=payload.get('reason'))
+        except RingBuildNotFound:
+            return HTTPNotFound(request=req)
+        except RingBuildStateConflict as err:
+            return self._json_error(req, HTTPConflict, str(err))
+        if did_cancel and self._ring_build_executor == 'manager':
+            self._build_pool.spawn_n(self._build_worker.process_jobs)
+        return self._json_response(req, build)
+
+    def _retry_build_metadata(self, source, timestamp, reason=None):
+        try:
+            retry_count = int(source.get('retry_count', 0)) + 1
+        except (TypeError, ValueError):
+            retry_count = 1
+        metadata = {
+            'retry_of': source['id'],
+            'retry_root': source.get('retry_root') or
+            source.get('retry_of') or source['id'],
+            'retry_count': retry_count,
+            'retry_source_state': source.get('state'),
+            'retry_requested_at': timestamp,
+        }
+        if source.get('error') is not None:
+            metadata['retry_source_error'] = source['error']
+        if reason not in (None, ''):
+            metadata['retry_reason'] = str(reason)
+        return metadata
+
+    def ring_build_retry(self, req, build_id):
+        payload = self._json_request_body(req)
+        timestamp = NormalTimestamp.now().internal
+        try:
+            source = self._store.get_ring_build(unquote(build_id))
+        except RingBuildNotFound:
+            return HTTPNotFound(request=req)
+        state = source.get('state')
+        if state not in ('failed', 'cancelled'):
+            return self._json_error(
+                req, HTTPConflict,
+                'build %s in state %s cannot be retried' %
+                (source.get('id'), state))
+        request = source.get('request')
+        if not isinstance(request, dict):
+            return self._json_error(
+                req, HTTPBadRequest,
+                'build %s does not have a retryable request' %
+                source.get('id'))
+        try:
+            build = self._enqueue_ring_build(
+                request, timestamp=timestamp,
+                extra=self._retry_build_metadata(
+                    source, timestamp, reason=payload.get('reason')))
+        except RingNotFound:
+            return HTTPNotFound(request=req)
+        except RingBuildVersionConflict as err:
+            return self._json_error(req, HTTPConflict, str(err))
+        except RingBuildPublishedVersionConflict as err:
+            return self._json_error(req, HTTPBadRequest, str(err))
+        except (RingBuilderPublisherError, RingBuilderManagerError) as err:
+            return self._json_error(req, HTTPBadRequest, str(err))
+        return self._json_response(
+            req, build, status=202,
+            headers={'Location': build['resource_uri']})
 
     def latest_ring_artifact_version(self, req, ring_id):
         ring_id = unquote(ring_id)

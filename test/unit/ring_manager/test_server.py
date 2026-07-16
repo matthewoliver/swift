@@ -309,6 +309,10 @@ class TestRingManagerApplication(unittest.TestCase):
              '(?P<device_id>[0-9]+)/?$', ('GET',),
              'ring_membership_device'),
             ('^/api/v1/rings/builds/?$', ('GET',), 'ring_builds'),
+            ('^/api/v1/rings/builds/(?P<build_id>[^/]+)/cancel/?$',
+             ('POST',), 'ring_build_cancel'),
+            ('^/api/v1/rings/builds/(?P<build_id>[^/]+)/retry/?$',
+             ('POST',), 'ring_build_retry'),
             ('^/api/v1/rings/builds/(?P<build_id>[^/]+)/?$', ('GET',),
              'ring_build_detail'),
             ('^/api/v1/rings/releases/?$', ('GET', 'POST'),
@@ -575,6 +579,196 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(200, resp.status_int)
         self.assertEqual(
             [first['id']], [item['id'] for item in body['objects']])
+
+    def test_ring_build_cancel_is_narrow_and_idempotent(self):
+        first = self.app.store.create_ring_build({
+            'version': 'release-queued',
+            'rings': ['1'],
+        }, NormalTimestamp(1000).internal)
+        second = self.app.store.create_ring_build({
+            'version': 'release-next',
+            'rings': ['1'],
+        }, NormalTimestamp(1001).internal)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/builds/%s/cancel/' % first['id'], 'POST', {
+                'reason': 'superseded',
+            })
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('cancelled', body['state'])
+        self.assertEqual('queued', body['cancelled_from'])
+        self.assertEqual('superseded', body['cancel_reason'])
+
+        resp, body = self.json_request(
+            '/api/v1/rings/builds/%s/cancel/' % first['id'], 'POST', {
+                'reason': 'ignored retry',
+            })
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('superseded', body['cancel_reason'])
+
+        claimed = self.app.store.claim_ring_build(
+            'builder-a', NormalTimestamp(1002).internal)
+        self.assertEqual(second['id'], claimed['id'])
+        resp, body = self.json_request(
+            '/api/v1/rings/builds/%s/cancel/' % second['id'], 'POST', {})
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('cannot be cancelled', body['error'])
+
+    def test_ring_build_cancel_deferred_job_unblocks_queue(self):
+        first = self.app.store.create_ring_build({
+            'version': 'release-deferred',
+            'rings': ['1'],
+        }, NormalTimestamp(1000).internal)
+        second = self.app.store.create_ring_build({
+            'version': 'release-next',
+            'rings': ['1'],
+        }, NormalTimestamp(1001).internal)
+        self.app.store._update_ring_build(first['id'], {
+            'state': 'deferred',
+            'deferred_until': NormalTimestamp(2000).internal,
+        }, NormalTimestamp(1002).internal)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/builds/%s/cancel/' % first['id'], 'POST', {})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('deferred', body['cancelled_from'])
+        claimed = self.app.store.claim_ring_build(
+            'builder-a', NormalTimestamp(1003).internal)
+        self.assertEqual(second['id'], claimed['id'])
+
+    def test_ring_build_retry_appends_immutable_lineage(self):
+        source = self.app.store.create_ring_build({
+            'version': 'release-retry',
+            'rings': ['1'],
+        }, NormalTimestamp(1000).internal)
+        self.app.store._update_ring_build(source['id'], {
+            'state': 'failed',
+            'completed_at': NormalTimestamp(1001).internal,
+            'error': 'temporary builder failure',
+        }, NormalTimestamp(1001).internal)
+
+        resp, retry = self.json_request(
+            '/api/v1/rings/builds/%s/retry/' % source['id'], 'POST', {
+                'reason': 'operator retry',
+            })
+        self.assertEqual(202, resp.status_int)
+        self.assertNotEqual(source['id'], retry['id'])
+        self.assertEqual(2, retry['sequence'])
+        self.assertEqual('queued', retry['state'])
+        self.assertEqual(source['id'], retry['retry_of'])
+        self.assertEqual(source['id'], retry['retry_root'])
+        self.assertEqual(1, retry['retry_count'])
+        self.assertEqual('failed', retry['retry_source_state'])
+        self.assertEqual('temporary builder failure',
+                         retry['retry_source_error'])
+        self.assertEqual('operator retry', retry['retry_reason'])
+        self.assertTrue(resp.headers['Location'].endswith(
+            retry['resource_uri']))
+        self.assertEqual('failed', self.app.store.get_ring_build(
+            source['id'])['state'])
+
+        self.app.store._update_ring_build(retry['id'], {
+            'state': 'cancelled',
+        }, NormalTimestamp(1002).internal)
+        resp, child = self.json_request(
+            '/api/v1/rings/builds/%s/retry/' % retry['id'], 'POST', {})
+        self.assertEqual(202, resp.status_int)
+        self.assertEqual(retry['id'], child['retry_of'])
+        self.assertEqual(source['id'], child['retry_root'])
+        self.assertEqual(2, child['retry_count'])
+
+    def test_ring_build_retry_rejects_invalid_source_state(self):
+        job = self.app.store.create_ring_build({
+            'version': 'release-queued',
+            'rings': ['1'],
+        }, NormalTimestamp(1000).internal)
+        resp, body = self.json_request(
+            '/api/v1/rings/builds/%s/retry/' % job['id'], 'POST', {})
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('cannot be retried', body['error'])
+
+    def test_ring_build_retry_reuses_enqueue_admission(self):
+        source = self.app.store.create_ring_build({
+            'version': 'release-retry',
+            'rings': ['1'],
+        }, NormalTimestamp(1000).internal)
+        self.app.store._update_ring_build(source['id'], {
+            'state': 'failed',
+        }, NormalTimestamp(1001).internal)
+        self.app.store.create_ring_build({
+            'version': 'release-retry',
+            'rings': ['1'],
+        }, NormalTimestamp(1002).internal)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/builds/%s/retry/' % source['id'], 'POST', {})
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('active ring build', body['error'])
+
+    def test_ring_build_actions_wake_manager_executor(self):
+        app = RingManagerApplication({
+            'ring_manager_state_dir': self.state_dir,
+            'ring_artifact_dir': self.artifact_dir,
+            'ring_builder_dir': self.testdir,
+            'ring_build_executor': 'manager',
+        }, logger=debug_logger())
+        queued = app.store.create_ring_build({
+            'version': 'release-queued',
+            'rings': ['1'],
+        }, NormalTimestamp(1000).internal)
+        with mock.patch.object(app.build_pool, 'spawn_n') as spawn:
+            resp, body = self.json_request(
+                '/api/v1/rings/builds/%s/cancel/' % queued['id'], 'POST',
+                {}, app=app)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('cancelled', body['state'])
+        spawn.assert_called_once_with(app.build_worker.process_jobs)
+
+        app.store._update_ring_build(queued['id'], {
+            'state': 'failed',
+        }, NormalTimestamp(1001).internal)
+        with mock.patch.object(app.build_pool, 'spawn_n') as spawn:
+            resp, body = self.json_request(
+                '/api/v1/rings/builds/%s/retry/' % queued['id'], 'POST',
+                {}, app=app)
+        self.assertEqual(202, resp.status_int)
+        self.assertEqual('queued', body['state'])
+        spawn.assert_called_once_with(app.build_worker.process_jobs)
+
+    def test_ring_builds_filter_retry_lineage(self):
+        self._write_json('ring_builds/source.json', {
+            'id': 'source',
+            'sequence': 1,
+            'state': 'failed',
+        })
+        self._write_json('ring_builds/direct-child.json', {
+            'id': 'direct-child',
+            'sequence': 2,
+            'state': 'failed',
+            'retry_of': 'source',
+            'retry_root': 'source',
+        })
+        self._write_json('ring_builds/grandchild.json', {
+            'id': 'grandchild',
+            'sequence': 3,
+            'state': 'queued',
+            'retry_of': 'direct-child',
+            'retry_root': 'source',
+        })
+
+        resp, body = self.get_json(
+            '/api/v1/rings/builds/?retry_of=source')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(['direct-child'], [
+            build['id'] for build in body['objects']])
+        resp, body = self.get_json(
+            '/api/v1/rings/builds/?retry_root=source')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(['direct-child', 'grandchild'], [
+            build['id'] for build in body['objects']])
+        resp, body = self.get_json('/api/v1/rings/builds/?retry_of=')
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('retry_of must not be empty', body['error'])
 
     def test_deferred_job_allows_disjoint_ring_claim(self):
         first = self.app.store.create_ring_build({

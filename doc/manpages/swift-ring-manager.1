@@ -155,11 +155,28 @@ Release version IDs cannot be reused.
 The command returns a queued build job; use \fBbuilds show\fR to inspect it.
 .TP
 .B builds list
-List queued, building, deferred, completed, and failed ring build jobs.
+[\fB\-\-retry-of\fR \fIBUILD_ID\fR] [\fB\-\-retry-root\fR \fIBUILD_ID\fR]
+List persistent ring build jobs.
+\fB\-\-retry-of\fR selects direct retries from one source build.
+\fB\-\-retry-root\fR selects all descendants in one retry chain.
 .TP
 .B builds show
 .I BUILD_ID
 Show one persistent ring build job and its result or failure detail.
+.TP
+.B builds cancel
+.I BUILD_ID
+[\fB\-\-reason\fR \fIREASON\fR]
+Cancel a queued or deferred ring build job.
+Already-building, completed, and failed jobs are rejected by the server.
+Cancellation does not interrupt an active rebuild or publication attempt.
+.TP
+.B builds retry
+.I BUILD_ID
+[\fB\-\-reason\fR \fIREASON\fR]
+Retry a failed or cancelled build as a fresh queued job.
+The original job remains terminal history and the new job records its retry
+lineage.
 .TP
 .B versions show
 [\fIVERSION\fR]

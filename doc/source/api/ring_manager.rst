@@ -135,17 +135,45 @@ Persistent build jobs
 
 Lists persistent build jobs in monotonic ``sequence`` order.
 Jobs expose their state, request, attempt count, and result or failure detail.
+The optional ``retry_of`` query parameter selects direct retries of one build.
+The optional ``retry_root`` parameter selects every descendant retry in one
+retry chain.
+Both filters retain terminal history so an operator can inspect every earlier
+attempt before retrying again.
 
 ``GET /api/v1/rings/builds/<build_id>/``
 ------------------------------------------
 
-Returns one queued, building, deferred, completed, or failed job.
+Returns one queued, building, deferred, completed, failed, or cancelled job.
 
 Workers claim jobs under a durable lease.
 An expired claim is recovered into FIFO order, while a worker with an old
 claim cannot update or refresh a newer claim.
 A deferred job blocks later overlapping scopes but permits disjoint explicit
 ring builds to proceed.
+
+``POST /api/v1/rings/builds/<build_id>/cancel/``
+----------------------------------------------------
+
+Cancels a queued or deferred job and records its terminal ``cancelled`` state.
+An optional JSON ``reason`` becomes an operator-visible cancellation reason.
+Repeating cancellation returns the existing cancelled record without changing
+its original reason or timestamp.
+Building, completed, and failed jobs return ``409 Conflict``.
+The operation never interrupts an active ``RingBuilder.rebalance`` or
+publication attempt.
+
+``POST /api/v1/rings/builds/<build_id>/retry/``
+---------------------------------------------------
+
+Retries a failed or cancelled job by creating a fresh queued job at the end of
+the FIFO sequence.
+The original job remains immutable terminal history.
+The new job records ``retry_of``, ``retry_root``, ``retry_count``, source state,
+and the optional JSON retry ``reason``.
+Retry validates the stored request through the normal enqueue path, including
+the release-version admission check.
+Queued, deferred, building, and completed jobs return ``409 Conflict``.
 
 ``GET /api/v1/rings/releases/``
 --------------------------------
