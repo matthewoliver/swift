@@ -130,6 +130,11 @@ selected for publication.
 ``POST /api/v1/rings/<ring_id>/versions/`` also creates a persistent job.
 The builder worker builds one artifact without creating a cluster release or
 changing the latest release pointer.
+Ring-manager automatically writes ring v2 when a builder needs device IDs wider
+than the legacy 2-byte format.
+An explicit v1 request fails instead of writing a lossy artifact.
+Release workers lock every selected builder in deterministic path order through
+format preflight, rebalance, and artifact writes.
 This permits controlled testing of disabled rings.
 Jobs are assigned a durable monotonic sequence and are claimed by
 ``swift-ring-manager-builder``.
@@ -182,6 +187,8 @@ Regions, zones, device IDs, and ports use guarded ASCII-decimal parsing;
 weights and builder numeric settings must be finite and within their allowed
 ranges.
 Explicit device IDs are bounded because ``RingBuilder.devs`` is a dense list.
+They may exceed the legacy 2-byte ring-format range, which selects ring v2 at
+publication time.
 Invalid multi-device requests leave the existing builder unchanged.
 Builder saves use a unique temporary file, fsync the file, atomically rename
 it, preserve an existing file mode, and fsync the parent directory.

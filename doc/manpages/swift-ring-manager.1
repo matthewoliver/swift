@@ -91,6 +91,10 @@ Show one logical Swift ring.
 Queue one immutable per-ring artifact build without creating a cluster release
 or changing the top-level \fBlatest\fR release pointer.
 This is also available for disabled rings.
+When \fB\-\-format-version\fR is omitted, ring-manager writes v1 for builders
+whose device IDs fit in the legacy 2-byte ring format and v2 for builders with
+wider device IDs.
+Explicit \fB\-\-format-version 1\fR fails for builders that require wider IDs.
 .TP
 \fBrings create\fR [ring field options]
 Create a logical Swift ring.
@@ -153,6 +157,10 @@ Build a complete enabled-ring release manifest.
 Other enabled rings are carried forward from their latest per-ring artifact.
 Release version IDs cannot be reused.
 The command returns a queued build job; use \fBbuilds show\fR to inspect it.
+When \fB\-\-format-version\fR is omitted, ring-manager writes v1 for builders
+whose device IDs fit in the legacy 2-byte ring format and v2 for builders with
+wider device IDs.
+Explicit \fB\-\-format-version 1\fR fails for builders that require wider IDs.
 .TP
 .B builds list
 [\fB\-\-retry-of\fR \fIBUILD_ID\fR] [\fB\-\-retry-root\fR \fIBUILD_ID\fR]

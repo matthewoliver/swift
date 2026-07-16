@@ -194,6 +194,13 @@ latest per-ring artifact versions so the manifest remains complete.
 Disabled rings are omitted and cannot be selected for a release build.
 Every selected ring and every carry-forward artifact is validated before the
 first builder is modified.
+The worker acquires every selected builder lock in deterministic path order and
+holds them through format preflight, rebalance, and artifact writes.
+``format_version`` is optional: ring-manager writes v1 when device IDs fit the
+legacy 2-byte format and automatically writes v2 when a builder needs wider
+device IDs.
+An explicit ``format_version: 1`` fails for a builder that needs wider IDs;
+use ``format_version: 2`` to force v2 output.
 Reusing a published release version returns ``400 Bad Request``.
 An active job for the same explicit release version returns ``409 Conflict``.
 
@@ -243,6 +250,10 @@ This is useful for validating a builder and is also allowed for disabled
 rings.
 The resulting artifact version is the Swift builder version, not a caller
 supplied release version.
+``format_version`` is optional: ring-manager writes v1 when device IDs fit the
+legacy 2-byte format and automatically writes v2 when a builder needs wider
+device IDs.
+An explicit ``format_version: 1`` fails for a builder that needs wider IDs.
 
 ``GET /api/v1/rings/<ring_id>/versions/<version>/``
 -----------------------------------------------------

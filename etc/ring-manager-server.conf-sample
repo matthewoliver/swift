@@ -43,8 +43,8 @@ use = egg:swift#ring_manager
 # are dense, so reject pathologically sparse IDs before changing a builder.
 # max_explicit_device_id = 1000000
 #
-# Seconds to wait for the exclusive builder lock used by device CRUD and
-# builder-setting updates.
+# Seconds to wait for the exclusive builder lock used by device CRUD,
+# builder-setting updates, and build workers.
 # builder_lock_timeout = 600
 #
 # Build requests are queued for swift-ring-manager-builder by default.

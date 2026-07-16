@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import hashlib
 import os
 import re
 
 from swift.common import exceptions as swift_exceptions
-from swift.common.ring.ring import DEFAULT_RING_FORMAT_VERSION
+from swift.common.ring.ring import DEFAULT_RING_FORMAT_VERSION, RING_CODECS
 from swift.common.utils import config_true_value, lock_file, mkdirs
 from swift.ring_manager.builder import RingBuilderManager, \
     RingBuilderManagerError, save_builder_durable
@@ -135,8 +136,80 @@ class RingBuilderPublisher(object):
         builder.get_ring().save(
             artifact_path, format_version=format_version)
 
+    def _format_version_from_payload(self, payload):
+        value = payload.get('format_version')
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise RingBuilderPublisherError(
+                'format_version must be one of %s' %
+                ', '.join(str(version) for version in sorted(RING_CODECS)))
+        if isinstance(value, int):
+            format_version = value
+        elif isinstance(value, str) and re.match(r'^[0-9]+$', value):
+            try:
+                format_version = int(value)
+            except ValueError:
+                raise RingBuilderPublisherError(
+                    'format_version must be one of %s' %
+                    ', '.join(
+                        str(version) for version in sorted(RING_CODECS)))
+        else:
+            raise RingBuilderPublisherError(
+                'format_version must be one of %s' %
+                ', '.join(str(version) for version in sorted(RING_CODECS)))
+        if format_version not in RING_CODECS:
+            raise RingBuilderPublisherError(
+                'format_version must be one of %s' %
+                ', '.join(str(version) for version in sorted(RING_CODECS)))
+        return format_version
+
+    def _effective_format_version(self, ring, builder, format_version):
+        if format_version is None:
+            if builder.dev_id_bytes > 2:
+                return 2
+            return DEFAULT_RING_FORMAT_VERSION
+        if format_version == 1 and builder.dev_id_bytes > 2:
+            raise RingBuilderPublisherError(
+                'ring %s requires ring format version 2 for %d-byte '
+                'device ids' % (ring.get('id'), builder.dev_id_bytes))
+        return format_version
+
+    def _preflight_format_version(self, ring, format_version):
+        if format_version is None:
+            return
+        try:
+            builder = self.builder_manager.load_builder(ring)[1]
+        except swift_exceptions.FileNotFoundError:
+            raise RingBuilderPublisherError(
+                'ring %s builder does not exist' % ring.get('id'))
+        self._effective_format_version(ring, builder, format_version)
+
     def _builder_lock_path(self, builder_path):
         return '%s.lock' % builder_path
+
+    @contextlib.contextmanager
+    def _builder_locks(self, rings):
+        lock_specs = {}
+        for ring in rings:
+            builder_path = self.builder_manager.builder_path(ring)
+            lock_specs[self._builder_lock_path(builder_path)] = (
+                builder_path, ring.get('id'))
+        with contextlib.ExitStack() as stack:
+            for lock_path in sorted(lock_specs):
+                builder_path, ring_id = lock_specs[lock_path]
+                directory = os.path.dirname(builder_path)
+                if directory:
+                    mkdirs(directory)
+                try:
+                    stack.enter_context(lock_file(
+                        lock_path, timeout=self.builder_lock_timeout,
+                        unlink=False))
+                except swift_exceptions.LockTimeout:
+                    raise RingBuilderPublisherError(
+                        'timed out waiting for builder lock for ring %s' %
+                        ring_id)
+            yield
 
     def _builder_needs_rebalance(self, builder):
         if builder.devs_changed:
@@ -216,7 +289,7 @@ class RingBuilderPublisher(object):
         }
 
     def _build_ring_locked(self, ring, publish_version, created_at, seed=None,
-                           format_version=DEFAULT_RING_FORMAT_VERSION):
+                           format_version=None):
         try:
             builder_path, builder = self.builder_manager.load_builder(ring)
         except swift_exceptions.FileNotFoundError:
@@ -241,6 +314,8 @@ class RingBuilderPublisher(object):
 
         artifact_name = self._artifact_name(ring)
         artifact_path = self._artifact_path(publish_version, artifact_name)
+        format_version = self._effective_format_version(
+            ring, builder, format_version)
         self._save_ring_data(builder, artifact_path, format_version)
         save_builder_durable(builder, builder_path)
         file_info = self._artifact_info(
@@ -278,11 +353,15 @@ class RingBuilderPublisher(object):
         }
 
     def _build_ring(self, ring, publish_version, created_at, seed=None,
-                    format_version=DEFAULT_RING_FORMAT_VERSION):
+                    format_version=None, lock=True):
         builder_path = self.builder_manager.builder_path(ring)
         directory = os.path.dirname(builder_path)
         if directory:
             mkdirs(directory)
+        if not lock:
+            return self._build_ring_locked(
+                ring, publish_version, created_at, seed=seed,
+                format_version=format_version)
         try:
             with lock_file(
                     self._builder_lock_path(builder_path),
@@ -308,9 +387,9 @@ class RingBuilderPublisher(object):
                                  self._artifact_namespace(ring_id,
                                                           created_at))
         seed = payload.get('seed')
-        format_version = int(payload.get(
-            'format_version', DEFAULT_RING_FORMAT_VERSION))
+        format_version = self._format_version_from_payload(payload)
 
+        self._preflight_format_version(ring, format_version)
         self._preflight_ring(ring)
         result = self._build_ring(
             ring, artifact_namespace, created_at, seed=seed,
@@ -330,8 +409,7 @@ class RingBuilderPublisher(object):
                 'published ring version %s already exists' % publish_version)
         created_at = self._timestamp_internal()
         seed = payload.get('seed')
-        format_version = int(payload.get(
-            'format_version', DEFAULT_RING_FORMAT_VERSION))
+        format_version = self._format_version_from_payload(payload)
 
         build_rings = [self.store.get_ring(ring_id)
                        for ring_id in self._ring_ids(payload)]
@@ -356,20 +434,23 @@ class RingBuilderPublisher(object):
                 'ring %s is not in the manifest ring set' %
                 sorted(missing_from_manifest)[0])
 
-        for ring in build_rings:
-            self._preflight_ring(ring)
-        for ring in manifest_ring_set:
-            if ring['id'] not in build_ring_ids:
-                self._latest_artifact_version(ring)
-
         build_results = []
         build_results_by_ring = {}
-        for ring in build_rings:
-            result = self._build_ring(
-                ring, publish_version, created_at, seed=seed,
-                format_version=format_version)
-            build_results.append(result)
-            build_results_by_ring[result['ring_id']] = result
+        with self._builder_locks(build_rings):
+            for ring in build_rings:
+                self._preflight_format_version(ring, format_version)
+            for ring in build_rings:
+                self._preflight_ring(ring)
+            for ring in manifest_ring_set:
+                if ring['id'] not in build_ring_ids:
+                    self._latest_artifact_version(ring)
+
+            for ring in build_rings:
+                result = self._build_ring(
+                    ring, publish_version, created_at, seed=seed,
+                    format_version=format_version, lock=False)
+                build_results.append(result)
+                build_results_by_ring[result['ring_id']] = result
 
         carried_forward = []
         manifest_rings = []

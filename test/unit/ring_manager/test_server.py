@@ -22,10 +22,12 @@ from unittest import mock
 from urllib.parse import quote
 
 from swift.common.ring.builder import RingBuilder
+from swift.common.ring.ring import RingData
 from swift.common.swob import Request, Response
 from swift.common.utils import md5
 from swift.ring_manager import routing
-from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID
+from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID, \
+    RingBuilderManagerError
 from swift.ring_manager.builder_daemon import RingBuildWorker, \
     RingManagerBuilder
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
@@ -35,7 +37,8 @@ from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
 from swift.ring_manager.server import app_factory, \
     DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS, RingManagerApplication
 from swift.ring_manager.middleware.auth import RingManagerAuthMiddleware
-from swift.ring_manager.publisher import RingBuilderPublisherDeferred
+from swift.ring_manager.publisher import RingBuilderPublisher, \
+    RingBuilderPublisherDeferred, RingBuilderPublisherError
 from swift.ring_manager.store import RingManagerStore, RingNotFound
 from test.debug_logger import debug_logger
 
@@ -516,6 +519,162 @@ class TestRingManagerApplication(unittest.TestCase):
             for ring in body['rings'])
         self.assertEqual(first_versions['object-1'],
                          second_versions['object-1'])
+
+    def test_publish_auto_selects_v2_for_large_device_ids(self):
+        self._disable_initial_rings()
+        builder_path = self._make_publishable_object_ring('object-2', 2)
+        self._make_large_device_id_builder(builder_path)
+
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-wide',
+            'rings': ['object-2'],
+        })
+        self.assertEqual(202, resp.status_int)
+
+        build = self.process_next_build()
+        self.assertEqual('completed', build['state'])
+        artifact_path = os.path.join(
+            self.artifact_dir, 'release-wide', 'object-2.ring.gz')
+        ring_data = RingData.load(artifact_path, metadata_only=True)
+        self.assertEqual(2, ring_data.format_version)
+        self.assertEqual(4, ring_data.dev_id_bytes)
+
+    def test_artifact_build_auto_selects_v2_for_large_device_ids(self):
+        builder_path = self._make_publishable_object_ring('object-2', 2)
+        self._make_large_device_id_builder(builder_path)
+
+        resp, body = self.json_request(
+            '/api/v1/rings/object-2/versions/', 'POST', {})
+        self.assertEqual(202, resp.status_int)
+
+        build = self.process_next_build()
+        self.assertEqual('completed', build['state'])
+        artifact = self.app.store.get_ring_artifact_version_record(
+            'object-2', build['result']['version'])
+        artifact_path = os.path.join(
+            self.artifact_dir, artifact['files'][0]['path'])
+        ring_data = RingData.load(artifact_path, metadata_only=True)
+        self.assertEqual(2, ring_data.format_version)
+        self.assertEqual(4, ring_data.dev_id_bytes)
+
+    def test_publish_rejects_v1_for_large_device_ids(self):
+        self._disable_initial_rings()
+        builder_path = self._make_publishable_object_ring('object-2', 2)
+        self._make_large_device_id_builder(builder_path)
+
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-wide-v1',
+            'rings': ['object-2'],
+            'format_version': 1,
+        })
+        self.assertEqual(202, resp.status_int)
+
+        build = self.process_next_build()
+        self.assertEqual('failed', build['state'])
+        self.assertIn(
+            'object-2 requires ring format version 2 for 4-byte device ids',
+            build['error'])
+        self.assertFalse(self.app.store.ring_version_exists('release-wide-v1'))
+
+    def test_publish_rejects_lossy_format_version_values(self):
+        for index, value in enumerate((
+                True, 1.0, '1.0', 'v2', '9' * 5000, 3)):
+            with self.assertRaises(RingBuilderPublisherError) as err_ctx:
+                self.app.publisher.publish({
+                    'version': 'release-bad-format-%d' % index,
+                    'rings': ['1'],
+                    'format_version': value,
+                })
+            self.assertIn(
+                'format_version must be one of 1, 2',
+                str(err_ctx.exception))
+            self.assertFalse(self.app.store.ring_version_exists(
+                'release-bad-format-%d' % index))
+
+    def test_publish_preflights_v1_before_writing_artifacts(self):
+        self._disable_initial_rings()
+        small_builder_path = self._make_publishable_object_ring('object-1', 1)
+        small_builder_version = RingBuilder.load(small_builder_path).version
+        wide_builder_path = self._make_publishable_object_ring('object-2', 2)
+        self._make_large_device_id_builder(wide_builder_path)
+
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-wide-v1-preflight',
+            'rings': ['object-1', 'object-2'],
+            'format_version': 1,
+        })
+        self.assertEqual(202, resp.status_int)
+
+        build = self.process_next_build()
+        self.assertEqual('failed', build['state'])
+        self.assertIn(
+            'object-2 requires ring format version 2 for 4-byte device ids',
+            build['error'])
+        self.assertFalse(self.app.store.ring_version_exists(
+            'release-wide-v1-preflight'))
+        self.assertFalse(self.app.store.ring_artifact_version_exists(
+            'object-1', small_builder_version))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.artifact_dir,
+            'release-wide-v1-preflight', 'object-1.ring.gz')))
+
+    def test_publish_holds_all_builder_locks_before_writing(self):
+        self._disable_initial_rings()
+        self._make_publishable_object_ring('object-1', 1)
+        object2_builder_path = self._make_publishable_object_ring(
+            'object-2', 2)
+        publisher = RingBuilderPublisher(
+            self.app.store, ring_artifact_dir=self.artifact_dir,
+            builder_manager=self.app.builder_manager,
+            builder_lock_timeout=1, logger=debug_logger())
+        original_build_ring_locked = publisher._build_ring_locked
+        object2_ring = self.app.store.get_ring('object-2')
+        self.app.builder_manager.builder_lock_timeout = 0.01
+        blocked_mutations = []
+
+        def build_with_racing_mutation(ring, *args, **kwargs):
+            if ring['id'] == 'object-1':
+                try:
+                    self.app.builder_manager.add_devices(object2_ring, [{
+                        'id': 65535,
+                        'label': 'node-wide:sdb',
+                        'region': 1,
+                        'zone': 9,
+                        'ip': '10.0.9.99',
+                        'port': 6200,
+                        'replication_ip': '10.1.9.99',
+                        'replication_port': 6200,
+                        'device': 'sdb',
+                        'weight': 100,
+                    }])
+                except RingBuilderManagerError as err:
+                    blocked_mutations.append(str(err))
+                else:
+                    self.fail('racing mutation unexpectedly acquired lock')
+            return original_build_ring_locked(ring, *args, **kwargs)
+
+        with mock.patch.object(
+                publisher, '_build_ring_locked',
+                side_effect=build_with_racing_mutation):
+            result = publisher.publish({
+                'version': 'release-lock-preflight',
+                'rings': ['object-1', 'object-2'],
+                'format_version': 1,
+            })
+
+        self.assertEqual('release-lock-preflight', result['version'])
+        self.assertTrue(result['latest'])
+        self.assertEqual([
+            'timed out waiting for builder lock for ring object-2',
+        ], blocked_mutations)
+        object2_builder = RingBuilder.load(object2_builder_path)
+        self.assertNotIn(65535, [
+            dev['id'] for dev in object2_builder.devs if dev is not None])
+        ring_data = RingData.load(os.path.join(
+            self.artifact_dir,
+            'release-lock-preflight', 'object-1.ring.gz'),
+            metadata_only=True)
+        self.assertEqual(1, ring_data.format_version)
 
     def test_publish_rejects_disabled_and_missing_rings_before_building(self):
         self._disable_initial_rings()
