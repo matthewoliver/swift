@@ -14,14 +14,18 @@
 
 import os
 import re
+import shlex
+import subprocess
 import sys
 
+from eventlet.queue import Full
 from swift import __version__ as swift_version
 from swift.common import exceptions as swift_exceptions
-from swift.common.concurrency import GreenPool, Timeout
-from swift.common.swob import HTTPBadRequest, HTTPException, \
-    HTTPForbidden, HTTPInternalServerError, HTTPMethodNotAllowed, \
-    HTTPNotFound, Request, Response, wsgi_to_str
+from swift.common.concurrency import GreenPool, Queue, Semaphore, Timeout, \
+    spawn, tpool
+from swift.common.swob import HTTPBadRequest, HTTPConflict, \
+    HTTPException, HTTPForbidden, HTTPInternalServerError, \
+    HTTPMethodNotAllowed, HTTPNotFound, Request, Response, wsgi_to_str
 from swift.common.utils import config_true_value, get_log_line, get_logger, \
     config_positive_float_value, config_positive_int_value, \
     LOG_LINE_DEFAULT_FORMAT, non_negative_float, parse_options
@@ -47,6 +51,7 @@ RING_MANAGER_API_VERSION = 'v1'
 RING_MANAGER_API_PREFIX = '/api/%s' % RING_MANAGER_API_VERSION
 DEFAULT_MAX_JSON_REQUEST_BODY_SIZE = 1024 * 1024
 DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS = 1000
+DEFAULT_SYNC_TRIGGER_QUEUE_SIZE = 1
 RING_MANAGER_MODES = ('primary', 'readonly', 'standby')
 READONLY_RING_MANAGER_MODES = ('readonly', 'standby')
 
@@ -119,6 +124,19 @@ class RingManagerApplication(object):
         self.sync_freshness_threshold = non_negative_float(conf.get(
             'ring_manager_sync_freshness_threshold',
             DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD))
+        self.sync_trigger_command = conf.get(
+            'ring_manager_sync_trigger_command')
+        self.sync_trigger_timeout = non_negative_float(conf.get(
+            'ring_manager_sync_trigger_timeout', 0))
+        self.sync_trigger_queue = None
+        self.sync_trigger_worker = None
+        self.sync_trigger_lock = Semaphore()
+        self.sync_trigger_active = False
+        self.sync_trigger_pending = False
+        if self.sync_trigger_command:
+            self.sync_trigger_queue = Queue(
+                maxsize=DEFAULT_SYNC_TRIGGER_QUEUE_SIZE)
+            self.sync_trigger_worker = spawn(self._run_sync_triggers)
         self.build_pool = None
         self.build_worker = None
         if self.ring_build_executor == 'manager':
@@ -152,6 +170,9 @@ class RingManagerApplication(object):
             routing.Route(r'^/api/v1/?$', ('GET',), self.api_root),
             routing.Route(r'^/api/v1/ring_manager/status/?$',
                           ('GET',), self.ring_manager_status),
+            routing.Route(r'^/api/v1/ring_manager/sync/trigger/?$',
+                          ('POST',), self.ring_manager_sync_trigger,
+                          read_only_methods=('POST',)),
         ] + self.ring_controller.routes()
 
     def _route_methods(self, route):
@@ -235,6 +256,7 @@ class RingManagerApplication(object):
     def _api_links(self):
         return {
             'status': '/api/v1/ring_manager/status/',
+            'sync_trigger': '/api/v1/ring_manager/sync/trigger/',
             'rings': '/api/v1/rings/',
             'ring_builds': '/api/v1/rings/builds/',
             'ring_versions': '/api/v1/rings/releases/',
@@ -291,6 +313,128 @@ class RingManagerApplication(object):
             return False
         return os.path.exists(os.path.join(
             self.store.state_dir, RING_MANAGER_SYNC_JOURNAL))
+
+    def _sync_trigger_status(self):
+        self.sync_trigger_lock.acquire()
+        try:
+            return {
+                'configured': bool(self.sync_trigger_command),
+                'active': self.sync_trigger_active,
+                'pending': self.sync_trigger_pending,
+            }
+        finally:
+            self.sync_trigger_lock.release()
+
+    def _queue_sync_trigger(self, payload):
+        item = {
+            'triggered_at': NormalTimestamp.now().internal,
+            'payload': payload,
+        }
+        self.sync_trigger_lock.acquire()
+        try:
+            if self.sync_trigger_pending:
+                return False, item
+            self.sync_trigger_pending = True
+        finally:
+            self.sync_trigger_lock.release()
+        try:
+            self.sync_trigger_queue.put_nowait(item)
+        except Full:
+            # Do not make a transient queue-full condition permanently look
+            # pending; otherwise later wake-ups would be silently dropped.
+            self.sync_trigger_lock.acquire()
+            try:
+                self.sync_trigger_pending = False
+            finally:
+                self.sync_trigger_lock.release()
+            return False, item
+        return True, item
+
+    def _run_sync_triggers(self):
+        while True:
+            item = self.sync_trigger_queue.get()
+            self.sync_trigger_lock.acquire()
+            try:
+                self.sync_trigger_pending = False
+                self.sync_trigger_active = True
+            finally:
+                self.sync_trigger_lock.release()
+            try:
+                try:
+                    tpool.execute(self._run_sync_trigger_command, item)
+                except Exception:
+                    stats_increment(self.logger, 'sync_trigger.failures')
+                    self.logger.exception(
+                        'Unexpected error running ring-manager sync trigger')
+            finally:
+                self.sync_trigger_lock.acquire()
+                try:
+                    self.sync_trigger_active = False
+                finally:
+                    self.sync_trigger_lock.release()
+                self.sync_trigger_queue.task_done()
+
+    def _run_sync_trigger_command(self, item):
+        try:
+            argv = shlex.split(self.sync_trigger_command)
+        except ValueError as err:
+            stats_increment(self.logger, 'sync_trigger.failures')
+            self.logger.warning(
+                'Invalid ring-manager sync trigger command %r: %s',
+                self.sync_trigger_command, err)
+            return
+        if not argv:
+            stats_increment(self.logger, 'sync_trigger.failures')
+            self.logger.warning('Ring-manager sync trigger command is empty')
+            return
+        payload = item.get('payload') or {}
+        env = os.environ.copy()
+        env.update({
+            'RING_MANAGER_SYNC_TRIGGERED_AT':
+                str(item.get('triggered_at') or ''),
+            'RING_MANAGER_SYNC_TRIGGER_REASON':
+                str(payload.get('reason') or ''),
+            'RING_MANAGER_SYNC_TRIGGER_EXPECTED_LATEST':
+                str(payload.get('expected_latest') or ''),
+        })
+        cwd = self.store.state_dir if self.store.state_dir else None
+        started_at = float(NormalTimestamp.now())
+        timeout = self.sync_trigger_timeout or None
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            stats_increment(self.logger, 'sync_trigger.timeouts')
+            stats_increment(self.logger, 'sync_trigger.failures')
+            stats_timing_since(self.logger, 'sync_trigger.timing',
+                               started_at)
+            self.logger.warning(
+                'Ring-manager sync trigger timed out after %s seconds',
+                self.sync_trigger_timeout)
+            return
+        except OSError as err:
+            stats_increment(self.logger, 'sync_trigger.failures')
+            stats_timing_since(self.logger, 'sync_trigger.timing',
+                               started_at)
+            self.logger.warning(
+                'Unable to run ring-manager sync trigger command %r: %s',
+                self.sync_trigger_command, err)
+            return
+        if proc.returncode:
+            stats_increment(self.logger, 'sync_trigger.failures')
+            stats_timing_since(self.logger, 'sync_trigger.timing',
+                               started_at)
+            output = (stderr or stdout or b'').decode('utf-8', 'replace')
+            self.logger.warning(
+                'Ring-manager sync trigger exited %s: %s',
+                proc.returncode, output.strip())
+            return
+        stats_increment(self.logger, 'sync_trigger.successes')
+        stats_timing_since(self.logger, 'sync_trigger.timing', started_at)
 
     def _ring_manager_sync_status(self, latest_version, index_error=None):
         status = self._base_sync_status()
@@ -649,6 +793,7 @@ class RingManagerApplication(object):
                 lease_timeout=self.build_job_lease_timeout),
             'ring_manager_sync': self._ring_manager_sync_status(
                 latest_version, index_error=index_error),
+            'sync_trigger': self._sync_trigger_status(),
         }
         if config_true_value(req.params.get('promotion', 'false')):
             body['promotion_readiness'] = self._promotion_readiness(
@@ -657,6 +802,39 @@ class RingManagerApplication(object):
             body['ring_manager_sync'], body.get('promotion_readiness'))
         self._emit_operator_attention_metrics(body['operator_attention'])
         return http.json_response(req, body)
+
+    def ring_manager_sync_trigger(self, req):
+        stats_increment(self.logger, 'sync_trigger.requests')
+        if self.writable:
+            return http.json_error(
+                req, HTTPConflict,
+                'ring-manager sync trigger is available only in readonly '
+                'or standby mode')
+        if not self.sync_trigger_command:
+            stats_increment(self.logger, 'sync_trigger.disabled')
+            return http.json_error(
+                req, HTTPConflict,
+                'ring_manager_sync_trigger_command is not configured')
+
+        payload = http.json_request_body(req, self.max_json_request_body_size)
+        trigger = {
+            'reason': payload.get('reason') or
+            req.params.get('reason') or 'api',
+            'expected_latest': payload.get('expected_latest') or
+            req.params.get('expected_latest') or '',
+        }
+        queued, _item = self._queue_sync_trigger(trigger)
+        if queued:
+            stats_increment(self.logger, 'sync_trigger.queued')
+            state = 'queued'
+        else:
+            stats_increment(self.logger, 'sync_trigger.already_pending')
+            state = 'already_pending'
+        return http.json_response(req, {
+            'state': state,
+            'queued': queued,
+            'sync_trigger': self._sync_trigger_status(),
+        }, status=202)
 
 
 def app_factory(global_conf, **local_conf):

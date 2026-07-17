@@ -61,6 +61,13 @@ that remain referenced by the current release.
 non-zero until the standby is ready.
 Its state and recon timestamp fields use Swift ``NormalTimestamp.internal``
 strings, while elapsed sync time remains numeric seconds.
+An authenticated controller can call the replica's
+``POST /api/v1/ring_manager/sync/trigger/`` endpoint to queue a configured,
+root-owned local sync wrapper.
+The queue keeps at most one follow-up request while a wrapper is active, so
+notifications cannot create overlapping pulls.
+It is a pull-only signal: it neither transfers bytes in the request path nor
+changes the release pointer or promotes the standby.
 
 Ring-specific resources are owned by an internal controller.
 This keeps HTTP dispatch and process lifecycle in the WSGI application while

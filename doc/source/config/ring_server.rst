@@ -61,6 +61,25 @@ Server options
     This is an observability and failover-precheck value, not an automatic
     promotion mechanism or a read-path availability gate.
 
+``ring_manager_sync_trigger_command``
+    Optional root-owned wrapper which starts ``swift-ring-manager-sync`` on a
+    ``readonly`` or ``standby`` server when an authenticated operator sends a
+    ``POST /api/v1/ring_manager/sync/trigger/`` request.
+    Requests queue at most one follow-up run and return before the pull starts.
+    The command is split with shell-like quoting and executed without a shell.
+    It runs with ``ring_manager_state_dir`` as its working directory and
+    receives ``RING_MANAGER_SYNC_TRIGGERED_AT``,
+    ``RING_MANAGER_SYNC_TRIGGER_REASON``, and
+    ``RING_MANAGER_SYNC_TRIGGER_EXPECTED_LATEST`` in its environment.
+    Use a wrapper script to keep source URLs, credentials, and any multi-step
+    recovery logic outside the service configuration.
+    The trigger only requests a local pull; it cannot push state or promote a
+    standby server.
+
+``ring_manager_sync_trigger_timeout``
+    Seconds to wait for the sync-trigger wrapper.
+    The default is ``0``, which does not set a timeout.
+
 ``ring_manager_state_dir``
     Root of the directory-backed JSON state.
     The default is ``/etc/swift/ring-manager-state``.
@@ -173,6 +192,17 @@ State-change hook metrics include::
     state_change_hook.failures
     state_change_hook.timeouts
     state_change_hook.timing
+
+Sync-trigger wrapper metrics include::
+
+    sync_trigger.requests
+    sync_trigger.queued
+    sync_trigger.already_pending
+    sync_trigger.disabled
+    sync_trigger.successes
+    sync_trigger.failures
+    sync_trigger.timeouts
+    sync_trigger.timing
 
 ``swift-ring-manager-sync`` also emits metrics when invoked with
 ``--log-statsd-host``::

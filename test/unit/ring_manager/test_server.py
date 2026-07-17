@@ -15,12 +15,14 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
 from urllib.parse import quote
 
+from swift.common.concurrency import Event, sleep
 from swift.common.ring.builder import RingBuilder
 from swift.common.ring.ring import RingData
 from swift.common.swob import Request, Response
@@ -293,6 +295,8 @@ class TestRingManagerApplication(unittest.TestCase):
                          app.builder_lock_timeout)
         self.assertEqual(DEFAULT_RING_BUILD_EXECUTOR,
                          app.ring_build_executor)
+        self.assertIsNone(app.sync_trigger_command)
+        self.assertEqual(0.0, app.sync_trigger_timeout)
 
     def test_controller_receives_store(self):
         self.assertIs(self.app.store, self.app.ring_controller._store)
@@ -307,6 +311,8 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual('/api/v1/', body['api_versions'][0]['url'])
         self.assertEqual(
             '/api/v1/ring_manager/status/', body['links']['status'])
+        self.assertEqual('/api/v1/ring_manager/sync/trigger/',
+                         body['links']['sync_trigger'])
         self.assertEqual('/api/v1/rings/', body['links']['rings'])
         self.assertEqual('/api/v1/rings/builds/',
                          body['links']['ring_builds'])
@@ -332,6 +338,11 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(self.latest_version, body['latest_ring_version'])
         self.assertEqual('external', body['ring_build_executor'])
         self.assertEqual(0, body['ring_builds']['total'])
+        self.assertEqual({
+            'configured': False,
+            'active': False,
+            'pending': False,
+        }, body['sync_trigger'])
         self.assertEqual({
             'applicable': False,
             'source': None,
@@ -370,15 +381,39 @@ class TestRingManagerApplication(unittest.TestCase):
         return NormalTimestamp(
             float(NormalTimestamp.now()) - seconds).internal
 
-    def _status_app(self, mode='standby', threshold=300):
+    def _status_app(self, mode='standby', threshold=300,
+                    sync_trigger_command=None, sync_trigger_timeout=None,
+                    logger=None):
+        conf = {
+            'ring_manager_state_dir': self.state_dir,
+            'ring_artifact_dir': self.artifact_dir,
+            'ring_builder_dir': self.testdir,
+            'ring_manager_mode': mode,
+            'ring_manager_sync_freshness_threshold': threshold,
+        }
+        if sync_trigger_command is not None:
+            conf['ring_manager_sync_trigger_command'] = sync_trigger_command
+        if sync_trigger_timeout is not None:
+            conf['ring_manager_sync_trigger_timeout'] = sync_trigger_timeout
         return RingManagerApplication(
-            {
-                'ring_manager_state_dir': self.state_dir,
-                'ring_artifact_dir': self.artifact_dir,
-                'ring_builder_dir': self.testdir,
-                'ring_manager_mode': mode,
-                'ring_manager_sync_freshness_threshold': threshold,
-            }, logger=debug_logger())
+            conf, logger=logger or debug_logger())
+
+    def _make_sync_trigger_command(self):
+        command_path = os.path.join(self.testdir, 'sync-trigger')
+        log_path = os.path.join(self.testdir, 'sync-trigger.log')
+        with open(command_path, 'w') as fp:
+            fp.write('#!/bin/sh\n')
+            fp.write('printf "%s|%s|%s|%s\\n" '
+                     '"$RING_MANAGER_SYNC_TRIGGERED_AT" '
+                     '"$RING_MANAGER_SYNC_TRIGGER_REASON" '
+                     '"$RING_MANAGER_SYNC_TRIGGER_EXPECTED_LATEST" '
+                     '"$PWD" >> "$1"\n')
+        os.chmod(command_path, 0o755)
+        return command_path, log_path
+
+    def _wait_sync_triggers(self, app):
+        if app.sync_trigger_queue is not None:
+            app.sync_trigger_queue.join()
 
     def _write_sync_index(self, synced_at, latest_version=None,
                           source='https://primary.example.com:6205'):
@@ -393,6 +428,166 @@ class TestRingManagerApplication(unittest.TestCase):
             'latest_ring_version': self.latest_version,
             'ring_manager_sync': sync_info,
         })
+
+    def test_sync_trigger_status_reports_configured_state(self):
+        app = self._status_app(
+            mode='standby', sync_trigger_command='/bin/true')
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=app)
+
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual({
+            'configured': True,
+            'active': False,
+            'pending': False,
+        }, body['sync_trigger'])
+
+    def test_sync_trigger_requires_configured_command(self):
+        logger = debug_logger()
+        app = self._status_app(mode='readonly', logger=logger)
+
+        resp, body = self.json_request(
+            '/api/v1/ring_manager/sync/trigger/', 'POST', {}, app=app)
+
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('ring_manager_sync_trigger_command', body['error'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync_trigger.requests'])
+        self.assertEqual(1, counts['sync_trigger.disabled'])
+
+    def test_sync_trigger_rejects_primary_mode(self):
+        logger = debug_logger()
+        app = self._status_app(
+            mode='primary', sync_trigger_command='/bin/true', logger=logger)
+
+        resp, body = self.json_request(
+            '/api/v1/ring_manager/sync/trigger/', 'POST', {}, app=app)
+
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('available only in readonly or standby', body['error'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync_trigger.requests'])
+        self.assertNotIn('sync_trigger.queued', counts)
+
+    def test_sync_trigger_queues_and_coalesces(self):
+        logger = debug_logger()
+        app = self._status_app(
+            mode='standby', sync_trigger_command='/bin/true', logger=logger)
+        trigger_started = Event()
+        trigger_blocked = Event()
+        calls = []
+
+        def block_trigger_worker(func, item):
+            calls.append(item)
+            if not trigger_started.ready():
+                trigger_started.send(True)
+            trigger_blocked.wait()
+
+        with mock.patch(
+                'swift.ring_manager.server.tpool.execute',
+                side_effect=block_trigger_worker):
+            resp, body = self.json_request(
+                '/api/v1/ring_manager/sync/trigger/', 'POST', {
+                    'reason': 'publish',
+                    'expected_latest': self.latest_version,
+                }, app=app)
+            self.assertEqual(202, resp.status_int)
+            self.assertEqual('queued', body['state'])
+            self.assertTrue(body['queued'])
+
+            for _attempt in range(10):
+                if trigger_started.ready():
+                    break
+                sleep(0)
+            self.assertTrue(trigger_started.ready())
+            self.assertEqual('publish', calls[0]['payload']['reason'])
+            self.assertEqual(self.latest_version,
+                             calls[0]['payload']['expected_latest'])
+
+            resp, body = self.get_json(
+                '/api/v1/ring_manager/status/', app=app)
+            self.assertEqual({
+                'configured': True,
+                'active': True,
+                'pending': False,
+            }, body['sync_trigger'])
+
+            resp, body = self.json_request(
+                '/api/v1/ring_manager/sync/trigger/', 'POST', {}, app=app)
+            self.assertEqual(202, resp.status_int)
+            self.assertEqual('queued', body['state'])
+            self.assertTrue(body['queued'])
+
+            resp, body = self.json_request(
+                '/api/v1/ring_manager/sync/trigger/', 'POST', {}, app=app)
+            self.assertEqual(202, resp.status_int)
+            self.assertEqual('already_pending', body['state'])
+            self.assertFalse(body['queued'])
+
+            trigger_blocked.send(True)
+            self._wait_sync_triggers(app)
+
+        self.assertEqual(2, len(calls))
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(3, counts['sync_trigger.requests'])
+        self.assertEqual(2, counts['sync_trigger.queued'])
+        self.assertEqual(1, counts['sync_trigger.already_pending'])
+
+    def test_sync_trigger_command_receives_environment(self):
+        command_path, log_path = self._make_sync_trigger_command()
+        logger = debug_logger()
+        app = self._status_app(
+            mode='standby',
+            sync_trigger_command='%s %s' % (command_path, log_path),
+            logger=logger)
+
+        app._run_sync_trigger_command({
+            'triggered_at': '1800000000.00000',
+            'payload': {
+                'reason': 'publish',
+                'expected_latest': self.latest_version,
+            },
+        })
+
+        with open(log_path) as fp:
+            line = fp.read().rstrip('\n').split('|')
+        self.assertEqual([
+            '1800000000.00000',
+            'publish',
+            self.latest_version,
+            self.state_dir,
+        ], line)
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync_trigger.successes'])
+        self.assertEqual(
+            ['sync_trigger.timing'],
+            [call[0][0] for call in logger.statsd_client.calls['timing']
+             if call[0][0] == 'sync_trigger.timing'])
+
+    def test_sync_trigger_timeout_records_failure(self):
+        logger = debug_logger()
+        app = self._status_app(
+            mode='standby', sync_trigger_command='/bin/sleep 10',
+            sync_trigger_timeout=1, logger=logger)
+        process = mock.Mock()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(['/bin/sleep', '10'], 1),
+            (b'', b''),
+        ]
+
+        with mock.patch(
+                'swift.ring_manager.server.subprocess.Popen',
+                return_value=process):
+            app._run_sync_trigger_command({
+                'triggered_at': '1800000000.00000',
+                'payload': {},
+            })
+
+        process.kill.assert_called_once_with()
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync_trigger.timeouts'])
+        self.assertEqual(1, counts['sync_trigger.failures'])
 
     def test_readonly_status_reports_fresh_sync_for_reads(self):
         self._write_sync_index(self._timestamp_seconds_ago(10))
@@ -1021,6 +1216,8 @@ class TestRingManagerApplication(unittest.TestCase):
             ('^/api/v1/?$', ('GET',), 'api_root'),
             ('^/api/v1/ring_manager/status/?$',
              ('GET',), 'ring_manager_status'),
+            ('^/api/v1/ring_manager/sync/trigger/?$',
+             ('POST',), 'ring_manager_sync_trigger'),
             ('^/api/v1/rings/schema/?$', ('GET',), 'ring_schema'),
             ('^/api/v1/rings/?$', ('GET', 'POST'), 'ring_list'),
             ('^/api/v1/rings/membership/device/'

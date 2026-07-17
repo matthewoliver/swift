@@ -35,6 +35,17 @@ use = egg:swift#ring_manager
 # reports published state as stale. This does not block existing read routes.
 # ring_manager_sync_freshness_threshold = 300
 #
+# Optional root-owned wrapper to request a local pull on a readonly or standby
+# server. POST /api/v1/ring_manager/sync/trigger/ queues at most one follow-up
+# run; it never pushes state or promotes the server. The command is split like
+# a shell command but runs without a shell, in ring_manager_state_dir, with
+# RING_MANAGER_SYNC_TRIGGERED_AT, RING_MANAGER_SYNC_TRIGGER_REASON, and
+# RING_MANAGER_SYNC_TRIGGER_EXPECTED_LATEST set. Use a wrapper for sync args.
+# ring_manager_sync_trigger_command =
+#
+# Seconds to wait for the sync-trigger wrapper. Use 0 for no timeout.
+# ring_manager_sync_trigger_timeout = 0
+#
 # Directory for Swift-native ring-manager state. Each resource is stored in
 # its own JSON file and updates are written atomically and durably.
 # ring_manager_state_dir = /etc/swift/ring-manager-state

@@ -54,7 +54,8 @@ Example response::
         "ring_builds": "/api/v1/rings/builds/",
         "ring_versions": "/api/v1/rings/releases/",
         "rings": "/api/v1/rings/",
-        "status": "/api/v1/ring_manager/status/"
+        "status": "/api/v1/ring_manager/status/",
+        "sync_trigger": "/api/v1/ring_manager/sync/trigger/"
       },
       "mode": "primary",
       "service": "ring-manager-server",
@@ -72,6 +73,9 @@ This permits replicas to serve discovery, status, published releases, and
 artifact downloads while retaining one authoritative writer.
 The bulk ``POST .../partitions_at_risk/`` analysis route is explicitly
 read-only and therefore remains available in these modes.
+The ``POST /api/v1/ring_manager/sync/trigger/`` route is also explicitly
+read-only: it can only request a configured local pull from a replica and
+cannot change published state or promote the server.
 
 Ring resources
 ==============
@@ -606,6 +610,11 @@ Example response::
         "promotion_blockers": ["mode_not_standby"],
         "reasons": []
       },
+      "sync_trigger": {
+        "configured": true,
+        "active": false,
+        "pending": false
+      },
       "operator_attention": {
         "needed": false,
         "reasons": [],
@@ -661,6 +670,10 @@ ready.
 Neither response fences the old primary, redirects writers, or performs
 automatic failover.
 
+``sync_trigger`` reports whether a local sync-trigger wrapper is configured,
+currently running, or waiting as the one permitted follow-up run.
+It contains no command, source URL, credential, or local path details.
+
 ``operator_attention`` summarizes conditions that should page or stop an HA
 runbook without requiring it to interpret every status field.
 It is ``needed=true`` when synchronized state is not fresh enough to prefer
@@ -669,6 +682,35 @@ standby's published-state promotion precheck fails.
 The server emits ``operator_attention``, ``operator_attention.sync``,
 ``operator_attention.promotion``, and ``operator_attention.<reason>`` StatsD
 counters when this state is present.
+
+Standby sync trigger
+====================
+
+``POST /api/v1/ring_manager/sync/trigger/``
+------------------------------------------------
+
+Queues a configured local pull on a ``readonly`` or ``standby`` server.
+The request is accepted only when ``ring_manager_sync_trigger_command`` is
+configured; a primary server or a replica without that command receives
+``409 Conflict``.
+The route is subject to the normal ring-manager authentication policy even
+though it is available in read-only modes.
+
+The optional JSON body, or equivalent query parameters, may specify a
+``reason`` and ``expected_latest``.
+The server passes these as
+``RING_MANAGER_SYNC_TRIGGER_REASON`` and
+``RING_MANAGER_SYNC_TRIGGER_EXPECTED_LATEST`` to the wrapper, with
+``RING_MANAGER_SYNC_TRIGGERED_AT`` set to a Swift normal timestamp.
+The command runs without a shell in ``ring_manager_state_dir``.
+
+The response is ``202 Accepted`` and reports whether a run was newly
+``queued`` or an existing queued follow-up was retained.
+The bounded queue permits one follow-up while a command is active, so repeated
+notifications do not start overlapping sync processes.
+The endpoint returns before the wrapper starts and does not transfer bytes,
+advance the local release pointer, or perform standby promotion.
+The wrapper must perform the pull and any operator-specific retry policy.
 
 Method negotiation
 ==================
