@@ -365,17 +365,19 @@ read-only, so it remains available to these replicas.
 This keeps ring authoring ordered while allowing clients to use replicas for
 discovery, status, manifests, and immutable artefact downloads.
 
-swift-ring-manager-sync pulls a primary's latest published release, or a
-fresh replica's latest published release, into a read-only or standby server.
+swift-ring-manager-sync pulls a primary's latest and desired published state,
+or a fresh replica's matching state, into a read-only or standby server.
 It validates ``/api/v1/ring_manager/status/`` before downloading.
 A primary is accepted directly.
 A read-only or standby source must report fresh, synced, non-stale published
-state with a matching latest version and valid upstream sync timestamp.
+state with matching latest and desired versions and a valid upstream sync
+timestamp.
 This prevents old last-known-good data from a stale replica being recorded as
 a fresh downstream sync.
 It verifies declared byte counts and SHA-256 digests before recording each
-immutable artefact, then writes the local release manifest and advances
-latest_ring_version only after the full pull succeeds.
+immutable artefact, then writes the local release manifest and advances the
+latest_ring_version and desired_ring_version pointers atomically only after
+the full pull succeeds.
 
 For example::
 
@@ -402,9 +404,10 @@ Local state, index, artifact, or cleanup failures abort the attempt rather
 than mixing a partially written local state with a later source.
 Mutable state JSON and synced builder files are committed with rollback
 backups. If that local commit fails, the previous mutable state is restored
-and ``latest_ring_version`` is not advanced. Immutable artifact files may be
-left on disk after a failed attempt because they are addressed by checksum and
-are not visible through ``latest`` until the state commit succeeds. A pending
+and neither release pointer is advanced. Immutable artifact files may be left
+on disk after a failed attempt because they are addressed by checksum and are
+not visible through either release pointer until the state commit succeeds.
+A pending
 sync transaction journal makes status fail closed with
 ``sync_transaction_pending`` until the next sync run recovers it. Recon
 includes a ``sync_transaction`` summary; recovery details mirror the
@@ -430,10 +433,10 @@ For a promotable standby, ``sync_builder_files = true`` or
 admin-only endpoints.
 Builder sync requires admin credentials, verifies the byte count, SHA-256
 digest, and Swift builder loadability, and writes files below
-``ring_builder_dir`` before the local ``latest_ring_version`` advances.
+``ring_builder_dir`` before the local release pointers advance.
 Synced builder files are committed together with mutable state JSON using
 rollback backups; if the local commit fails, the previous builder files and
-state JSON are restored and ``latest`` is not advanced.
+state JSON are restored and neither release pointer is advanced.
 Disabled-ring builders are skipped by default.
 The command records its latest attempt in ring-manager.recon below the
 recon cache directory.

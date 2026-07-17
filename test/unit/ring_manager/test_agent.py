@@ -93,6 +93,7 @@ class TestRingManagerAgent(unittest.TestCase):
             'state': 'published',
             'created_at': self.created_at,
             'latest': True,
+            'desired': True,
             'resource_uri': '/api/v1/rings/releases/release-1/',
             'files': [
                 {
@@ -145,6 +146,7 @@ class TestRingManagerAgent(unittest.TestCase):
             'state': 'published',
             'created_at': created_at or self.created_at,
             'latest': True,
+            'desired': True,
             'resource_uri': '/api/v1/rings/releases/%s/' % version,
             'files': [
                 {
@@ -162,18 +164,17 @@ class TestRingManagerAgent(unittest.TestCase):
                              host='ring.example.com:6205'):
         body = self.ring_body if body is None else body
         routes = {}
-        routes[('GET', host, '/api/v1/rings/releases/latest/manifest/')] = \
+        routes[('GET', host, '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(manifest)
         routes[('GET', host, manifest['files'][0]['url'])] = \
             FakeResponse(body)
         return routes
 
-    def _write_agent_state(self, version, created_at, manifest=None):
+    def _write_agent_state(self, version, created_at, manifest=None,
+                           legacy=False):
         os.makedirs(os.path.dirname(self.state_file))
         state = {
             'source': 'https://previous.example.com:6205',
-            'latest_ring_version': version,
-            'latest_ring_created_at': created_at,
             'synced_at': created_at,
             'swift_dir': self.swift_dir,
             'files': [],
@@ -182,6 +183,12 @@ class TestRingManagerAgent(unittest.TestCase):
                 'created_at': created_at,
             },
         }
+        if legacy:
+            state['latest_ring_version'] = version
+            state['latest_ring_created_at'] = created_at
+        else:
+            state['installed_ring_version'] = version
+            state['installed_ring_created_at'] = created_at
         with open(self.state_file, 'w') as fp:
             json.dump(state, fp)
 
@@ -201,7 +208,7 @@ class TestRingManagerAgent(unittest.TestCase):
         return path
 
     def _routes(self):
-        manifest_path = '/api/v1/rings/releases/latest/manifest/'
+        manifest_path = '/api/v1/rings/releases/desired/manifest/'
         file_path = '/api/v1/rings/releases/release-1/files/object.ring.gz'
         routes = {}
         routes[('GET', 'ring.example.com:6205', manifest_path)] = \
@@ -226,7 +233,7 @@ class TestRingManagerAgent(unittest.TestCase):
             routes[('GET', 'ring.example.com:6205', path)] = \
                 FakeResponse(body)
         routes[('GET', 'ring.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(manifest)
         return manifest, routes
 
@@ -236,7 +243,7 @@ class TestRingManagerAgent(unittest.TestCase):
         result = self._agent(opener, logger=logger).sync_once()
 
         self.assertEqual({
-            'latest_ring_version': 'release-1',
+            'desired_ring_version': 'release-1',
             'files_installed': 1,
             'files_downloaded': 1,
             'files_unchanged': 0,
@@ -247,19 +254,23 @@ class TestRingManagerAgent(unittest.TestCase):
 
         with open(self.state_file, 'r') as fp:
             state = json.load(fp)
-        self.assertEqual('release-1', state['latest_ring_version'])
+        self.assertEqual('release-1', state['installed_ring_version'])
         self.assertEqual('https://ring.example.com:6205', state['source'])
         self.assertEqual(ring_path, state['files'][0]['path'])
 
         stats = self._recon_stats()
         self.assertTrue(stats['success'])
         self.assertEqual('enforce', stats['mode'])
-        self.assertEqual('release-1', stats['latest_ring_version'])
+        self.assertEqual('release-1', stats['desired_ring_version'])
+        self.assertNotIn('latest_ring_version', stats)
         self.assertEqual(1, stats['files_downloaded'])
         self.assertEqual(0, stats['files_unchanged'])
         self.assertEqual(self.swift_dir, stats['swift_dir'])
         self.assertFalse(stats['operator_attention']['needed'])
         self.assertEqual(11, opener.requests[0]['timeout'])
+        self.assertEqual(
+            '/api/v1/rings/releases/desired/manifest/',
+            opener.requests[0]['path'])
 
         counts = logger.statsd_client.get_stats_counts()
         self.assertEqual(1, counts['agent.sync.attempts'])
@@ -273,6 +284,76 @@ class TestRingManagerAgent(unittest.TestCase):
             'agent.sync.timing',
             [call[0][0] for call in
              logger.statsd_client.calls['timing']])
+
+    def test_sync_once_fails_closed_without_desired_release(self):
+        manifest_path = '/api/v1/rings/releases/desired/manifest/'
+        opener = FakeOpener({
+            ('GET', 'ring.example.com:6205', manifest_path):
+                FakeResponse(b'{"error": "no desired release"}', status=404),
+        })
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(opener).sync_once()
+
+        self.assertIn('failed with HTTP 404', str(cm.exception))
+        self.assertEqual([manifest_path], [
+            request['path'] for request in opener.requests])
+        self.assertFalse(os.path.exists(self.state_file))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.swift_dir, 'object.ring.gz')))
+
+    def test_sync_once_rejects_manifest_not_marked_desired(self):
+        manifest = dict(self.manifest)
+        manifest.pop('desired')
+        routes = self._routes()
+        routes[('GET', 'ring.example.com:6205',
+                '/api/v1/rings/releases/desired/manifest/')] = \
+            json_response(manifest)
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(opener).sync_once()
+
+        self.assertIn('desired manifest is not marked desired',
+                      str(cm.exception))
+        self.assertEqual(1, len(opener.requests))
+        self.assertFalse(os.path.exists(self.state_file))
+
+    def test_sync_once_rejects_desired_without_created_at_before_install(self):
+        manifest = dict(self.manifest)
+        manifest.pop('created_at')
+        opener = FakeOpener(self._routes_for_manifest(manifest))
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(opener).sync_once()
+
+        self.assertIn('desired manifest has no created_at', str(cm.exception))
+        self.assertEqual(1, len(opener.requests))
+        self.assertFalse(os.path.exists(self.state_file))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.swift_dir, 'object.ring.gz')))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.swift_dir, INSTALL_JOURNAL)))
+        stats = self._recon_stats()
+        self.assertFalse(stats['success'])
+        self.assertIn('desired manifest has no created_at',
+                      stats['source_errors'][0]['error'])
+
+    def test_sync_once_clears_legacy_latest_recon_field(self):
+        os.makedirs(self.recon_cache_path)
+        recon_path = os.path.join(
+            self.recon_cache_path, RECON_RING_MANAGER_AGENT_FILE)
+        with open(recon_path, 'w') as fp:
+            json.dump({'ring_manager_agent': {
+                'mode': 'enforce',
+                'latest_ring_version': 'legacy-release',
+            }}, fp)
+
+        self._agent(FakeOpener(self._routes())).sync_once()
+
+        stats = self._recon_stats()
+        self.assertEqual('release-1', stats['desired_ring_version'])
+        self.assertNotIn('latest_ring_version', stats)
 
     def test_observe_mode_inventories_without_url_or_local_writes(self):
         ring_path = self._write_ring()
@@ -717,7 +798,8 @@ class TestRingManagerAgent(unittest.TestCase):
         self.assertEqual('enforce', stats['mode'])
         for field in agent_mod.OBSERVE_RECON_FIELDS:
             self.assertNotIn(field, stats)
-        self.assertIn('latest_ring_version', stats)
+        self.assertIn('desired_ring_version', stats)
+        self.assertNotIn('latest_ring_version', stats)
         self.assertIn('source', stats)
 
         ring_path = self._write_ring(version=8)
@@ -776,7 +858,8 @@ class TestRingManagerAgent(unittest.TestCase):
         with open(ring_path, 'wb') as fp:
             fp.write(b'already installed ring')
         installed_created_at = agent_mod.NormalTimestamp(2).internal
-        self._write_agent_state('release-2', installed_created_at)
+        self._write_agent_state(
+            'release-2', installed_created_at, legacy=True)
         opener = FakeOpener(self._routes())
 
         with self.assertRaises(RingManagerAgentError) as cm:
@@ -810,7 +893,7 @@ class TestRingManagerAgent(unittest.TestCase):
             opener, allow_ring_version_rollback='true').sync_once()
 
         self.assertEqual({
-            'latest_ring_version': 'release-1',
+            'desired_ring_version': 'release-1',
             'files_installed': 1,
             'files_downloaded': 1,
             'files_unchanged': 0,
@@ -819,20 +902,23 @@ class TestRingManagerAgent(unittest.TestCase):
             self.assertEqual(self.ring_body, fp.read())
         with open(self.state_file, 'r') as fp:
             state = json.load(fp)
-        self.assertEqual('release-1', state['latest_ring_version'])
-        self.assertEqual(self.created_at, state['latest_ring_created_at'])
+        self.assertEqual('release-1', state['installed_ring_version'])
+        self.assertEqual(self.created_at, state['installed_ring_created_at'])
+        self.assertNotIn('latest_ring_version', state)
 
     def test_sync_once_allows_equal_manifest_timestamp(self):
-        self._write_agent_state('release-1', self.created_at)
+        self._write_agent_state(
+            'release-1', self.created_at, legacy=True)
         opener = FakeOpener(self._routes())
 
         result = self._agent(opener).sync_once()
 
-        self.assertEqual('release-1', result['latest_ring_version'])
+        self.assertEqual('release-1', result['desired_ring_version'])
         with open(self.state_file, 'r') as fp:
             state = json.load(fp)
-        self.assertEqual('release-1', state['latest_ring_version'])
-        self.assertEqual(self.created_at, state['latest_ring_created_at'])
+        self.assertEqual('release-1', state['installed_ring_version'])
+        self.assertEqual(self.created_at, state['installed_ring_created_at'])
+        self.assertNotIn('latest_ring_version', state)
         self.assertEqual(2, len(opener.requests))
 
     def test_sync_once_allows_newer_manifest_than_state(self):
@@ -846,15 +932,15 @@ class TestRingManagerAgent(unittest.TestCase):
         result = self._agent(opener).sync_once()
 
         self.assertEqual({
-            'latest_ring_version': 'release-2',
+            'desired_ring_version': 'release-2',
             'files_installed': 1,
             'files_downloaded': 1,
             'files_unchanged': 0,
         }, result)
         with open(self.state_file, 'r') as fp:
             state = json.load(fp)
-        self.assertEqual('release-2', state['latest_ring_version'])
-        self.assertEqual(newer_created_at, state['latest_ring_created_at'])
+        self.assertEqual('release-2', state['installed_ring_version'])
+        self.assertEqual(newer_created_at, state['installed_ring_created_at'])
         with open(os.path.join(self.swift_dir, 'object.ring.gz'), 'rb') as fp:
             self.assertEqual(newer_body, fp.read())
 
@@ -864,7 +950,7 @@ class TestRingManagerAgent(unittest.TestCase):
             fp.write('{bad json')
         routes = self._routes()
         routes[('GET', 'backup.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(self.manifest)
         opener = FakeOpener(routes)
 
@@ -890,7 +976,7 @@ class TestRingManagerAgent(unittest.TestCase):
             json.dump([], fp)
         routes = self._routes()
         routes[('GET', 'backup.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(self.manifest)
         opener = FakeOpener(routes)
 
@@ -1016,7 +1102,7 @@ class TestRingManagerAgent(unittest.TestCase):
 
         routes = self._routes()
         routes[('GET', 'ring.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = manifest_route
+                '/api/v1/rings/releases/desired/manifest/')] = manifest_route
         routes[('GET', 'ring.example.com:6205',
                 '/api/v1/rings/releases/release-1/files/object.ring.gz')] = \
             file_route
@@ -1031,7 +1117,7 @@ class TestRingManagerAgent(unittest.TestCase):
         def fail_primary(_request):
             raise urllib_request.URLError('down')
 
-        manifest_path = '/api/v1/rings/releases/latest/manifest/'
+        manifest_path = '/api/v1/rings/releases/desired/manifest/'
         file_path = '/api/v1/rings/releases/release-1/files/object.ring.gz'
         routes = {}
         routes[('GET', 'primary.example.com:6205', manifest_path)] = \
@@ -1050,7 +1136,7 @@ class TestRingManagerAgent(unittest.TestCase):
 
         result = agent.sync_once()
 
-        self.assertEqual('release-1', result['latest_ring_version'])
+        self.assertEqual('release-1', result['desired_ring_version'])
         self.assertEqual('primary.example.com:6205',
                          opener.requests[0]['host'])
         self.assertEqual('secondary.example.com:6205',
@@ -1074,6 +1160,34 @@ class TestRingManagerAgent(unittest.TestCase):
         self.assertEqual(1, counts['agent.operator_attention'])
         self.assertEqual(1, counts['agent.operator_attention.source_errors'])
 
+    def test_sync_once_falls_back_when_source_has_no_desired_release(self):
+        manifest_path = '/api/v1/rings/releases/desired/manifest/'
+        file_path = '/api/v1/rings/releases/release-1/files/object.ring.gz'
+        opener = FakeOpener({
+            ('GET', 'primary.example.com:6205', manifest_path):
+                FakeResponse(b'{"error": "no desired release"}', status=404),
+            ('GET', 'secondary.example.com:6205', manifest_path):
+                json_response(self.manifest),
+            ('GET', 'secondary.example.com:6205', file_path):
+                FakeResponse(self.ring_body),
+        })
+
+        result = self._agent(
+            opener,
+            urls='https://primary.example.com:6205, '
+                 'https://secondary.example.com:6205').sync_once()
+
+        self.assertEqual('release-1', result['desired_ring_version'])
+        self.assertEqual([
+            'primary.example.com:6205',
+            'secondary.example.com:6205',
+            'secondary.example.com:6205',
+        ], [request['host'] for request in opener.requests])
+        stats = self._recon_stats()
+        self.assertEqual(
+            'https://secondary.example.com:6205', stats['source'])
+        self.assertIn('HTTP 404', stats['source_errors'][0]['error'])
+
     def test_sync_once_rejects_cross_origin_artifact_url(self):
         manifest = dict(self.manifest)
         manifest['files'] = [dict(
@@ -1081,7 +1195,7 @@ class TestRingManagerAgent(unittest.TestCase):
             url='https://evil.example.com/steal')]
         routes = self._routes()
         routes[('GET', 'ring.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(manifest)
         opener = FakeOpener(routes)
 
@@ -1100,7 +1214,7 @@ class TestRingManagerAgent(unittest.TestCase):
             url='/api/v1/../../healthcheck')]
         routes = self._routes()
         routes[('GET', 'ring.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(manifest)
         opener = FakeOpener(routes)
 
@@ -1165,7 +1279,7 @@ class TestRingManagerAgent(unittest.TestCase):
             self.ring_body)
         result = self._agent(opener).sync_once()
 
-        self.assertEqual('release-1', result['latest_ring_version'])
+        self.assertEqual('release-1', result['desired_ring_version'])
         stats = self._recon_stats()
         self.assertTrue(stats['success'])
         self.assertNotIn('source_errors', stats)
@@ -1218,7 +1332,7 @@ class TestRingManagerAgent(unittest.TestCase):
              hashlib.sha256(b'expected container ring').hexdigest()),
         ])
         routes[('GET', 'backup.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(self.manifest)
         opener = FakeOpener(routes)
 
@@ -1248,7 +1362,7 @@ class TestRingManagerAgent(unittest.TestCase):
         os.makedirs(self.swift_dir)
         routes = self._routes()
         routes[('GET', 'backup.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(self.manifest)
         opener = FakeOpener(routes)
         real_fsync = agent_mod.fsync
@@ -1453,7 +1567,7 @@ class TestRingManagerAgent(unittest.TestCase):
              hashlib.sha256(container_body).hexdigest()),
         ])
         routes[('GET', 'backup.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(self.manifest)
         opener = FakeOpener(routes)
         real_rename = os.rename
@@ -1495,7 +1609,7 @@ class TestRingManagerAgent(unittest.TestCase):
             fp.write(b'old object ring')
         routes = self._routes()
         routes[('GET', 'backup.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(self.manifest)
         opener = FakeOpener(routes)
         real_unlink = os.unlink
@@ -1625,7 +1739,7 @@ class TestRingManagerAgent(unittest.TestCase):
 
         routes = {
             ('GET', 'ring.example.com:6205',
-             '/api/v1/rings/releases/latest/manifest/'): fail_manifest,
+             '/api/v1/rings/releases/desired/manifest/'): fail_manifest,
         }
         logger = debug_logger()
 
@@ -1763,7 +1877,7 @@ class TestRingManagerAgent(unittest.TestCase):
                                   name='../object.ring.gz')]
         routes = self._routes()
         routes[('GET', 'ring.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(manifest)
         opener = FakeOpener(routes)
 
@@ -1779,7 +1893,7 @@ class TestRingManagerAgent(unittest.TestCase):
             manifest['files'] = [dict(self.manifest['files'][0], name=name)]
             routes = self._routes()
             routes[('GET', 'ring.example.com:6205',
-                    '/api/v1/rings/releases/latest/manifest/')] = \
+                    '/api/v1/rings/releases/desired/manifest/')] = \
                 json_response(manifest)
             opener = FakeOpener(routes)
 
@@ -1800,7 +1914,7 @@ class TestRingManagerAgent(unittest.TestCase):
         ]
         routes = self._routes()
         routes[('GET', 'ring.example.com:6205',
-                '/api/v1/rings/releases/latest/manifest/')] = \
+                '/api/v1/rings/releases/desired/manifest/')] = \
             json_response(manifest)
         opener = FakeOpener(routes)
 

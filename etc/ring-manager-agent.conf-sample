@@ -24,7 +24,7 @@
 # ionice_priority =
 
 [ring-manager-agent]
-# Agent operating mode. Enforce mode installs the latest manifest. Observe
+# Agent operating mode. Enforce mode installs the desired manifest. Observe
 # mode only inventories local *.ring.gz files. Validate-only mode compares
 # local ring files with one selected release. Observe and validate-only do not
 # write under swift_dir.
@@ -46,10 +46,10 @@
 # storage-node pull traffic across equivalent read-only ring-manager servers.
 # shuffle_ring_manager_urls = false
 #
-# In enforce mode, refuse to install a latest manifest older than the manifest
+# In enforce mode, refuse to install a desired manifest older than the manifest
 # recorded in the local agent state file. Keep this disabled unless an
-# operator is deliberately rolling the fleet back to an older published ring
-# version. Validate-only never applies this install rollback guard.
+# operator is deliberately selecting an older known release for rollback.
+# Validate-only never applies this install rollback guard.
 # allow_ring_version_rollback = false
 
 # Optional read-only authentication values sent when fetching from

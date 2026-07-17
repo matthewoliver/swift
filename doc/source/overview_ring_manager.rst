@@ -190,7 +190,8 @@ compare-and-set request.
 The API calculates both annotations from ``index.json`` without changing a
 manifest.
 Replica sync preserves both pointers, while the storage-node agent consumes
-``latest``. Desired-aware agent installs are a separate slice.
+``desired``. A published ``latest`` release does not install on storage nodes
+until it is selected as ``desired``.
 Disabled rings remain editable but are omitted from releases and cannot be
 selected for publication.
 ``POST /api/v1/rings/<ring_id>/versions/`` also creates a persistent job.

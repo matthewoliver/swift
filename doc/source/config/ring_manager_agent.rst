@@ -6,8 +6,8 @@ Ring Manager Agent Configuration
 
 This document describes the configuration options available for the
 ring-manager agent. The agent runs on Swift storage nodes. In ``enforce``
-mode it installs the latest published ring files from one or more ring-manager
-servers. In ``observe`` mode it inventories local ring files without using
+mode it installs the desired ring files from one or more ring-manager servers.
+In ``observe`` mode it inventories local ring files without using
 ring-manager. In ``validate-only`` mode it compares local ring files with one
 selected release without downloading or installing artifacts.
 
@@ -126,9 +126,10 @@ The ring-manager agent uses the common Swift daemon options, including
      - HTTP request timeout in seconds.
    * - ``allow_ring_version_rollback``
      - ``false``
-     - In ``enforce`` mode, allow installation of a latest manifest older than
-       the last installed manifest. This does not affect ``validate-only``;
-       selecting an older release for comparison never installs it.
+     - In ``enforce`` mode, allow installation of a desired manifest older
+       than the last installed manifest. This does not affect
+       ``validate-only``; selecting an older release for comparison never
+       installs it.
    * - ``lock_timeout``
      - ``10``
      - Maximum time to wait for the local install lock in ``enforce`` mode.
@@ -151,11 +152,13 @@ configured inline/file pairs fail closed at startup.
 
 The agent writes recon data under ``/recon/ring_manager_agent``. Every payload
 includes ``mode``. A successful ``enforce`` payload includes the selected
-source URL, the latest ring version, installed file counts, timing information,
-and ``swift_dir``. A successful ``observe`` payload includes each local ring
-file's size, modification time, SHA-256 checksum, Swift ring version, part
-power, replica count, and validation status. A successful ``validate-only``
-payload includes the configured selector, resolved release, source,
+source URL, ``desired_ring_version``, installed file counts, timing
+information, and ``swift_dir``. The local state file records the same concrete
+release as ``installed_ring_version``. A successful ``observe`` payload
+includes each local ring file's size, modification time, SHA-256 checksum,
+Swift ring version, part power, replica count, and validation status. A
+successful ``validate-only`` payload includes the configured selector,
+resolved release, source,
 convergence result, comparison counts, and per-file expected and local
 metadata. Per-file comparison states
 are ``matching``, ``stale``, ``missing``, ``unknown``, ``extra``, and

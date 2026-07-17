@@ -48,8 +48,9 @@ INSTALL_JOURNAL = '.ring-manager-agent-install.json'
 BACKUP_MARKER = '.ring-manager-backup-'
 OPERATOR_ATTENTION_FILE_LIMIT = 20
 ENFORCE_RECON_FIELDS = (
-    'source', 'latest_ring_version', 'files_installed', 'files_downloaded',
+    'source', 'desired_ring_version', 'files_installed', 'files_downloaded',
     'files_unchanged', 'sync_time', 'last_synced_at')
+LEGACY_ENFORCE_RECON_FIELDS = ('latest_ring_version',)
 OBSERVE_RECON_FIELDS = (
     'files_observed', 'files_valid', 'files_invalid', 'files',
     'observe_time', 'last_observed_at')
@@ -81,7 +82,7 @@ class RingManagerAgent(Daemon):
     """
     Observe, validate, or enforce published ring state on a storage node.
 
-    Enforce mode consumes the ring-manager latest manifest API, verifies each
+    Enforce mode consumes the ring-manager desired manifest API, verifies each
     artifact against the manifest metadata, and installs the ring files into
     ``swift_dir`` using same-directory atomic renames. Observe mode only
     inventories local ring files. Validate-only mode compares them with one
@@ -254,7 +255,7 @@ class RingManagerAgent(Daemon):
     def _artifact_path(self, file_info):
         return os.path.join(self.swift_dir, self._artifact_name(file_info))
 
-    def _manifest_files(self, manifest, field_name='latest manifest'):
+    def _manifest_files(self, manifest, field_name='desired manifest'):
         version = str(manifest.get('version', ''))
         if not version:
             raise RingManagerAgentError('%s has no version' % field_name)
@@ -366,7 +367,9 @@ class RingManagerAgent(Daemon):
                 '%s has invalid created_at %r' % (field_name, value))
 
     def _state_manifest_timestamp(self, state):
-        value = state.get('latest_ring_created_at')
+        value = state.get('installed_ring_created_at')
+        if value in (None, ''):
+            value = state.get('latest_ring_created_at')
         if value in (None, ''):
             manifest = state.get('manifest', {})
             if isinstance(manifest, dict):
@@ -377,7 +380,7 @@ class RingManagerAgent(Daemon):
             return NormalTimestamp(value).internal
         except (TypeError, ValueError, AssertionError):
             raise RingManagerAgentLocalError(
-                'local ring-manager agent state has invalid latest ring '
+                'local ring-manager agent state has invalid installed ring '
                 'created_at %r' % value)
 
     def _check_manifest_not_rollback(self, source_url, manifest):
@@ -388,12 +391,13 @@ class RingManagerAgent(Daemon):
         if installed_created_at is None:
             return
         manifest_created_at = self._manifest_timestamp(
-            manifest, 'latest manifest')
+            manifest, 'desired manifest')
         if manifest_created_at >= installed_created_at:
             return
-        installed_version = state.get('latest_ring_version')
+        installed_version = state.get('installed_ring_version') or \
+            state.get('latest_ring_version')
         raise RingManagerAgentError(
-            'source %s latest manifest version %s created at %s is older '
+            'source %s desired manifest version %s created at %s is older '
             'than installed version %s created at %s' % (
                 source_url, manifest.get('version'), manifest_created_at,
                 installed_version, installed_created_at))
@@ -1064,11 +1068,11 @@ class RingManagerAgent(Daemon):
 
     def _write_state(self, source_url, version, manifest, installed_files,
                      synced_at):
-        created_at = self._manifest_timestamp(manifest, 'latest manifest')
+        created_at = self._manifest_timestamp(manifest, 'desired manifest')
         state = {
             'source': source_url,
-            'latest_ring_version': version,
-            'latest_ring_created_at': created_at,
+            'installed_ring_version': version,
+            'installed_ring_created_at': created_at,
             'synced_at': synced_at,
             'swift_dir': self.swift_dir,
             'files': installed_files,
@@ -1084,7 +1088,9 @@ class RingManagerAgent(Daemon):
                                   err)
             return
         current_fields = MODE_RECON_FIELDS.get(stats.get('mode'), frozenset())
-        all_fields = frozenset().union(*MODE_RECON_FIELDS.values())
+        all_fields = frozenset().union(
+            *MODE_RECON_FIELDS.values()) | frozenset(
+                LEGACY_ENFORCE_RECON_FIELDS)
         stale_fields = all_fields - current_fields
         for field in stale_fields:
             stats.setdefault(field, {})
@@ -1140,7 +1146,12 @@ class RingManagerAgent(Daemon):
 
     def _sync_from_source(self, source_url):
         manifest = self._json_request(
-            source_url, '/api/v1/rings/releases/latest/manifest/')
+            source_url, '/api/v1/rings/releases/desired/manifest/')
+        if manifest.get('desired') is not True:
+            raise RingManagerAgentError(
+                'source %s desired manifest is not marked desired' %
+                source_url)
+        self._manifest_timestamp(manifest, 'desired manifest')
         self._check_manifest_not_rollback(source_url, manifest)
         version, installed_files, downloaded, unchanged = \
             self._sync_manifest_files(source_url, manifest)
@@ -1152,7 +1163,7 @@ class RingManagerAgent(Daemon):
             raise RingManagerAgentLocalError(
                 'local ring-manager agent state write failed: %s' % err)
         return {
-            'latest_ring_version': version,
+            'desired_ring_version': version,
             'files_installed': len(installed_files),
             'files_downloaded': downloaded,
             'files_unchanged': unchanged,
@@ -1374,7 +1385,7 @@ class RingManagerAgent(Daemon):
             return result
         result = self.sync_once()
         self.logger.info(
-            'Synced ring-manager version %(latest_ring_version)s: '
+            'Synced desired ring-manager version %(desired_ring_version)s: '
             '%(files_downloaded)d files downloaded, '
             '%(files_unchanged)d unchanged' % result)
         return result

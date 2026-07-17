@@ -300,15 +300,17 @@ The selector is writable, so readonly and standby servers reject it.
 manifest with ``desired: true``.
 It also returns ``404 Not Found`` until a desired release exists.
 
-The storage-node agent consumes the latest manifest in this slice.
-Replica sync preserves both pointers, while desired-aware agent consumption is
-separate work.
+The storage-node agent consumes the desired manifest in this slice.
+Replica sync preserves both pointers so storage nodes can treat ``desired`` as
+the rollout gate.
 
 Storage-node agent
 ==================
 
 ``swift-ring-manager-agent`` polls one or more ring-manager sources for the
-latest release manifest.
+desired release manifest.
+It requires the response to be marked ``desired: true`` before downloading
+anything.
 It verifies every downloaded artefact's byte count and SHA-256 digest before
 installing the complete set under a local lock.
 Files are staged and fsynced first, then atomically replaced with an install
@@ -328,8 +330,11 @@ The agent records its last completed or failed pass in
 ``ring-manager-agent.recon``.
 With the standard recon middleware enabled, ``GET
 /recon/ring_manager_agent`` returns that record.
-It includes the selected source, latest release version, installed-file counts,
-timing, and per-source failures.
+It includes the selected source, desired release version, installed-file
+counts, timing, and per-source failures.
+If no desired release is selected, the endpoint returns ``404 Not Found``.
+The agent treats that as a source failure, tries the next configured source,
+and installs nothing if every source has no desired release.
 
 ``GET /api/v1/rings/releases/<version>/files/<file_name>``
 -----------------------------------------------------------------
@@ -345,15 +350,13 @@ selected immutable version, or returns ``404 Not Found`` when none is set.
 Replica pull workflow
 =====================
 
-swift-ring-manager-sync pulls the primary's
-/api/v1/rings/releases/latest/manifest/ document, each immutable release
-artefact, ring metadata, and the referenced per-ring version records.
+swift-ring-manager-sync pulls the primary's latest manifest and, when one is
+selected, its distinct desired manifest, each immutable release artefact, ring
+metadata, and the referenced per-ring version records.
 It validates the supplied byte counts and SHA-256 digests.
 The command records local paths rather than source URLs, writes the release
-manifest, and advances the mutable latest_ring_version pointer only after the
-pull completes.
-Desired-pointer replication follows separately, so this sync workflow still
-tracks ``latest`` only.
+manifest, and atomically advances the mutable latest_ring_version and
+desired_ring_version pointers only after the pull completes.
 Existing valid artefacts use If-None-Match and may receive 304 Not Modified.
 
 One or more source URLs may be supplied directly or through the dedicated
