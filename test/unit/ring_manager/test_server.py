@@ -352,11 +352,13 @@ class TestRingManagerApplication(unittest.TestCase):
             'applicable': False,
             'source': None,
             'latest_ring_version': None,
+            'desired_ring_version': None,
             'last_synced_at': None,
             'age_seconds': None,
             'freshness_threshold':
                 DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD,
             'latest_matches_local': None,
+            'desired_matches_local': None,
             'synced': False,
             'fresh': False,
             'stale': False,
@@ -421,18 +423,23 @@ class TestRingManagerApplication(unittest.TestCase):
             app.sync_trigger_queue.join()
 
     def _write_sync_index(self, synced_at, latest_version=None,
+                          desired_version=None,
                           source='https://primary.example.com:6205'):
         sync_info = {
             'source': source,
             'latest_ring_version': latest_version or self.latest_version,
+            'desired_ring_version': desired_version,
             'synced_at': synced_at,
         }
         if source is None:
             sync_info.pop('source')
-        self._write_json('index.json', {
+        index = {
             'latest_ring_version': self.latest_version,
             'ring_manager_sync': sync_info,
-        })
+        }
+        if desired_version is not None:
+            index['desired_ring_version'] = desired_version
+        self._write_json('index.json', index)
 
     def test_sync_trigger_status_reports_configured_state(self):
         app = self._status_app(
@@ -615,7 +622,60 @@ class TestRingManagerApplication(unittest.TestCase):
                          sync['source'])
         self.assertEqual(self.latest_version, sync['latest_ring_version'])
         self.assertEqual(True, sync['latest_matches_local'])
+        self.assertTrue(sync['desired_matches_local'])
         self.assertLess(sync['age_seconds'], 300)
+
+    def test_readonly_status_reports_matching_desired_sync(self):
+        self._write_sync_index(
+            self._timestamp_seconds_ago(10),
+            desired_version=self.latest_version)
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/',
+            app=self._status_app(mode='readonly', threshold=300))
+        self.assertEqual(200, resp.status_int)
+
+        sync = body['ring_manager_sync']
+        self.assertTrue(sync['can_serve_published_reads'])
+        self.assertEqual(
+            self.latest_version, sync['desired_ring_version'])
+        self.assertTrue(sync['desired_matches_local'])
+
+    def test_readonly_status_rejects_desired_sync_mismatch(self):
+        self._write_sync_index(
+            self._timestamp_seconds_ago(10),
+            desired_version=self.latest_version)
+        index = self.app.store.get_state_index()
+        index['desired_ring_version'] = 'locally-changed-release'
+        self._write_json('index.json', index)
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/',
+            app=self._status_app(mode='readonly', threshold=300))
+        self.assertEqual(200, resp.status_int)
+
+        sync = body['ring_manager_sync']
+        self.assertFalse(sync['can_serve_published_reads'])
+        self.assertFalse(sync['desired_matches_local'])
+        self.assertIn('desired_version_mismatch', sync['reasons'])
+
+    def test_readonly_status_rejects_legacy_sync_without_desired(self):
+        self._write_json('index.json', {
+            'latest_ring_version': self.latest_version,
+            'ring_manager_sync': {
+                'source': 'https://primary.example.com:6205',
+                'latest_ring_version': self.latest_version,
+                'synced_at': self._timestamp_seconds_ago(10),
+            },
+        })
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/',
+            app=self._status_app(mode='readonly', threshold=300))
+        self.assertEqual(200, resp.status_int)
+
+        sync = body['ring_manager_sync']
+        self.assertFalse(sync['can_serve_published_reads'])
+        self.assertIn(
+            'missing_sync_desired_ring_version', sync['reasons'])
 
     def test_standby_status_reports_published_state_promote_ready(self):
         self._write_sync_index(self._timestamp_seconds_ago(10))

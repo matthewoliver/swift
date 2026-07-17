@@ -106,6 +106,7 @@ class TestRingManagerSync(unittest.TestCase):
             'version': 'release-1',
             'state': 'published',
             'latest': True,
+            'desired': True,
             'resource_uri': '/api/v1/rings/releases/release-1/',
             'rings': [
                 {'ring_id': 'account', 'swift_ring_version': 12},
@@ -159,6 +160,7 @@ class TestRingManagerSync(unittest.TestCase):
         self.primary_status = {
             'mode': 'primary',
             'latest_ring_version': 'release-1',
+            'desired_ring_version': 'release-1',
             'ring_manager_sync': {
                 'applicable': False,
             },
@@ -205,6 +207,8 @@ class TestRingManagerSync(unittest.TestCase):
                 json_response(self.primary_status),
             ('GET', '/api/v1/rings/releases/latest/manifest/'):
                 json_response(self.manifest),
+            ('GET', '/api/v1/rings/releases/desired/'):
+                json_response(self.manifest),
             ('GET', '/api/v1/rings/releases/release-1/files/'
              'account.ring.gz'): artifact,
             ('GET', '/api/v1/rings/'): json_response(self.rings),
@@ -248,16 +252,20 @@ class TestRingManagerSync(unittest.TestCase):
     def _replica_status(self, mode='readonly',
                         can_serve_published_reads=True, reasons=None,
                         latest_ring_version='release-1',
+                        desired_ring_version='release-1',
                         last_synced_at='1700000000.00000',
                         latest_matches_local=True,
                         synced=True, fresh=True, stale=False):
         return {
             'mode': mode,
+            'desired_ring_version': desired_ring_version,
             'ring_manager_sync': {
                 'can_serve_published_reads': can_serve_published_reads,
                 'latest_ring_version': latest_ring_version,
+                'desired_ring_version': desired_ring_version,
                 'last_synced_at': last_synced_at,
                 'latest_matches_local': latest_matches_local,
+                'desired_matches_local': True,
                 'synced': synced,
                 'fresh': fresh,
                 'stale': stale,
@@ -300,6 +308,7 @@ class TestRingManagerSync(unittest.TestCase):
             opener, time_func=lambda: NormalTimestamp(1700000000),
             logger=logger).sync()
         self.assertEqual({
+            'desired_ring_version': 'release-1',
             'latest_ring_version': 'release-1',
             'manifest_files_downloaded': 1,
             'manifest_files_unchanged': 0,
@@ -321,10 +330,13 @@ class TestRingManagerSync(unittest.TestCase):
         with open(os.path.join(self.state_dir, 'index.json')) as fp:
             index = json.load(fp)
         self.assertEqual('release-1', index['latest_ring_version'])
+        self.assertEqual('release-1', index['desired_ring_version'])
         self.assertEqual('http://primary.example.com:6205',
                          index['ring_manager_sync']['source'])
         self.assertEqual('release-1',
                          index['ring_manager_sync']['latest_ring_version'])
+        self.assertEqual('release-1',
+                         index['ring_manager_sync']['desired_ring_version'])
         self.assertEqual('1700000000.00000',
                          index['ring_manager_sync']['synced_at'])
 
@@ -334,6 +346,8 @@ class TestRingManagerSync(unittest.TestCase):
                          recon_stats['source'])
         self.assertEqual('release-1',
                          recon_stats['latest_ring_version'])
+        self.assertEqual('release-1',
+                         recon_stats['desired_ring_version'])
         self.assertEqual({
             'action': 'none',
             'committed': False,
@@ -370,6 +384,7 @@ class TestRingManagerSync(unittest.TestCase):
                 'manifest.json')) as fp:
             manifest = json.load(fp)
         self.assertNotIn('latest', manifest)
+        self.assertNotIn('desired', manifest)
         self.assertNotIn('resource_uri', manifest)
         self.assertNotIn('url', manifest['files'][0])
         self.assertEqual('release-1/account.ring.gz',
@@ -401,7 +416,15 @@ class TestRingManagerSync(unittest.TestCase):
         body = json.loads(resp.body.decode('ascii'))
         self.assertEqual('release-1', body['version'])
         self.assertEqual(True, body['latest'])
+        self.assertEqual(True, body['desired'])
         self.assertNotIn('path', body['files'][0])
+
+        req = Request.blank('/api/v1/rings/releases/desired/manifest/')
+        resp = req.get_response(app)
+        self.assertEqual(200, resp.status_int)
+        body = json.loads(resp.body.decode('ascii'))
+        self.assertEqual('release-1', body['version'])
+        self.assertTrue(body['desired'])
 
         req = Request.blank(
             '/api/v1/rings/releases/release-1/files/account.ring.gz')
@@ -427,6 +450,91 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertIn(
             'sync.timing',
             [call[0][0] for call in logger.statsd_client.calls['timing']])
+
+    def test_sync_copies_distinct_desired_release_and_pointer_metadata(self):
+        desired_manifest = dict(self.manifest)
+        desired_manifest.update({
+            'version': 'release-0',
+            'latest': False,
+            'resource_uri': '/api/v1/rings/releases/release-0/',
+        })
+        desired_manifest['files'] = [dict(
+            self.manifest['files'][0],
+            url='/api/v1/rings/releases/release-0/files/'
+            'account.ring.gz')]
+        desired_detail = dict(desired_manifest)
+        desired_detail.update({
+            'desired_updated_at': '1699999990.00000',
+            'desired_reason': 'rollback target',
+        })
+        self.primary_status['desired_ring_version'] = 'release-0'
+        routes = self._routes()
+        routes[('GET', '/api/v1/rings/releases/desired/')] = \
+            json_response(desired_detail)
+        routes[('GET', '/api/v1/rings/releases/desired/manifest/')] = \
+            json_response(desired_manifest)
+        routes[('GET', '/api/v1/rings/releases/release-0/files/'
+                'account.ring.gz')] = FakeResponse(self.artifact_body)
+
+        result = self._syncer(FakeOpener(routes)).sync()
+
+        self.assertEqual('release-1', result['latest_ring_version'])
+        self.assertEqual('release-0', result['desired_ring_version'])
+        self.assertEqual(2, result['manifest_files_downloaded'])
+        self.assertEqual(2, result['ring_versions_synced'])
+        with open(os.path.join(self.state_dir, 'index.json')) as fp:
+            index = json.load(fp)
+        self.assertEqual('release-1', index['latest_ring_version'])
+        self.assertEqual('release-0', index['desired_ring_version'])
+        self.assertEqual(
+            '1699999990.00000', index['desired_updated_at'])
+        self.assertEqual('rollback target', index['desired_reason'])
+        self.assertEqual(
+            'release-0',
+            index['ring_manager_sync']['desired_ring_version'])
+        for version in ('release-0', 'release-1'):
+            self.assertTrue(os.path.exists(os.path.join(
+                self.state_dir, 'releases', version, 'manifest.json')))
+            self.assertTrue(os.path.exists(os.path.join(
+                self.artifact_dir, version, 'account.ring.gz')))
+
+        app = RingManagerApplication({
+            'ring_manager_state_dir': self.state_dir,
+            'ring_artifact_dir': self.artifact_dir,
+            'ring_manager_mode': 'readonly',
+        }, logger=debug_logger())
+        req = Request.blank('/api/v1/rings/releases/desired/')
+        resp = req.get_response(app)
+        self.assertEqual(200, resp.status_int)
+        body = json.loads(resp.body.decode('ascii'))
+        self.assertEqual('release-0', body['version'])
+        self.assertEqual('rollback target', body['desired_reason'])
+
+    def test_sync_clears_desired_when_source_has_none(self):
+        os.makedirs(self.state_dir)
+        with open(os.path.join(self.state_dir, 'index.json'), 'w') as fp:
+            json.dump({
+                'desired_ring_version': 'release-old',
+                'desired_updated_at': '1699999900.00000',
+                'desired_reason': 'stale local selection',
+            }, fp)
+        self.primary_status['desired_ring_version'] = None
+
+        opener = FakeOpener(self._routes())
+        result = self._syncer(opener).sync()
+
+        self.assertIsNone(result['desired_ring_version'])
+        with open(os.path.join(self.state_dir, 'index.json')) as fp:
+            index = json.load(fp)
+        self.assertNotIn('desired_ring_version', index)
+        self.assertNotIn('desired_updated_at', index)
+        self.assertNotIn('desired_reason', index)
+        self.assertIsNone(
+            index['ring_manager_sync']['desired_ring_version'])
+        self.assertFalse([
+            request for request in opener.requests
+            if request['path'].startswith(
+                '/api/v1/rings/releases/desired')])
 
     def test_sync_builder_files_when_enabled(self):
         self.rings['objects'][0]['builder_files'] = [
@@ -697,6 +805,7 @@ class TestRingManagerSync(unittest.TestCase):
         routes = self._routes()
         routes[('GET', '/api/v1/ring_manager/status/')] = json_response({
             'mode': 'readonly',
+            'desired_ring_version': None,
             'ring_manager_sync': {
                 'can_serve_published_reads': True,
             },
@@ -723,6 +832,21 @@ class TestRingManagerSync(unittest.TestCase):
                 opener, source_url='http://ring-ro.example.com:6205').sync()
         self.assertIn('status latest version release-other',
                       str(caught.exception))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, 'index.json')))
+
+    def test_sync_rejects_replica_desired_status_mismatch(self):
+        status = self._replica_status()
+        status['desired_ring_version'] = 'release-other'
+        routes = self._routes()
+        routes[('GET', '/api/v1/ring_manager/status/')] = \
+            json_response(status)
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerSyncError) as caught:
+            self._syncer(
+                opener, source_url='http://ring-ro.example.com:6205').sync()
+        self.assertIn('desired_status_mismatch', str(caught.exception))
         self.assertFalse(os.path.exists(os.path.join(
             self.state_dir, 'index.json')))
 
@@ -782,7 +906,7 @@ class TestRingManagerSync(unittest.TestCase):
                          recon_stats['operator_attention']['reasons'])
         self.assertTrue(recon_stats['operator_attention']['needed'])
 
-    def test_sync_rolls_back_transaction_on_latest_write_failure(self):
+    def test_sync_rolls_back_transaction_on_index_write_failure(self):
         os.makedirs(os.path.join(self.state_dir, 'rings'))
         os.makedirs(os.path.join(self.state_dir, 'ring-versions', 'account'))
         os.makedirs(os.path.join(self.state_dir, 'releases', 'old-release'))
@@ -796,7 +920,12 @@ class TestRingManagerSync(unittest.TestCase):
                 self.state_dir, 'rings', 'account.json'), 'w') as fp:
             json.dump(old_ring, fp)
         with open(os.path.join(self.state_dir, 'index.json'), 'w') as fp:
-            json.dump({'latest_ring_version': 'old-release'}, fp)
+            json.dump({
+                'latest_ring_version': 'old-release',
+                'desired_ring_version': 'old-desired',
+                'desired_updated_at': '1699999900.00000',
+                'desired_reason': 'keep this selection',
+            }, fp)
         builder_dir = os.path.join(self.testdir, 'builders')
         os.makedirs(builder_dir)
         local_builder = os.path.join(builder_dir, 'account.builder')
@@ -809,13 +938,13 @@ class TestRingManagerSync(unittest.TestCase):
         opener = FakeOpener(self._routes())
         real_write = RingManagerSync._write_file_atomic
 
-        def fail_latest(syncer, path, body):
+        def fail_index(syncer, path, body):
             if path.endswith('index.json'):
-                raise RingManagerSyncLocalError('latest write failed')
+                raise RingManagerSyncLocalError('index write failed')
             return real_write(syncer, path, body)
 
         with mock.patch.object(
-                RingManagerSync, '_write_file_atomic', fail_latest):
+                RingManagerSync, '_write_file_atomic', fail_index):
             with self.assertRaises(RingManagerSyncLocalError):
                 self._syncer(
                     opener, builder_dir=builder_dir,
@@ -827,8 +956,12 @@ class TestRingManagerSync(unittest.TestCase):
                 self.state_dir, 'rings', 'account.json')) as fp:
             self.assertEqual(old_ring, json.load(fp))
         with open(os.path.join(self.state_dir, 'index.json')) as fp:
-            self.assertEqual(
-                {'latest_ring_version': 'old-release'}, json.load(fp))
+            self.assertEqual({
+                'latest_ring_version': 'old-release',
+                'desired_ring_version': 'old-desired',
+                'desired_updated_at': '1699999900.00000',
+                'desired_reason': 'keep this selection',
+            }, json.load(fp))
         self.assertFalse(os.path.exists(os.path.join(
             self.state_dir, 'ring-versions', 'account', '12.json')))
         self.assertFalse(os.path.exists(os.path.join(

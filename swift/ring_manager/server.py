@@ -294,10 +294,12 @@ class RingManagerApplication(object):
             'applicable': self.mode in READONLY_RING_MANAGER_MODES,
             'source': None,
             'latest_ring_version': None,
+            'desired_ring_version': None,
             'last_synced_at': None,
             'age_seconds': None,
             'freshness_threshold': self.sync_freshness_threshold,
             'latest_matches_local': None,
+            'desired_matches_local': None,
             'synced': False,
             'fresh': False,
             'stale': False,
@@ -439,7 +441,8 @@ class RingManagerApplication(object):
         stats_increment(self.logger, 'sync_trigger.successes')
         stats_timing_since(self.logger, 'sync_trigger.timing', started_at)
 
-    def _ring_manager_sync_status(self, latest_version, index_error=None):
+    def _ring_manager_sync_status(self, latest_version, desired_version,
+                                  index_error=None):
         status = self._base_sync_status()
         if not status['applicable']:
             status['reasons'].append('mode_not_replicated')
@@ -487,6 +490,17 @@ class RingManagerApplication(object):
             return status
         sync_latest = str(sync_latest)
         status['latest_ring_version'] = sync_latest
+        if 'desired_ring_version' not in sync_info:
+            status['reasons'].append('missing_sync_desired_ring_version')
+            status['promotion_blockers'].append(
+                'missing_sync_desired_ring_version')
+            return status
+        sync_desired = sync_info.get('desired_ring_version')
+        if sync_desired in (None, ''):
+            sync_desired = None
+        else:
+            sync_desired = str(sync_desired)
+        status['desired_ring_version'] = sync_desired
 
         synced_at = sync_info.get('synced_at') or \
             sync_info.get('last_synced_at')
@@ -532,6 +546,13 @@ class RingManagerApplication(object):
             status['promotion_blockers'].append('latest_version_mismatch')
             return status
         status['latest_matches_local'] = True
+
+        if sync_desired != desired_version:
+            status['desired_matches_local'] = False
+            status['reasons'].append('desired_version_mismatch')
+            status['promotion_blockers'].append('desired_version_mismatch')
+            return status
+        status['desired_matches_local'] = True
 
         status['fresh'] = True
         status['stale'] = False
@@ -798,7 +819,7 @@ class RingManagerApplication(object):
             'ring_builds': self.store.ring_build_queue_stats(
                 lease_timeout=self.build_job_lease_timeout),
             'ring_manager_sync': self._ring_manager_sync_status(
-                latest_version, index_error=index_error),
+                latest_version, desired_version, index_error=index_error),
             'sync_trigger': self._sync_trigger_status(),
         }
         if config_true_value(req.params.get('promotion', 'false')):

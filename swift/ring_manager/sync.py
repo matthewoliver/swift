@@ -564,7 +564,7 @@ class RingManagerSync(object):
                 (path, err))
 
     def _commit_sync_transaction(self, state_writes, staged_builders,
-                                 latest_write):
+                                 index_write):
         journal = {
             'committed': False,
             'entries': [],
@@ -583,8 +583,8 @@ class RingManagerSync(object):
             for builder in staged_builders:
                 self._commit_staged_builder(touched, journal, builder)
             self._commit_path_body(
-                touched, journal, latest_write['path'], latest_write['body'])
-            state_paths.append(latest_write['path'])
+                touched, journal, index_write['path'], index_write['body'])
+            state_paths.append(index_write['path'])
             journal['committed'] = True
             self._write_sync_journal(journal)
         except Exception:
@@ -783,20 +783,22 @@ class RingManagerSync(object):
         local_info['path'] = self._local_artifact_relpath(version, file_info)
         return local_info
 
-    def _sync_manifest_files(self, source_url, manifest):
+    def _sync_manifest_files(self, source_url, manifest,
+                             field_name='release manifest'):
         version = str(manifest.get('version', ''))
         if not version:
-            raise RingManagerSyncError('latest manifest has no version')
+            raise RingManagerSyncError('%s has no version' % field_name)
         files = manifest.get('files', [])
         if not isinstance(files, list):
-            raise RingManagerSyncError('latest manifest files must be a list')
+            raise RingManagerSyncError(
+                '%s files must be a list' % field_name)
 
         downloaded = unchanged = 0
         localized_files = []
         for file_info in files:
             if not isinstance(file_info, dict) or not file_info.get('name'):
                 raise RingManagerSyncError(
-                    'latest manifest files must contain objects with name')
+                    '%s files must contain objects with name' % field_name)
             relpath = self._local_artifact_relpath(version, file_info)
             local_path = self._artifact_path(relpath)
             default_url = '/api/v1/rings/releases/%s/files/%s' % (
@@ -813,6 +815,7 @@ class RingManagerSync(object):
 
         local_manifest = dict(manifest)
         local_manifest.pop('latest', None)
+        local_manifest.pop('desired', None)
         local_manifest.pop('resource_uri', None)
         local_manifest['version'] = version
         local_manifest['files'] = localized_files
@@ -1023,16 +1026,33 @@ class RingManagerSync(object):
                     '%s.json' % self._safe_id(version['version_id'])),
                 version['body'])
 
-    def _latest_write(self, source_url, version, synced_at):
+    def _index_write(self, source_url, latest_version, desired_version,
+                     desired_info, synced_at):
         index_path = self._state_path('index.json')
         index = self._read_json(index_path, {})
         if not isinstance(index, dict):
             raise RingManagerSyncLocalError(
                 'local index.json must be an object')
-        index['latest_ring_version'] = version
+        index['latest_ring_version'] = latest_version
+        if desired_version is None:
+            for key in ('desired_ring_version', 'desired_updated_at',
+                        'desired_reason'):
+                index.pop(key, None)
+        else:
+            index['desired_ring_version'] = desired_version
+            if desired_info.get('desired_updated_at') is None:
+                index.pop('desired_updated_at', None)
+            else:
+                index['desired_updated_at'] = \
+                    desired_info['desired_updated_at']
+            if desired_info.get('desired_reason') is None:
+                index.pop('desired_reason', None)
+            else:
+                index['desired_reason'] = desired_info['desired_reason']
         index['ring_manager_sync'] = {
             'source': source_url,
-            'latest_ring_version': version,
+            'latest_ring_version': latest_version,
+            'desired_ring_version': desired_version,
             'synced_at': synced_at,
         }
         return {
@@ -1106,10 +1126,20 @@ class RingManagerSync(object):
     def _validate_source(self, source_url):
         status = self._source_status(source_url)
         mode = status.get('mode')
+        if 'desired_ring_version' not in status:
+            raise RingManagerSyncError(
+                'source %s status did not include desired_ring_version' %
+                source_url)
+        desired_version = status.get('desired_ring_version')
+        if desired_version not in (None, ''):
+            desired_version = str(desired_version)
+        else:
+            desired_version = None
         if mode == 'primary':
             return {
                 'mode': mode,
                 'latest_ring_version': status.get('latest_ring_version'),
+                'desired_ring_version': desired_version,
                 'sync_timestamp': None,
             }
         if mode in ('readonly', 'standby'):
@@ -1129,6 +1159,18 @@ class RingManagerSync(object):
                 blockers.append('stale')
             if sync_status.get('latest_matches_local') is not True:
                 blockers.append('latest_mismatch_or_unknown')
+            if sync_status.get('desired_matches_local') is not True:
+                blockers.append('desired_mismatch_or_unknown')
+            if 'desired_ring_version' not in sync_status:
+                blockers.append('missing_desired_ring_version')
+            else:
+                sync_desired = sync_status.get('desired_ring_version')
+                if sync_desired in (None, ''):
+                    sync_desired = None
+                else:
+                    sync_desired = str(sync_desired)
+                if sync_desired != desired_version:
+                    blockers.append('desired_status_mismatch')
             sync_latest = sync_status.get('latest_ring_version')
             if sync_latest in (None, ''):
                 blockers.append('missing_latest_ring_version')
@@ -1151,62 +1193,130 @@ class RingManagerSync(object):
             return {
                 'mode': mode,
                 'latest_ring_version': str(sync_latest),
+                'desired_ring_version': desired_version,
                 'sync_timestamp': synced_at,
             }
         raise RingManagerSyncError(
             'source %s returned unsupported ring-manager mode %r' %
             (source_url, mode))
 
+    def _sync_release(self, source_url, selector, expected_version):
+        manifest = self._json_request(
+            source_url, '/api/v1/rings/releases/%s/manifest/' % selector)
+        version, local_manifest, downloaded, unchanged = \
+            self._sync_manifest_files(
+                source_url, manifest, field_name='%s manifest' % selector)
+        if str(expected_version) != version:
+            raise RingManagerSyncError(
+                'source %s status %s version %s does not match %s manifest '
+                'version %s' % (
+                    source_url, selector, expected_version, selector,
+                    version))
+        per_ring, per_ring_downloaded, per_ring_unchanged, ring_versions = \
+            self._sync_ring_artifact_versions(
+                source_url, version, manifest)
+        return {
+            'version': version,
+            'manifest': manifest,
+            'local_manifest': local_manifest,
+            'manifest_files_downloaded': downloaded,
+            'manifest_files_unchanged': unchanged,
+            'ring_versions_synced': per_ring,
+            'ring_version_files_downloaded': per_ring_downloaded,
+            'ring_version_files_unchanged': per_ring_unchanged,
+            'ring_versions': ring_versions,
+        }
+
     def _sync_from_source(self, source_url):
         staged_builders = []
         try:
             source_status = self._validate_source(source_url)
-            manifest = self._json_request(
-                source_url, '/api/v1/rings/releases/latest/manifest/')
-            version, local_manifest, downloaded, unchanged = \
-                self._sync_manifest_files(source_url, manifest)
             source_latest = source_status.get('latest_ring_version')
-            if source_latest not in (None, '') and str(source_latest) != \
-                    version:
+            if source_latest in (None, ''):
                 raise RingManagerSyncError(
-                    'source %s status latest version %s does not match latest '
-                    'manifest version %s' % (
-                        source_url, source_latest, version))
+                    'source %s status has no latest ring version' %
+                    source_url)
+            source_latest = str(source_latest)
+            latest = self._sync_release(
+                source_url, 'latest', source_latest)
+
+            desired_version = source_status.get('desired_ring_version')
+            desired_info = {}
+            desired = None
+            if desired_version is not None:
+                desired_info = self._json_request(
+                    source_url, '/api/v1/rings/releases/desired/')
+                if str(desired_info.get('version')) != desired_version or \
+                        desired_info.get('desired') is not True:
+                    raise RingManagerSyncError(
+                        'source %s desired release does not match status '
+                        'version %s' % (source_url, desired_version))
+                if desired_version == source_latest:
+                    desired = latest
+                else:
+                    desired = self._sync_release(
+                        source_url, 'desired', desired_version)
+
             _rings, ring_objects = self._sync_rings(source_url)
             builder_stats = self._sync_builder_files(
                 source_url, ring_objects, staged_builders)
-            per_ring, per_ring_downloaded, per_ring_unchanged, \
-                ring_versions = self._sync_ring_artifact_versions(
-                    source_url, version, manifest)
 
             state_writes = []
             rings = self._stage_rings(state_writes, ring_objects)
-            self._stage_ring_artifact_versions(state_writes, ring_versions)
+            self._stage_ring_artifact_versions(
+                state_writes, latest['ring_versions'])
+            if desired is not None and desired is not latest:
+                self._stage_ring_artifact_versions(
+                    state_writes, desired['ring_versions'])
             self._stage_json_write(
                 state_writes,
                 self._state_path(
-                    'releases', self._safe_id(version), 'manifest.json'),
-                local_manifest)
+                    'releases', self._safe_id(source_latest),
+                    'manifest.json'),
+                latest['local_manifest'])
+            if desired is not None and desired is not latest:
+                self._stage_json_write(
+                    state_writes,
+                    self._state_path(
+                        'releases', self._safe_id(desired_version),
+                        'manifest.json'),
+                    desired['local_manifest'])
             commit_at = self._timestamp()
             synced_at = source_status.get('sync_timestamp') or \
                 commit_at.internal
-            latest_write = self._latest_write(source_url, version, synced_at)
+            index_write = self._index_write(
+                source_url, source_latest, desired_version, desired_info,
+                synced_at)
             self._commit_sync_transaction(
-                state_writes, staged_builders, latest_write)
+                state_writes, staged_builders, index_write)
         except Exception:
             self._cleanup_staged_builders(staged_builders)
             raise
 
         ended_at = self._timestamp()
 
+        release_results = [latest]
+        if desired is not None and desired is not latest:
+            release_results.append(desired)
         return {
-            'latest_ring_version': version,
-            'manifest_files_downloaded': downloaded,
-            'manifest_files_unchanged': unchanged,
+            'latest_ring_version': source_latest,
+            'desired_ring_version': desired_version,
+            'manifest_files_downloaded': sum(
+                result['manifest_files_downloaded']
+                for result in release_results),
+            'manifest_files_unchanged': sum(
+                result['manifest_files_unchanged']
+                for result in release_results),
             'rings_synced': rings,
-            'ring_versions_synced': per_ring,
-            'ring_version_files_downloaded': per_ring_downloaded,
-            'ring_version_files_unchanged': per_ring_unchanged,
+            'ring_versions_synced': sum(
+                result['ring_versions_synced']
+                for result in release_results),
+            'ring_version_files_downloaded': sum(
+                result['ring_version_files_downloaded']
+                for result in release_results),
+            'ring_version_files_unchanged': sum(
+                result['ring_version_files_unchanged']
+                for result in release_results),
             'builder_files_synced': builder_stats['builder_files_synced'],
             'builder_files_downloaded': builder_stats[
                 'builder_files_downloaded'],

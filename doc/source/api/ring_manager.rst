@@ -648,10 +648,12 @@ Example response::
         "applicable": true,
         "source": "https://primary.example.com:6205",
         "latest_ring_version": "release-42",
+        "desired_ring_version": "release-41",
         "last_synced_at": "1700000000.00000",
         "age_seconds": 12.4,
         "freshness_threshold": 300.0,
         "latest_matches_local": true,
+        "desired_matches_local": true,
         "synced": true,
         "fresh": true,
         "stale": false,
@@ -694,6 +696,9 @@ also fails closed with the ``sync_transaction_pending`` reason and promotion
 blocker until the next sync run recovers or cleans up the journal. The same
 state is also exposed as the low-cardinality
 ``ring_manager_sync.sync_transaction.pending`` status field.
+The sync record includes both the latest publication pointer and the desired
+installation pointer, and they must each match local state before a replica is
+considered fresh enough to serve as a published-state source.
 
 Stale sync metadata does not disable the read API.
 A read-only or standby server continues serving its last successfully
@@ -763,7 +768,7 @@ The response is ``202 Accepted`` and reports whether a run was newly
 The bounded queue permits one follow-up while a command is active, so repeated
 notifications do not start overlapping sync processes.
 The endpoint returns before the wrapper starts and does not transfer bytes,
-advance the local release pointer, or perform standby promotion.
+advance local release pointers, or perform standby promotion.
 The wrapper must perform the pull and any operator-specific retry policy.
 
 Method negotiation

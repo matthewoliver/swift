@@ -26,16 +26,18 @@ directories, while the primary remains the only service that can change
 builder state, queue builds, or publish releases.
 The bulk partition-risk POST is analysis rather than a mutation and is
 available on replicas too.
-swift-ring-manager-sync pulls the latest complete release and immutable
-artefacts from a primary or fresh replica into another replica.
+swift-ring-manager-sync pulls the latest and desired releases, when distinct,
+and their immutable artefacts from a primary or fresh replica into another
+replica.
 It validates source status before any download, preserves an upstream
 replica's sync timestamp, and falls through only after a source failure.
 Local write failures abort the sync rather than attempting another source.
 Mutable state JSON and synced builder files are committed with rollback
 backups; failed local commits restore the previous mutable state and do not
 advance ``latest``. Immutable artifact files may be left on disk after a
-failed attempt, but they are not served through ``latest`` until the state
-commit succeeds. Overlapping sync processes are serialized by a local
+failed attempt, but they are not served through ``latest`` or ``desired``
+until the state commit succeeds. Overlapping sync processes are serialized by
+a local
 ``ring-manager-sync`` lock.
 The sync command accepts either explicit source URLs or a config file with a
 dedicated ``[ring-manager-sync]`` section for source and local-sync settings.
@@ -187,8 +189,8 @@ release by leaving ``desired`` unchanged and later selecting a release with a
 compare-and-set request.
 The API calculates both annotations from ``index.json`` without changing a
 manifest.
-Current storage-node agents and replica sync still consume ``latest``;
-desired-aware agent installs and desired-pointer sync are separate slices.
+Replica sync preserves both pointers, while current storage-node agents still
+consume ``latest``. Desired-aware agent installs are a separate slice.
 Disabled rings remain editable but are omitted from releases and cannot be
 selected for publication.
 ``POST /api/v1/rings/<ring_id>/versions/`` also creates a persistent job.
