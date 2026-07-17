@@ -94,12 +94,20 @@ use = egg:swift#ring_manager
 # Local directories populated by the syncer.
 # ring_manager_state_dir = /etc/swift/ring-manager-state
 # ring_artifact_dir = /etc/swift/ring-manager-artifacts
+#
+# Optional builder-file sync for promotable standby servers. This downloads
+# enabled-ring builder files from admin-only builder endpoints and writes them
+# under ring_builder_dir. Disabled-ring builders are skipped by default.
+# sync_builder_files = false
+# ring_builder_dir = /etc/swift
 # request_timeout = 30
 # recon_cache_path = /var/cache/swift
 # recon_dump = true
 #
 # Credentials for the remote source. Keep these explicit here; the syncer
 # never borrows keys from the local ring-manager-auth filter.
+# Builder-file sync requires admin_key_file or auth_token because builders are
+# ring-authoring state, not storage-node install artefacts.
 # read_key_file = /etc/swift/secrets/ring-manager-read.key
 # admin_key_file =
 # read_auth_token =

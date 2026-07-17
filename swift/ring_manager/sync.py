@@ -22,6 +22,7 @@ import uuid
 from urllib.parse import quote, urljoin, urlparse
 
 from swift.common.concurrency import socket, urllib_request
+from swift.common.ring.builder import RingBuilder
 from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
     RECON_RING_MANAGER_FILE
 from swift.common.utils import NullLogger, config_true_value, \
@@ -29,8 +30,9 @@ from swift.common.utils import NullLogger, config_true_value, \
     non_negative_float, readconf
 from swift.common.utils import md5
 from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
-    load_secret, NormalTimestamp, StateChangeHook, normal_timestamp, \
-    stats_increment, stats_timing, validate_relative_api_url
+    DEFAULT_RING_BUILDER_DIR, load_secret, NormalTimestamp, StateChangeHook, \
+    normal_timestamp, stats_increment, stats_timing, validate_path_component, \
+    validate_relative_api_url
 
 
 USER_AGENT = 'swift-ring-manager-sync'
@@ -60,7 +62,8 @@ class RingManagerSync(object):
                  opener=None,
                  recon_cache_path=DEFAULT_RECON_CACHE_PATH, recon_dump=True,
                  logger=None, time_func=NormalTimestamp.now,
-                 state_change_hook=None, state_change_hook_timeout=None):
+                 state_change_hook=None, state_change_hook_timeout=None,
+                 builder_dir=None, sync_builder_files=False):
         if not source_url:
             raise RingManagerSyncError('source_url is required')
         if not state_dir:
@@ -71,6 +74,11 @@ class RingManagerSync(object):
         self.source_url = self.source_urls[0]
         self.state_dir = state_dir
         self.artifact_dir = artifact_dir
+        self.builder_dir = builder_dir
+        self.sync_builder_files = sync_builder_files
+        if self.sync_builder_files and not self.builder_dir:
+            raise RingManagerSyncError(
+                'ring_builder_dir is required when sync_builder_files is true')
         try:
             self.read_key = load_secret(
                 read_key, 'read_key', read_key_file, 'read_key_file')
@@ -80,6 +88,11 @@ class RingManagerSync(object):
             raise RingManagerSyncError(str(err))
         self.read_auth_token = read_auth_token
         self.auth_token = auth_token
+        if self.sync_builder_files and not (self.admin_key or
+                                            self.auth_token):
+            raise RingManagerSyncError(
+                'admin credentials are required when sync_builder_files is '
+                'true')
         self.timeout = timeout
         self.opener = opener or urllib_request.urlopen
         self.recon_cache_path = recon_cache_path or DEFAULT_RECON_CACHE_PATH
@@ -108,8 +121,16 @@ class RingManagerSync(object):
     def _api_url(self, source_url, path_or_url):
         return urljoin(source_url + '/', path_or_url)
 
-    def _headers(self, extra=None):
+    def _headers(self, extra=None, admin=False):
         headers = {'User-Agent': USER_AGENT}
+        if admin:
+            if self.admin_key:
+                headers['X-Ring-Manager-Admin-Key'] = self.admin_key
+            elif self.auth_token:
+                headers['X-Auth-Token'] = self.auth_token
+            if extra:
+                headers.update(extra)
+            return headers
         has_read_credentials = self.read_key or self.read_auth_token
         if self.read_key:
             headers['X-Ring-Manager-Read-Key'] = self.read_key
@@ -123,9 +144,10 @@ class RingManagerSync(object):
             headers.update(extra)
         return headers
 
-    def _request(self, source_url, path_or_url, headers=None):
+    def _request(self, source_url, path_or_url, headers=None, admin=False):
         url = self._api_url(source_url, path_or_url)
-        req = urllib_request.Request(url, headers=self._headers(headers))
+        req = urllib_request.Request(
+            url, headers=self._headers(headers, admin=admin))
         try:
             resp = self.opener(req, timeout=self.timeout)
         except urllib_request.HTTPError as err:
@@ -154,8 +176,9 @@ class RingManagerSync(object):
                     url, status, body.decode('utf-8', 'replace')))
         return status, body, resp.info()
 
-    def _json_request(self, source_url, path):
-        _status, body, _headers = self._request(source_url, path)
+    def _json_request(self, source_url, path, admin=False):
+        _status, body, _headers = self._request(
+            source_url, path, admin=admin)
         try:
             value = json.loads(body.decode('utf-8'))
         except (TypeError, ValueError, UnicodeDecodeError) as err:
@@ -172,6 +195,19 @@ class RingManagerSync(object):
 
     def _artifact_path(self, *parts):
         return os.path.join(self.artifact_dir, *parts)
+
+    def _builder_path(self, file_name):
+        file_name = validate_path_component(file_name, 'builder file name')
+        root = os.path.realpath(self.builder_dir)
+        path = os.path.realpath(os.path.join(root, file_name))
+        try:
+            common_path = os.path.commonpath([root, path])
+        except ValueError:
+            common_path = None
+        if common_path != root:
+            raise RingManagerSyncError(
+                'builder file name escapes ring_builder_dir: %s' % file_name)
+        return path
 
     def _mkdirs(self, path):
         directory = os.path.dirname(path)
@@ -207,6 +243,37 @@ class RingManagerSync(object):
         body = json.dumps(value, sort_keys=True, indent=2).encode('ascii')
         self._write_file_atomic(path, body + b'\n')
         self.state_change_hook.run('write', path)
+
+    def _write_builder_file_atomic(self, path, body, ring_id):
+        temp_path = None
+        try:
+            self._mkdirs(path)
+            temp_path = '%s.tmp-%s' % (path, uuid.uuid4().hex)
+            with open(temp_path, 'wb') as fp:
+                fp.write(body)
+            try:
+                RingBuilder.load(temp_path)
+            except Exception as err:
+                raise RingManagerSyncError(
+                    'downloaded builder for ring %s could not be loaded: %s' %
+                    (ring_id, err))
+            os.rename(temp_path, path)
+            temp_path = None
+        except RingManagerSyncError:
+            raise
+        except Exception as err:
+            raise RingManagerSyncLocalError(
+                'local ring-manager builder sync write failed for %s: %s' %
+                (path, err))
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError as err:
+                    if err.errno != errno.ENOENT:
+                        raise RingManagerSyncLocalError(
+                            'local ring-manager builder sync cleanup failed '
+                            'for %s: %s' % (temp_path, err))
 
     def _read_json(self, path, default):
         try:
@@ -261,6 +328,57 @@ class RingManagerSync(object):
                 raise RingManagerSyncError(
                     '%s sha256 mismatch: got %s, expected %s' % (
                         url, actual, expected_sha256))
+
+    def _response_header(self, headers, name):
+        if not headers:
+            return None
+        for key, value in headers.items():
+            if key.lower() == name.lower():
+                return value
+        return None
+
+    def _default_builder_name(self, ring):
+        ring_id = ring.get('id')
+        ring_type = ring.get('ring_type') or ring.get('type')
+        if ring_type == 'account' or ring_id == 'account':
+            return 'account.builder'
+        if ring_type == 'container' or ring_id == 'container':
+            return 'container.builder'
+        policy_index = ring.get('storage_policy_index')
+        if policy_index in (None, '', 0, '0'):
+            return 'object.builder'
+        return 'object-%s.builder' % policy_index
+
+    def _local_builder_file_name(self, ring):
+        path = None
+        files = ring.get('builder_files')
+        if isinstance(files, list) and len(files) == 1 and files[0]:
+            path = files[0]
+        elif ring.get('builder_path'):
+            path = ring['builder_path']
+        if path:
+            file_name = os.path.basename(str(path))
+            if file_name:
+                return validate_path_component(
+                    file_name, 'builder file name')
+        return validate_path_component(
+            self._default_builder_name(ring), 'builder file name')
+
+    def _ring_is_disabled(self, ring):
+        return config_true_value(str(ring.get('disabled', False)))
+
+    def _stage_local_builder_names(self, rings):
+        seen = {}
+        for ring in rings:
+            file_name = self._local_builder_file_name(ring)
+            other_ring_id = seen.get(file_name)
+            if other_ring_id is not None:
+                raise RingManagerSyncError(
+                    'rings %s and %s map to the same local builder file %s' %
+                    (other_ring_id, ring['id'], file_name))
+            seen[file_name] = ring['id']
+            ring.pop('builder_path', None)
+            ring['builder_files'] = [file_name]
 
     def _file_url(self, file_info, default_url):
         url = file_info.get('url') or default_url
@@ -332,19 +450,158 @@ class RingManagerSync(object):
         if not isinstance(objects, list):
             raise RingManagerSyncError(
                 'rings collection objects must be a list')
-        synced = 0
+        local_rings = []
         for ring in objects:
             if not isinstance(ring, dict) or ring.get('id') in (None, ''):
                 raise RingManagerSyncError(
                     'rings collection objects must contain ids')
             local_ring = dict(ring)
             local_ring.pop('resource_uri', None)
+            local_rings.append(local_ring)
+        if self.sync_builder_files:
+            self._stage_local_builder_names(local_rings)
+        return len(local_rings), local_rings
+
+    def _write_rings(self, rings):
+        synced = 0
+        for local_ring in rings:
             self._write_json_atomic(
                 self._state_path(
                     'rings', '%s.json' % self._safe_id(local_ring['id'])),
                 local_ring)
             synced += 1
         return synced
+
+    def _verify_local_builder(self, path, file_info):
+        return self._verified_local_builder_etag(path, file_info) is not None
+
+    def _verified_local_builder_etag(self, path, file_info):
+        try:
+            with open(path, 'rb') as fp:
+                body = fp.read()
+        except IOError:
+            return None
+        try:
+            RingBuilder.load(path)
+        except Exception:
+            return None
+        if not self._body_matches(body, file_info):
+            return None
+        expected_version = file_info.get('builder_version')
+        if expected_version not in (None, ''):
+            try:
+                builder = RingBuilder.load(path)
+            except Exception:
+                return None
+            if str(builder.version) != str(expected_version):
+                return None
+        return md5(body, usedforsecurity=False).hexdigest()
+
+    def _download_builder_file(self, source_url, ring, metadata, local_path):
+        ring_id = str(ring['id'])
+        file_info = metadata.get('file')
+        if not isinstance(file_info, dict):
+            raise RingManagerSyncError(
+                'ring %s builder metadata file must be an object' % ring_id)
+        expected_url = '/api/v1/rings/%s/builder/file/' % quote(
+            ring_id, safe='')
+        url = self._file_url(file_info, expected_url)
+        if file_info.get('url') != expected_url or url != expected_url:
+            raise RingManagerSyncError(
+                'ring %s builder metadata file URL must be %s' %
+                (ring_id, expected_url))
+        missing = [key for key in ('bytes', 'sha256')
+                   if file_info.get(key) in (None, '')]
+        if metadata.get('builder_version') in (None, ''):
+            missing.append('builder_version')
+        if missing:
+            raise RingManagerSyncError(
+                'ring %s builder metadata missing required field(s): %s' %
+                (ring_id, ', '.join(missing)))
+        file_info = dict(file_info)
+        file_info['builder_version'] = metadata['builder_version']
+        headers = {}
+        if file_info.get('sha256'):
+            etag = self._verified_local_builder_etag(local_path, file_info)
+            if etag:
+                headers['If-None-Match'] = etag
+        status, body, response_headers = self._request(
+            source_url, url, headers=headers, admin=True)
+        if status == 304:
+            return 'unchanged'
+        expected_sha256 = file_info.get('sha256') or self._response_header(
+            response_headers, 'X-Checksum-Sha256')
+        if expected_sha256 is not None:
+            file_info = dict(file_info)
+            file_info['sha256'] = expected_sha256
+        self._verify_download(body, file_info, url)
+        temp_verify_path = '%s.verify-%s' % (local_path, uuid.uuid4().hex)
+        try:
+            self._mkdirs(temp_verify_path)
+            with open(temp_verify_path, 'wb') as fp:
+                fp.write(body)
+            try:
+                builder = RingBuilder.load(temp_verify_path)
+            except Exception as err:
+                raise RingManagerSyncError(
+                    'downloaded builder for ring %s could not be loaded: %s' %
+                    (ring_id, err))
+            expected_version = metadata.get('builder_version')
+            if expected_version not in (None, '') and \
+                    str(builder.version) != str(expected_version):
+                raise RingManagerSyncError(
+                    'downloaded builder for ring %s version %s did not match '
+                    'metadata version %s' % (
+                        ring_id, builder.version, expected_version))
+        except RingManagerSyncError:
+            raise
+        except Exception as err:
+            raise RingManagerSyncLocalError(
+                'local ring-manager builder sync validation failed for %s: '
+                '%s' % (local_path, err))
+        finally:
+            try:
+                os.unlink(temp_verify_path)
+            except OSError as err:
+                if err.errno != errno.ENOENT:
+                    raise RingManagerSyncLocalError(
+                        'local ring-manager builder sync cleanup failed for '
+                        '%s: %s' % (temp_verify_path, err))
+        stats_increment(self.logger, 'sync.bytes_downloaded', len(body))
+        self._write_builder_file_atomic(local_path, body, ring_id)
+        return 'downloaded'
+
+    def _sync_builder_files(self, source_url, rings):
+        stats = {
+            'builder_files_synced': 0,
+            'builder_files_downloaded': 0,
+            'builder_files_unchanged': 0,
+            'builder_files_skipped_disabled': 0,
+        }
+        if not self.sync_builder_files:
+            return stats
+        for ring in rings:
+            if self._ring_is_disabled(ring):
+                stats['builder_files_skipped_disabled'] += 1
+                continue
+            ring_id = str(ring['id'])
+            metadata = self._json_request(
+                source_url, '/api/v1/rings/%s/builder/' %
+                quote(ring_id, safe=''), admin=True)
+            if str(metadata.get('ring_id')) != ring_id:
+                raise RingManagerSyncError(
+                    'ring %s builder metadata returned ring_id %r' % (
+                        ring_id, metadata.get('ring_id')))
+            file_name = self._local_builder_file_name(ring)
+            local_path = self._builder_path(file_name)
+            result = self._download_builder_file(
+                source_url, ring, metadata, local_path)
+            stats['builder_files_synced'] += 1
+            if result == 'downloaded':
+                stats['builder_files_downloaded'] += 1
+            else:
+                stats['builder_files_unchanged'] += 1
+        return stats
 
     def _sync_ring_artifact_versions(self, source_url, manifest_version,
                                      manifest):
@@ -534,7 +791,9 @@ class RingManagerSync(object):
             raise RingManagerSyncError(
                 'source %s status latest version %s does not match latest '
                 'manifest version %s' % (source_url, source_latest, version))
-        rings = self._sync_rings(source_url)
+        _rings, ring_objects = self._sync_rings(source_url)
+        builder_stats = self._sync_builder_files(source_url, ring_objects)
+        rings = self._write_rings(ring_objects)
         per_ring, per_ring_downloaded, per_ring_unchanged = \
             self._sync_ring_artifact_versions(source_url, version, manifest)
 
@@ -554,6 +813,13 @@ class RingManagerSync(object):
             'ring_versions_synced': per_ring,
             'ring_version_files_downloaded': per_ring_downloaded,
             'ring_version_files_unchanged': per_ring_unchanged,
+            'builder_files_synced': builder_stats['builder_files_synced'],
+            'builder_files_downloaded': builder_stats[
+                'builder_files_downloaded'],
+            'builder_files_unchanged': builder_stats[
+                'builder_files_unchanged'],
+            'builder_files_skipped_disabled': builder_stats[
+                'builder_files_skipped_disabled'],
         }, synced_at, ended_at
 
     def _record_failure(self, started_at, err, source_url=None,
@@ -615,6 +881,18 @@ class RingManagerSync(object):
             stats_increment(
                 self.logger, 'sync.ring_version_files.unchanged',
                 result['ring_version_files_unchanged'])
+            stats_increment(
+                self.logger, 'sync.builder_files.synced',
+                result['builder_files_synced'])
+            stats_increment(
+                self.logger, 'sync.builder_files.downloaded',
+                result['builder_files_downloaded'])
+            stats_increment(
+                self.logger, 'sync.builder_files.unchanged',
+                result['builder_files_unchanged'])
+            stats_increment(
+                self.logger, 'sync.builder_files.skipped_disabled',
+                result['builder_files_skipped_disabled'])
             self._dump_recon(
                 self._sync_stats(
                     source_url, started_at, ended_at, synced_at, result,
@@ -652,6 +930,20 @@ def _make_parser():
     parser.add_option(
         '--ring-artifact-dir', dest='artifact_dir',
         help='Local ring_artifact_dir to write.')
+    parser.add_option(
+        '--ring-builder-dir', dest='builder_dir',
+        help='Local ring_builder_dir to write builder files when '
+             '--sync-builder-files is enabled. Default: %s' %
+             DEFAULT_RING_BUILDER_DIR)
+    parser.add_option(
+        '--sync-builder-files', action='store_true',
+        dest='sync_builder_files', default=None,
+        help='Also sync enabled-ring Swift builder files. Requires admin '
+             'credentials.')
+    parser.add_option(
+        '--no-sync-builder-files', action='store_false',
+        dest='sync_builder_files',
+        help='Do not sync Swift builder files.')
     parser.add_option(
         '--admin-key', dest='admin_key',
         help='Value for X-Ring-Manager-Admin-Key when fetching from source.')
@@ -823,6 +1115,10 @@ def _resolve_sync_conf(options, args):
         options, ('read_key', 'read_key_file'), conf)
     auth_token, read_auth_token = _option_pair_or_conf(
         options, ('auth_token', 'read_auth_token'), conf)
+    sync_builder_files = options.sync_builder_files
+    if sync_builder_files is None:
+        sync_builder_files = config_true_value(
+            conf.get('sync_builder_files', 'false'))
 
     return {
         'conf': conf,
@@ -833,6 +1129,11 @@ def _resolve_sync_conf(options, args):
         'artifact_dir': _option_or_conf(
             options, 'artifact_dir', conf,
             ('ring_artifact_dir', 'artifact_dir')),
+        'builder_dir': _option_or_conf(
+            options, 'builder_dir', conf,
+            ('ring_builder_dir', 'builder_dir'),
+            default=DEFAULT_RING_BUILDER_DIR),
+        'sync_builder_files': sync_builder_files,
         'admin_key': admin_key,
         'admin_key_file': admin_key_file,
         'auth_token': auth_token,
@@ -894,6 +1195,8 @@ def main(argv=None):
             state_change_hook=sync_conf['state_change_hook'],
             state_change_hook_timeout=sync_conf[
                 'state_change_hook_timeout'],
+            builder_dir=sync_conf['builder_dir'],
+            sync_builder_files=sync_conf['sync_builder_files'],
             logger=logger)
         result = syncer.sync()
     except RingManagerSyncError as err:
@@ -904,7 +1207,9 @@ def main(argv=None):
         print('Synced ring-manager version %(latest_ring_version)s: '
               '%(rings_synced)d rings, %(ring_versions_synced)d per-ring '
               'versions, %(manifest_files_downloaded)d manifest files '
-              'downloaded, %(manifest_files_unchanged)d unchanged' % result)
+              'downloaded, %(manifest_files_unchanged)d unchanged, '
+              '%(builder_files_downloaded)d builder files downloaded, '
+              '%(builder_files_unchanged)d unchanged' % result)
     return 0
 
 

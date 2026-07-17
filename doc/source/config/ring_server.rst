@@ -188,6 +188,10 @@ State-change hook metrics include::
     sync.ring_versions_synced
     sync.ring_version_files.downloaded
     sync.ring_version_files.unchanged
+    sync.builder_files.synced
+    sync.builder_files.downloaded
+    sync.builder_files.unchanged
+    sync.builder_files.skipped_disabled
     sync.bytes_downloaded
 
 Metrics intentionally avoid build IDs, ring versions, URLs, device names, and
@@ -267,6 +271,15 @@ Command-line options override values from this section.
      - unset
      - Local artefact directory to populate. Usually the same value used by
        the read-only or standby ``[app:ring-manager-server]`` section.
+   * - ``ring_builder_dir``
+     - ``/etc/swift``
+     - Local directory to write Swift builder files when
+       ``sync_builder_files`` is enabled.
+   * - ``sync_builder_files``
+     - ``false``
+     - Whether to sync enabled-ring builder files through admin-only
+       ring-manager builder endpoints. This is intended for promotable
+       standby servers and requires admin credentials.
    * - ``request_timeout``
      - ``30``
      - HTTP request timeout in seconds.
@@ -284,7 +297,8 @@ Command-line options override values from this section.
    * - ``admin_key_file`` / ``admin_key``
      - unset
      - Admin credential for upstream ring-manager sources. Read-only syncers
-       should normally use read credentials instead.
+       should normally use read credentials instead unless
+       ``sync_builder_files`` is enabled.
    * - ``read_auth_token`` / ``auth_token``
      - unset
      - Optional auth token headers for upstream ring-manager sources.
@@ -356,6 +370,15 @@ The command can instead receive a config file containing a
 
 See :ref:`ring_manager_sync_options` for the available settings and
 command-line precedence.
+By default the utility only synchronizes published state and immutable
+artefacts.
+For a promotable standby, ``sync_builder_files = true`` or
+``--sync-builder-files`` also downloads enabled-ring builder files from
+admin-only endpoints.
+Builder sync requires admin credentials, verifies the byte count, SHA-256
+digest, and Swift builder loadability, and writes files below
+``ring_builder_dir`` before the local ``latest_ring_version`` advances.
+Disabled-ring builders are skipped by default.
 The command records its latest attempt in ring-manager.recon below the
 recon cache directory.
 Place recon before ring-manager-auth to expose /recon/ring_manager without an

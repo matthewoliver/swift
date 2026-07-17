@@ -256,9 +256,18 @@ manifest, and advances the mutable latest_ring_version pointer only after the
 pull completes.
 Existing valid artefacts use If-None-Match and may receive 304 Not Modified.
 
-The initial command accepts one explicit primary URL.
-It does not make source-fallback, freshness, promotion, or transaction
-guarantees beyond advancing the local latest pointer last.
+One or more source URLs may be supplied directly or through the dedicated
+``[ring-manager-sync]`` config section.
+The syncer accepts a primary directly and uses a read-only or standby source
+only when its status advertises fresh synchronized published state.
+Remote source failures fall through in order, while local write failures stop
+the attempt rather than mixing local state from sources.
+By default the pull contains only published state and immutable artefacts.
+When ``sync_builder_files`` is enabled, it also downloads enabled-ring builder
+files through the admin-only endpoints using an administrator credential.
+It verifies byte count, SHA-256, and Swift builder loadability before writing
+local ring metadata or advancing the latest pointer.
+Disabled-ring builders are skipped by default.
 Its latest success or error is available from /recon/ring_manager when the
 recon middleware is configured.
 State and recon timestamp fields use Swift ``NormalTimestamp.internal``
@@ -604,8 +613,10 @@ endpoint to recommend it for published-state reads or promotion consideration.
 It does not re-open every artifact on each status request and it is not an
 availability gate for artifact ``GET`` requests.
 ``published_state_promote_ready`` is only a narrow standby precheck.
-It does not fence the old primary, verify builder files, redirect writers, or
-perform automatic failover.
+The ``promotion_readiness`` response from ``?promotion=true`` also checks
+local builder files for enabled rings.
+Neither response fences the old primary, redirects writers, or performs
+automatic failover.
 
 Method negotiation
 ==================

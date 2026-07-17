@@ -22,6 +22,7 @@ import unittest
 from urllib.parse import urlparse
 from unittest import mock
 
+from swift.common.ring.builder import RingBuilder
 from swift.common.recon import RECON_RING_MANAGER_FILE
 from swift.common.swob import Request
 from swift.common.utils import md5
@@ -91,6 +92,15 @@ class TestRingManagerSync(unittest.TestCase):
             self.artifact_body, usedforsecurity=False).hexdigest()
         self.artifact_sha256 = hashlib.sha256(
             self.artifact_body).hexdigest()
+        self.builder_path = os.path.join(self.testdir, 'account.builder')
+        self._make_builder(self.builder_path)
+        with open(self.builder_path, 'rb') as fp:
+            self.builder_body = fp.read()
+        self.builder_md5 = md5(
+            self.builder_body, usedforsecurity=False).hexdigest()
+        self.builder_sha256 = hashlib.sha256(
+            self.builder_body).hexdigest()
+        self.builder_version = RingBuilder.load(self.builder_path).version
         self.manifest = {
             'version': 'release-1',
             'state': 'published',
@@ -156,12 +166,38 @@ class TestRingManagerSync(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.testdir)
 
+    def _make_builder(self, path):
+        builder = RingBuilder(4, 3, 1)
+        for index in range(3):
+            builder.add_dev({
+                'id': index,
+                'region': 1,
+                'zone': index,
+                'ip': '10.0.0.%d' % index,
+                'port': 6000,
+                'device': 'sd%d' % index,
+                'replication_ip': '10.0.0.%d' % index,
+                'replication_port': 6003,
+                'weight': 100,
+            })
+        builder.rebalance(seed=1)
+        builder.save(path)
+
     def _routes(self):
         def artifact(request):
             if request['headers'].get('If-none-match'.lower()) == \
                     self.artifact_md5:
                 return FakeResponse(status=304)
             return FakeResponse(self.artifact_body)
+
+        def builder_file(request):
+            if request['headers'].get('If-none-match'.lower()) == \
+                    self.builder_md5:
+                return FakeResponse(status=304)
+            return FakeResponse(self.builder_body, headers={
+                'X-Checksum-Sha256': self.builder_sha256,
+                'X-Ring-Builder-Version': str(self.builder_version),
+            })
 
         return {
             ('GET', '/api/v1/ring_manager/status/'):
@@ -175,6 +211,20 @@ class TestRingManagerSync(unittest.TestCase):
                 json_response(self.ring_version),
             ('GET', '/api/v1/rings/account/versions/12/files/'
              'account.ring.gz'): artifact,
+            ('GET', '/api/v1/rings/account/builder/'):
+                json_response({
+                    'ring_id': 'account',
+                    'disabled': False,
+                    'builder_version': self.builder_version,
+                    'latest_swift_ring_version': self.builder_version,
+                    'file': {
+                        'bytes': len(self.builder_body),
+                        'md5': self.builder_md5,
+                        'sha256': self.builder_sha256,
+                        'url': '/api/v1/rings/account/builder/file/',
+                    },
+                }),
+            ('GET', '/api/v1/rings/account/builder/file/'): builder_file,
         }
 
     def _syncer(self, opener, time_func=NormalTimestamp.now, logger=None,
@@ -256,6 +306,10 @@ class TestRingManagerSync(unittest.TestCase):
             'ring_versions_synced': 1,
             'ring_version_files_downloaded': 0,
             'ring_version_files_unchanged': 1,
+            'builder_files_synced': 0,
+            'builder_files_downloaded': 0,
+            'builder_files_unchanged': 0,
+            'builder_files_skipped_disabled': 0,
         }, result)
 
         artifact_path = os.path.join(
@@ -280,6 +334,7 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertEqual('release-1',
                          recon_stats['latest_ring_version'])
         self.assertEqual(1, recon_stats['manifest_files_downloaded'])
+        self.assertEqual(0, recon_stats['builder_files_synced'])
         self.assertEqual(1, recon_stats['rings_synced'])
         self.assertEqual(0.0, recon_stats['sync_time'])
         self.assertEqual('1700000000.00000',
@@ -345,11 +400,212 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertEqual(1, counts['sync.ring_versions_synced'])
         self.assertEqual(0, counts['sync.ring_version_files.downloaded'])
         self.assertEqual(1, counts['sync.ring_version_files.unchanged'])
+        self.assertEqual(0, counts['sync.builder_files.synced'])
+        self.assertEqual(0, counts['sync.builder_files.downloaded'])
+        self.assertEqual(0, counts['sync.builder_files.unchanged'])
+        self.assertEqual(0, counts['sync.builder_files.skipped_disabled'])
         self.assertEqual(len(self.artifact_body),
                          counts['sync.bytes_downloaded'])
         self.assertIn(
             'sync.timing',
             [call[0][0] for call in logger.statsd_client.calls['timing']])
+
+    def test_sync_builder_files_when_enabled(self):
+        self.rings['objects'][0]['builder_files'] = [
+            '/srv/primary/account.builder']
+        builder_dir = os.path.join(self.testdir, 'builders')
+        opener = FakeOpener(self._routes())
+        logger = debug_logger()
+
+        result = self._syncer(
+            opener, builder_dir=builder_dir,
+            sync_builder_files=True, logger=logger).sync()
+
+        self.assertEqual(1, result['builder_files_synced'])
+        self.assertEqual(1, result['builder_files_downloaded'])
+        self.assertEqual(0, result['builder_files_unchanged'])
+        local_builder = os.path.join(builder_dir, 'account.builder')
+        self.assertTrue(os.path.exists(local_builder))
+        self.assertEqual(self.builder_version,
+                         RingBuilder.load(local_builder).version)
+        with open(os.path.join(self.state_dir, 'rings', 'account.json')) as fp:
+            ring = json.load(fp)
+        self.assertEqual(['account.builder'], ring['builder_files'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync.builder_files.synced'])
+        self.assertEqual(1, counts['sync.builder_files.downloaded'])
+        self.assertEqual(0, counts['sync.builder_files.unchanged'])
+        self.assertEqual(0, counts['sync.builder_files.skipped_disabled'])
+
+        result = self._syncer(
+            opener, builder_dir=builder_dir,
+            sync_builder_files=True).sync()
+        self.assertEqual(1, result['builder_files_synced'])
+        self.assertEqual(0, result['builder_files_downloaded'])
+        self.assertEqual(1, result['builder_files_unchanged'])
+
+        builder_requests = [
+            req for req in opener.requests
+            if req['path'].startswith('/api/v1/rings/account/builder')]
+        self.assertEqual([
+            '/api/v1/rings/account/builder/',
+            '/api/v1/rings/account/builder/file/',
+            '/api/v1/rings/account/builder/',
+            '/api/v1/rings/account/builder/file/',
+        ], [req['path'] for req in builder_requests])
+        for request in builder_requests:
+            self.assertEqual(
+                'secret', request['headers']['x-ring-manager-admin-key'])
+        self.assertEqual(
+            self.builder_md5,
+            builder_requests[-1]['headers']['if-none-match'])
+
+    def test_sync_builder_files_requires_builder_dir(self):
+        with self.assertRaises(RingManagerSyncError) as cm:
+            RingManagerSync(
+                'http://primary.example.com:6205', self.state_dir,
+                self.artifact_dir, admin_key='secret',
+                sync_builder_files=True)
+        self.assertIn('ring_builder_dir is required', str(cm.exception))
+
+    def test_sync_builder_files_requires_admin_credentials(self):
+        with self.assertRaises(RingManagerSyncError) as cm:
+            RingManagerSync(
+                'http://primary.example.com:6205', self.state_dir,
+                self.artifact_dir, read_key='reader',
+                builder_dir=os.path.join(self.testdir, 'builders'),
+                sync_builder_files=True)
+        self.assertIn('admin credentials are required', str(cm.exception))
+
+    def test_sync_builder_files_skip_disabled_rings(self):
+        self.rings['objects'][0]['disabled'] = True
+        builder_dir = os.path.join(self.testdir, 'builders')
+        opener = FakeOpener(self._routes())
+
+        result = self._syncer(
+            opener, builder_dir=builder_dir,
+            sync_builder_files=True).sync()
+
+        self.assertEqual(0, result['builder_files_synced'])
+        self.assertEqual(1, result['builder_files_skipped_disabled'])
+        self.assertFalse(os.path.exists(
+            os.path.join(builder_dir, 'account.builder')))
+        with open(os.path.join(self.state_dir, 'rings', 'account.json')) as fp:
+            ring = json.load(fp)
+        self.assertEqual(['account.builder'], ring['builder_files'])
+        self.assertNotIn('builder_path', ring)
+        self.assertFalse([
+            req for req in opener.requests
+            if req['path'].startswith('/api/v1/rings/account/builder')])
+
+    def test_sync_builder_checksum_mismatch_does_not_update_latest(self):
+        routes = self._routes()
+        routes[('GET', '/api/v1/rings/account/builder/')] = json_response({
+            'ring_id': 'account',
+            'disabled': False,
+            'builder_version': self.builder_version,
+            'file': {
+                'bytes': len(self.builder_body),
+                'sha256': '0' * 64,
+                'url': '/api/v1/rings/account/builder/file/',
+            },
+        })
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerSyncError) as cm:
+            self._syncer(
+                opener, builder_dir=os.path.join(self.testdir, 'builders'),
+                sync_builder_files=True).sync()
+
+        self.assertIn('sha256 mismatch', str(cm.exception))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state_dir, 'index.json')))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state_dir, 'rings', 'account.json')))
+
+    def test_sync_builder_missing_integrity_metadata_fails_closed(self):
+        routes = self._routes()
+        routes[('GET', '/api/v1/rings/account/builder/')] = json_response({
+            'ring_id': 'account',
+            'disabled': False,
+            'builder_version': self.builder_version,
+            'file': {
+                'bytes': len(self.builder_body),
+                'url': '/api/v1/rings/account/builder/file/',
+            },
+        })
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerSyncError) as cm:
+            self._syncer(
+                opener, builder_dir=os.path.join(self.testdir, 'builders'),
+                sync_builder_files=True).sync()
+
+        self.assertIn('missing required field(s): sha256', str(cm.exception))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state_dir, 'index.json')))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state_dir, 'rings', 'account.json')))
+
+    def test_sync_builder_local_failure_does_not_fall_back(self):
+        routes = self._routes()
+        routes[('GET', 'primary.example.com:6205',
+                '/api/v1/ring_manager/status/')] = json_response(
+                    self.primary_status)
+        routes[('GET', 'ring-ro.example.com:6205',
+                '/api/v1/ring_manager/status/')] = json_response(
+                    self._replica_status())
+        opener = FakeOpener(routes)
+
+        with mock.patch.object(
+                RingManagerSync, '_write_builder_file_atomic',
+                side_effect=RingManagerSyncLocalError(
+                    'local builder write failed')):
+            with self.assertRaises(RingManagerSyncLocalError):
+                self._syncer(
+                    opener,
+                    builder_dir=os.path.join(self.testdir, 'builders'),
+                    sync_builder_files=True,
+                    source_url=[
+                        'http://primary.example.com:6205',
+                        'http://ring-ro.example.com:6205',
+                    ]).sync()
+
+        self.assertEqual(
+            ['primary.example.com:6205'],
+            sorted(set(request['host'] for request in opener.requests)))
+
+    def test_sync_builder_duplicate_local_names_fail_closed(self):
+        self.rings['objects'] = [
+            {
+                'id': 'account',
+                'name': 'Account',
+                'ring_type': 'account',
+                'builder_files': ['/srv/primary/account.builder'],
+            },
+            {
+                'id': 'account-copy',
+                'name': 'Account Copy',
+                'ring_type': 'account',
+                'builder_files': ['/srv/other/account.builder'],
+            },
+        ]
+        opener = FakeOpener(self._routes())
+
+        with self.assertRaises(RingManagerSyncError) as cm:
+            self._syncer(
+                opener, builder_dir=os.path.join(self.testdir, 'builders'),
+                sync_builder_files=True).sync()
+
+        self.assertIn('map to the same local builder file account.builder',
+                      str(cm.exception))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state_dir, 'index.json')))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.state_dir, 'rings', 'account.json')))
+        self.assertFalse([
+            req for req in opener.requests
+            if req['path'].startswith('/api/v1/rings/account/builder')])
 
     def test_sync_accepts_fresh_readonly_source(self):
         routes = self._routes()
@@ -671,6 +927,63 @@ read_key = reader
         with open(os.path.join(self.state_dir, 'index.json')) as fp:
             index = json.load(fp)
         self.assertEqual('release-1', index['latest_ring_version'])
+
+    def test_main_reads_builder_sync_config_section(self):
+        builder_dir = os.path.join(self.testdir, 'builders')
+        conf_path = self._write_config('''
+[ring-manager-sync]
+source_urls = http://primary.example.com:6205
+ring_manager_state_dir = %s
+ring_artifact_dir = %s
+ring_builder_dir = %s
+sync_builder_files = true
+admin_key = secret
+''' % (self.state_dir, self.artifact_dir, builder_dir))
+        opener = FakeOpener(self._routes())
+
+        with mock.patch('swift.ring_manager.sync.urllib_request.urlopen',
+                        opener), \
+                mock.patch('sys.stdout', io.StringIO()):
+            status = sync.main([conf_path])
+
+        self.assertEqual(0, status)
+        self.assertTrue(os.path.exists(
+            os.path.join(builder_dir, 'account.builder')))
+        builder_requests = [
+            request for request in opener.requests
+            if request['path'].startswith('/api/v1/rings/account/builder')]
+        self.assertEqual(2, len(builder_requests))
+        for request in builder_requests:
+            self.assertEqual(
+                'secret', request['headers']['x-ring-manager-admin-key'])
+
+    def test_main_cli_disables_configured_builder_sync(self):
+        builder_dir = os.path.join(self.testdir, 'builders')
+        conf_path = self._write_config('''
+[ring-manager-sync]
+source_urls = http://primary.example.com:6205
+ring_manager_state_dir = %s
+ring_artifact_dir = %s
+ring_builder_dir = %s
+sync_builder_files = true
+admin_key = secret
+''' % (self.state_dir, self.artifact_dir, builder_dir))
+        opener = FakeOpener(self._routes())
+
+        with mock.patch('swift.ring_manager.sync.urllib_request.urlopen',
+                        opener), \
+                mock.patch('sys.stdout', io.StringIO()):
+            status = sync.main([
+                '--config', conf_path,
+                '--no-sync-builder-files',
+            ])
+
+        self.assertEqual(0, status)
+        self.assertFalse(os.path.exists(
+            os.path.join(builder_dir, 'account.builder')))
+        self.assertFalse([
+            request for request in opener.requests
+            if request['path'].startswith('/api/v1/rings/account/builder')])
 
     def test_main_cli_options_override_sync_config_section(self):
         conf_path = self._write_config('''

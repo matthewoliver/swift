@@ -33,6 +33,11 @@ replica's sync timestamp, and falls through only after a source failure.
 Local write failures abort the sync rather than attempting another source.
 The sync command accepts either explicit source URLs or a config file with a
 dedicated ``[ring-manager-sync]`` section for source and local-sync settings.
+By default it synchronizes published state and immutable artefacts only.
+For a promotable standby, ``sync_builder_files`` can additionally copy
+enabled-ring builder files with an administrator credential.
+It verifies byte count, SHA-256, and Swift builder loadability before the
+local latest pointer advances, while disabled-ring builders remain skipped.
 The utility records its result through /recon/ring_manager when the recon
 middleware is in the pipeline.
 Its state and recon timestamp fields use Swift ``NormalTimestamp.internal``
