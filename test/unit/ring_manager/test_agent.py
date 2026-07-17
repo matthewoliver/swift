@@ -85,9 +85,11 @@ class TestRingManagerAgent(unittest.TestCase):
         self.ring_md5 = md5(
             self.ring_body, usedforsecurity=False).hexdigest()
         self.ring_sha256 = hashlib.sha256(self.ring_body).hexdigest()
+        self.created_at = agent_mod.NormalTimestamp(1).internal
         self.manifest = {
             'version': 'release-1',
             'state': 'published',
+            'created_at': self.created_at,
             'latest': True,
             'resource_uri': '/api/v1/rings/releases/release-1/',
             'files': [
@@ -132,6 +134,53 @@ class TestRingManagerAgent(unittest.TestCase):
         with open(path, 'r') as fp:
             return json.load(fp)['ring_manager_agent']
 
+    def _manifest_for_version(self, version, body=None, created_at=None):
+        body = self.ring_body if body is None else body
+        sha256 = hashlib.sha256(body).hexdigest()
+        return {
+            'version': version,
+            'state': 'published',
+            'created_at': created_at or self.created_at,
+            'latest': True,
+            'resource_uri': '/api/v1/rings/releases/%s/' % version,
+            'files': [
+                {
+                    'name': 'object.ring.gz',
+                    'url': '/api/v1/rings/releases/%s/files/'
+                    'object.ring.gz' % version,
+                    'bytes': len(body),
+                    'sha256': sha256,
+                },
+            ],
+        }
+
+    def _routes_for_manifest(self, manifest, body=None,
+                             host='ring.example.com:6205'):
+        body = self.ring_body if body is None else body
+        routes = {}
+        routes[('GET', host, '/api/v1/rings/releases/latest/manifest/')] = \
+            json_response(manifest)
+        routes[('GET', host, manifest['files'][0]['url'])] = \
+            FakeResponse(body)
+        return routes
+
+    def _write_agent_state(self, version, created_at, manifest=None):
+        os.makedirs(os.path.dirname(self.state_file))
+        state = {
+            'source': 'https://previous.example.com:6205',
+            'latest_ring_version': version,
+            'latest_ring_created_at': created_at,
+            'synced_at': created_at,
+            'swift_dir': self.swift_dir,
+            'files': [],
+            'manifest': manifest or {
+                'version': version,
+                'created_at': created_at,
+            },
+        }
+        with open(self.state_file, 'w') as fp:
+            json.dump(state, fp)
+
     def _routes(self):
         manifest_path = '/api/v1/rings/releases/latest/manifest/'
         file_path = '/api/v1/rings/releases/release-1/files/object.ring.gz'
@@ -152,7 +201,6 @@ class TestRingManagerAgent(unittest.TestCase):
                 'name': name,
                 'url': path,
                 'bytes': len(body),
-                'md5': md5(body, usedforsecurity=False).hexdigest(),
                 'sha256': sha256,
             })
             routes[('GET', 'ring.example.com:6205', path)] = \
@@ -189,6 +237,7 @@ class TestRingManagerAgent(unittest.TestCase):
         self.assertEqual(1, stats['files_downloaded'])
         self.assertEqual(0, stats['files_unchanged'])
         self.assertEqual(self.swift_dir, stats['swift_dir'])
+        self.assertFalse(stats['operator_attention']['needed'])
         self.assertEqual(11, opener.requests[0]['timeout'])
 
         counts = logger.statsd_client.get_stats_counts()
@@ -203,6 +252,146 @@ class TestRingManagerAgent(unittest.TestCase):
             'agent.sync.timing',
             [call[0][0] for call in
              logger.statsd_client.calls['timing']])
+
+    def test_sync_once_rejects_older_manifest_than_state(self):
+        os.makedirs(self.swift_dir)
+        ring_path = os.path.join(self.swift_dir, 'object.ring.gz')
+        with open(ring_path, 'wb') as fp:
+            fp.write(b'already installed ring')
+        installed_created_at = agent_mod.NormalTimestamp(2).internal
+        self._write_agent_state('release-2', installed_created_at)
+        opener = FakeOpener(self._routes())
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(opener).sync_once()
+
+        self.assertIn('older than installed version release-2',
+                      str(cm.exception))
+        self.assertEqual(1, len(opener.requests))
+        with open(ring_path, 'rb') as fp:
+            self.assertEqual(b'already installed ring', fp.read())
+        with open(self.state_file, 'r') as fp:
+            state = json.load(fp)
+        self.assertEqual('release-2', state['latest_ring_version'])
+        self.assertEqual(installed_created_at,
+                         state['latest_ring_created_at'])
+        stats = self._recon_stats()
+        self.assertFalse(stats['success'])
+        self.assertIn('older than installed version release-2',
+                      stats['source_errors'][0]['error'])
+
+    def test_sync_once_allows_older_manifest_with_rollback_override(self):
+        os.makedirs(self.swift_dir)
+        ring_path = os.path.join(self.swift_dir, 'object.ring.gz')
+        with open(ring_path, 'wb') as fp:
+            fp.write(b'newer installed ring')
+        installed_created_at = agent_mod.NormalTimestamp(2).internal
+        self._write_agent_state('release-2', installed_created_at)
+        opener = FakeOpener(self._routes())
+
+        result = self._agent(
+            opener, allow_ring_version_rollback='true').sync_once()
+
+        self.assertEqual({
+            'latest_ring_version': 'release-1',
+            'files_installed': 1,
+            'files_downloaded': 1,
+            'files_unchanged': 0,
+        }, result)
+        with open(ring_path, 'rb') as fp:
+            self.assertEqual(self.ring_body, fp.read())
+        with open(self.state_file, 'r') as fp:
+            state = json.load(fp)
+        self.assertEqual('release-1', state['latest_ring_version'])
+        self.assertEqual(self.created_at, state['latest_ring_created_at'])
+
+    def test_sync_once_allows_equal_manifest_timestamp(self):
+        self._write_agent_state('release-1', self.created_at)
+        opener = FakeOpener(self._routes())
+
+        result = self._agent(opener).sync_once()
+
+        self.assertEqual('release-1', result['latest_ring_version'])
+        with open(self.state_file, 'r') as fp:
+            state = json.load(fp)
+        self.assertEqual('release-1', state['latest_ring_version'])
+        self.assertEqual(self.created_at, state['latest_ring_created_at'])
+        self.assertEqual(2, len(opener.requests))
+
+    def test_sync_once_allows_newer_manifest_than_state(self):
+        self._write_agent_state('release-1', self.created_at)
+        newer_created_at = agent_mod.NormalTimestamp(2).internal
+        newer_body = b'newer object ring bytes'
+        manifest = self._manifest_for_version(
+            'release-2', body=newer_body, created_at=newer_created_at)
+        opener = FakeOpener(self._routes_for_manifest(manifest, newer_body))
+
+        result = self._agent(opener).sync_once()
+
+        self.assertEqual({
+            'latest_ring_version': 'release-2',
+            'files_installed': 1,
+            'files_downloaded': 1,
+            'files_unchanged': 0,
+        }, result)
+        with open(self.state_file, 'r') as fp:
+            state = json.load(fp)
+        self.assertEqual('release-2', state['latest_ring_version'])
+        self.assertEqual(newer_created_at, state['latest_ring_created_at'])
+        with open(os.path.join(self.swift_dir, 'object.ring.gz'), 'rb') as fp:
+            self.assertEqual(newer_body, fp.read())
+
+    def test_sync_once_corrupt_state_aborts_before_install(self):
+        os.makedirs(os.path.dirname(self.state_file))
+        with open(self.state_file, 'w') as fp:
+            fp.write('{bad json')
+        routes = self._routes()
+        routes[('GET', 'backup.example.com:6205',
+                '/api/v1/rings/releases/latest/manifest/')] = \
+            json_response(self.manifest)
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(
+                opener,
+                urls='https://ring.example.com:6205, '
+                'https://backup.example.com:6205').sync_once()
+
+        self.assertIn('state read failed', str(cm.exception))
+        self.assertEqual(['ring.example.com:6205'],
+                         [request['host'] for request in opener.requests])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.swift_dir, 'object.ring.gz')))
+        stats = self._recon_stats()
+        self.assertFalse(stats['success'])
+        self.assertIn('local_failure',
+                      stats['operator_attention']['reasons'])
+
+    def test_sync_once_non_object_state_aborts_before_install(self):
+        os.makedirs(os.path.dirname(self.state_file))
+        with open(self.state_file, 'w') as fp:
+            json.dump([], fp)
+        routes = self._routes()
+        routes[('GET', 'backup.example.com:6205',
+                '/api/v1/rings/releases/latest/manifest/')] = \
+            json_response(self.manifest)
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(
+                opener,
+                urls='https://ring.example.com:6205, '
+                'https://backup.example.com:6205').sync_once()
+
+        self.assertIn('state must be an object', str(cm.exception))
+        self.assertEqual(['ring.example.com:6205'],
+                         [request['host'] for request in opener.requests])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.swift_dir, 'object.ring.gz')))
+        stats = self._recon_stats()
+        self.assertFalse(stats['success'])
+        self.assertIn('local_failure',
+                      stats['operator_attention']['reasons'])
 
     def test_sync_once_uses_read_key_when_configured(self):
         opener = FakeOpener(self._routes())
@@ -335,10 +524,12 @@ class TestRingManagerAgent(unittest.TestCase):
         routes[('GET', 'secondary.example.com:6205', file_path)] = \
             FakeResponse(self.ring_body)
         opener = FakeOpener(routes)
+        logger = debug_logger()
         agent = self._agent(
             opener,
             urls='https://primary.example.com:6205, '
-            'https://secondary.example.com:6205')
+            'https://secondary.example.com:6205',
+            logger=logger)
 
         result = agent.sync_once()
 
@@ -349,6 +540,22 @@ class TestRingManagerAgent(unittest.TestCase):
                          opener.requests[1]['host'])
         self.assertEqual('https://secondary.example.com:6205',
                          self._recon_stats()['source'])
+        stats = self._recon_stats()
+        self.assertEqual(1, len(stats['source_errors']))
+        self.assertEqual('https://primary.example.com:6205',
+                         stats['source_errors'][0]['source'])
+        self.assertIn('down', stats['source_errors'][0]['error'])
+        self.assertEqual({
+            'needed': True,
+            'reasons': ['source_errors'],
+            'source_errors': 1,
+            'install_journal_path': None,
+            'backup_files_count': 0,
+            'backup_files': [],
+        }, stats['operator_attention'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['agent.operator_attention'])
+        self.assertEqual(1, counts['agent.operator_attention.source_errors'])
 
     def test_sync_once_rejects_cross_origin_artifact_url(self):
         manifest = dict(self.manifest)
@@ -422,6 +629,32 @@ class TestRingManagerAgent(unittest.TestCase):
         self.assertEqual(1, counts['agent.sync.failures'])
         self.assertEqual(1, counts['agent.checksum_failures'])
 
+    def test_success_recon_clears_stale_source_errors(self):
+        ring_path = '/api/v1/rings/releases/release-1/files/object.ring.gz'
+        routes = self._routes()
+        routes[('GET', 'ring.example.com:6205', ring_path)] = FakeResponse(
+            b'x' * len(self.ring_body))
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerAgentError):
+            self._agent(opener).sync_once()
+
+        stats = self._recon_stats()
+        self.assertFalse(stats['success'])
+        self.assertIn('source_errors', stats)
+        self.assertIn('sources', stats)
+
+        routes[('GET', 'ring.example.com:6205', ring_path)] = FakeResponse(
+            self.ring_body)
+        result = self._agent(opener).sync_once()
+
+        self.assertEqual('release-1', result['latest_ring_version'])
+        stats = self._recon_stats()
+        self.assertTrue(stats['success'])
+        self.assertNotIn('source_errors', stats)
+        self.assertNotIn('sources', stats)
+        self.assertFalse(stats['operator_attention']['needed'])
+
     def test_bad_second_checksum_does_not_install_first_ring(self):
         os.makedirs(self.swift_dir)
         old_object = b'old object ring'
@@ -453,6 +686,7 @@ class TestRingManagerAgent(unittest.TestCase):
         self.assertFalse(os.path.exists(self.state_file))
         stats = self._recon_stats()
         self.assertFalse(stats['success'])
+        self.assertFalse(stats['operator_attention']['needed'])
         counts = logger.statsd_client.get_stats_counts()
         self.assertEqual(1, counts['agent.checksum_failures'])
 
@@ -569,9 +803,15 @@ class TestRingManagerAgent(unittest.TestCase):
             if '.tmp-' in name or '.ring-manager-backup-' in name])
         stats = self._recon_stats()
         self.assertFalse(stats['success'])
+        self.assertTrue(stats['operator_attention']['needed'])
+        self.assertIn('local_failure',
+                      stats['operator_attention']['reasons'])
+        self.assertEqual(0, stats['operator_attention']['backup_files_count'])
         counts = logger.statsd_client.get_stats_counts()
         self.assertEqual(1, counts['agent.install_failures'])
         self.assertEqual(1, counts['agent.sync.failures'])
+        self.assertEqual(1, counts['agent.operator_attention'])
+        self.assertEqual(1, counts['agent.operator_attention.local_failures'])
         self.assertNotIn('agent.sync.successes', counts)
 
     def test_successful_multi_file_update_removes_backups(self):
@@ -604,6 +844,7 @@ class TestRingManagerAgent(unittest.TestCase):
             if '.tmp-' in name or '.ring-manager-backup-' in name])
         stats = self._recon_stats()
         self.assertTrue(stats['success'])
+        self.assertFalse(stats['operator_attention']['needed'])
 
     def test_incomplete_rollback_preserves_backup_for_operator(self):
         os.makedirs(self.swift_dir)
@@ -657,8 +898,22 @@ class TestRingManagerAgent(unittest.TestCase):
         self.assertFalse(os.path.exists(self.state_file))
         stats = self._recon_stats()
         self.assertFalse(stats['success'])
+        attention = stats['operator_attention']
+        self.assertTrue(attention['needed'])
+        self.assertEqual(1, attention['backup_files_count'])
+        self.assertEqual(os.path.join(self.swift_dir, backups[0]),
+                         attention['backup_files'][0])
+        self.assertEqual(os.path.join(self.swift_dir, INSTALL_JOURNAL),
+                         attention['install_journal_path'])
+        self.assertIn('install_journal_present', attention['reasons'])
+        self.assertIn('rollback_backups_present', attention['reasons'])
+        self.assertIn('local_failure', attention['reasons'])
         counts = logger.statsd_client.get_stats_counts()
         self.assertEqual(1, counts['agent.install_failures'])
+        self.assertEqual(1, counts['agent.operator_attention'])
+        self.assertEqual(1, counts['agent.operator_attention.journal'])
+        self.assertEqual(1, counts['agent.operator_attention.backup_files'])
+        self.assertEqual(1, counts['agent.operator_attention.local_failures'])
         self.assertNotIn('agent.sync.successes', counts)
 
     def test_install_failure_does_not_fall_back_to_next_source(self):
@@ -733,11 +988,12 @@ class TestRingManagerAgent(unittest.TestCase):
                 raise OSError('injected backup cleanup failure')
             return real_unlink(path)
 
+        logger = debug_logger()
         with mock.patch('swift.ring_manager.agent.os.unlink',
                         side_effect=fail_backup_unlink):
             with self.assertRaises(RingManagerAgentError):
                 self._agent(
-                    opener,
+                    opener, logger=logger,
                     urls='https://ring.example.com:6205, '
                     'https://backup.example.com:6205').sync_once()
 
@@ -748,6 +1004,47 @@ class TestRingManagerAgent(unittest.TestCase):
         self.assertEqual(1, len([
             name for name in os.listdir(self.swift_dir)
             if '.ring-manager-backup-' in name]))
+        stats = self._recon_stats()
+        attention = stats['operator_attention']
+        self.assertTrue(attention['needed'])
+        self.assertIn('rollback_backups_present', attention['reasons'])
+        self.assertIn('local_failure', attention['reasons'])
+        self.assertEqual(1, attention['backup_files_count'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['agent.operator_attention'])
+        self.assertEqual(1, counts['agent.operator_attention.backup_files'])
+        self.assertEqual(1, counts['agent.operator_attention.local_failures'])
+
+    def test_success_recon_reports_leftover_backups_attention(self):
+        os.makedirs(self.swift_dir)
+        object_path = os.path.join(self.swift_dir, 'object.ring.gz')
+        backup_path = '%s.ring-manager-backup-leftover' % object_path
+        with open(object_path, 'wb') as fp:
+            fp.write(self.ring_body)
+        with open(backup_path, 'wb') as fp:
+            fp.write(b'old object ring')
+
+        routes = self._routes()
+        routes[('GET', 'ring.example.com:6205',
+                '/api/v1/rings/releases/release-1/files/object.ring.gz')] = \
+            FakeResponse(status=304)
+        logger = debug_logger()
+
+        result = self._agent(FakeOpener(routes), logger=logger).sync_once()
+
+        self.assertEqual(0, result['files_downloaded'])
+        stats = self._recon_stats()
+        self.assertTrue(stats['success'])
+        attention = stats['operator_attention']
+        self.assertTrue(attention['needed'])
+        self.assertEqual(1, attention['backup_files_count'])
+        self.assertEqual([backup_path], attention['backup_files'])
+        self.assertIn('rollback_backups_present', attention['reasons'])
+        self.assertNotIn('local_failure', attention['reasons'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['agent.operator_attention'])
+        self.assertEqual(1, counts['agent.operator_attention.backup_files'])
+        self.assertNotIn('agent.operator_attention.local_failures', counts)
 
     def test_install_journal_recovery_restores_old_files_before_sync(self):
         os.makedirs(self.swift_dir)
@@ -829,6 +1126,119 @@ class TestRingManagerAgent(unittest.TestCase):
             os.path.join(self.swift_dir, INSTALL_JOURNAL)))
         counts = logger.statsd_client.get_stats_counts()
         self.assertEqual(1, counts['agent.install_recoveries'])
+        stats = self._recon_stats()
+        self.assertFalse(stats['operator_attention']['needed'])
+
+    def test_install_journal_read_failure_needs_operator_attention(self):
+        os.makedirs(self.swift_dir)
+        journal_path = os.path.join(self.swift_dir, INSTALL_JOURNAL)
+        with open(journal_path, 'w') as fp:
+            fp.write('{bad json')
+        opener = FakeOpener(self._routes())
+        logger = debug_logger()
+
+        with self.assertRaises(RingManagerAgentError):
+            self._agent(opener, logger=logger).sync_once()
+
+        self.assertEqual([], opener.requests)
+        stats = self._recon_stats()
+        self.assertFalse(stats['success'])
+        attention = stats['operator_attention']
+        self.assertTrue(attention['needed'])
+        self.assertEqual(journal_path, attention['install_journal_path'])
+        self.assertIn('install_journal_present', attention['reasons'])
+        self.assertIn('local_failure', attention['reasons'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['agent.operator_attention'])
+        self.assertEqual(1, counts['agent.operator_attention.journal'])
+        self.assertEqual(1, counts['agent.operator_attention.local_failures'])
+
+    def test_falsey_install_journal_needs_operator_attention(self):
+        os.makedirs(self.swift_dir)
+        journal_path = os.path.join(self.swift_dir, INSTALL_JOURNAL)
+        for body in ('{}', 'null'):
+            with self.subTest(body=body):
+                with open(journal_path, 'w') as fp:
+                    fp.write(body)
+                opener = FakeOpener(self._routes())
+                logger = debug_logger()
+
+                with self.assertRaises(RingManagerAgentError):
+                    self._agent(opener, logger=logger).sync_once()
+
+                self.assertEqual([], opener.requests)
+                stats = self._recon_stats()
+                attention = stats['operator_attention']
+                self.assertTrue(attention['needed'])
+                self.assertEqual(
+                    journal_path, attention['install_journal_path'])
+                self.assertIn('install_journal_present', attention['reasons'])
+                self.assertIn('local_failure', attention['reasons'])
+                counts = logger.statsd_client.get_stats_counts()
+                self.assertEqual(1, counts['agent.operator_attention'])
+                self.assertEqual(1, counts['agent.operator_attention.journal'])
+                self.assertEqual(
+                    1, counts['agent.operator_attention.local_failures'])
+                os.unlink(journal_path)
+
+    def test_journal_clear_fsync_failure_needs_operator_attention(self):
+        os.makedirs(self.swift_dir)
+        object_path = os.path.join(self.swift_dir, 'object.ring.gz')
+        object_backup = '%s.ring-manager-backup-recover' % object_path
+        new_object = b'new object ring'
+        old_object = b'old object ring'
+        with open(object_path, 'wb') as fp:
+            fp.write(new_object)
+        with open(object_backup, 'wb') as fp:
+            fp.write(old_object)
+        journal_path = os.path.join(self.swift_dir, INSTALL_JOURNAL)
+        journal = {
+            'version': 'release-1',
+            'swift_dir': self.swift_dir,
+            'created_at': '1.00000',
+            'files': [{
+                'name': 'object.ring.gz',
+                'local_path': object_path,
+                'temp_path': None,
+                'backup_path': object_backup,
+                'had_existing': True,
+                'file_info': {
+                    'name': 'object.ring.gz',
+                    'bytes': len(new_object),
+                    'sha256': hashlib.sha256(new_object).hexdigest(),
+                },
+            }],
+        }
+        with open(journal_path, 'w') as fp:
+            json.dump(journal, fp)
+        opener = FakeOpener(self._routes())
+        logger = debug_logger()
+        real_fsync = agent_mod.fsync
+        calls = []
+
+        def fail_second_fsync(fd):
+            calls.append(fd)
+            if len(calls) == 2:
+                raise OSError('injected journal clear fsync failure')
+            return real_fsync(fd)
+
+        with mock.patch('swift.ring_manager.agent.fsync',
+                        side_effect=fail_second_fsync):
+            with self.assertRaises(RingManagerAgentError):
+                self._agent(opener, logger=logger).sync_once()
+
+        self.assertEqual([], opener.requests)
+        self.assertFalse(os.path.exists(journal_path))
+        self.assertFalse(os.path.exists(object_backup))
+        with open(object_path, 'rb') as fp:
+            self.assertEqual(old_object, fp.read())
+        stats = self._recon_stats()
+        attention = stats['operator_attention']
+        self.assertTrue(attention['needed'])
+        self.assertEqual(['local_failure'], attention['reasons'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['agent.operator_attention'])
+        self.assertEqual(1, counts['agent.operator_attention.local_failures'])
 
     def test_unsafe_file_name_is_rejected(self):
         manifest = dict(self.manifest)

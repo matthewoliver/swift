@@ -318,6 +318,12 @@ Local staging, install, journal recovery, backup cleanup, and state-write
 failures abort the pass so a later source cannot hide an incomplete local
 transaction.
 
+The ``operator_attention`` field is present on success and failure recon.
+It is ``needed=true`` when the agent sees node-local state that needs operator
+inspection, such as a leftover install journal, rollback backups, or a local
+filesystem failure.
+The agent emits corresponding ``agent.operator_attention`` StatsD counters.
+
 The agent records its last completed or failed pass in
 ``ring-manager-agent.recon``.
 With the standard recon middleware enabled, ``GET

@@ -4089,6 +4089,9 @@ class TestRingManagerAuthMiddleware(unittest.TestCase):
         self.assertEqual(200, Request.blank(
             '/api/v1/rings/', headers=read_headers
         ).get_response(app).status_int)
+        self.assertEqual(200, Request.blank(
+            '/recon/ring_manager', headers=read_headers
+        ).get_response(app).status_int)
         self.assertEqual(401, Request.blank(
             '/api/v1/rings/', method='POST', headers=read_headers,
             body=b'{}').get_response(app).status_int)

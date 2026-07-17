@@ -12,7 +12,7 @@ Paste pipeline
 A minimal authenticated pipeline is::
 
     [pipeline:main]
-    pipeline = catch_errors healthcheck recon ring-manager-auth ring-manager-server
+    pipeline = catch_errors healthcheck ring-manager-auth recon ring-manager-server
 
     [app:ring-manager-server]
     use = egg:swift#ring_manager
@@ -437,8 +437,8 @@ state JSON are restored and ``latest`` is not advanced.
 Disabled-ring builders are skipped by default.
 The command records its latest attempt in ring-manager.recon below the
 recon cache directory.
-Place recon before ring-manager-auth to expose /recon/ring_manager without an
-operator credential.
+Place ring-manager-auth before recon so the ring-manager recon entries use the
+same read-key boundary as control-plane reads.
 
 Authentication options
 ======================

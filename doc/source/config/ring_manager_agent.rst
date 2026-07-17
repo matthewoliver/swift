@@ -62,6 +62,10 @@ The ring-manager agent uses the common Swift daemon options, including
      - If true, randomize the configured URL order before each sync pass.
        This can spread storage-node pulls across equivalent read-only
        ring-manager servers.
+   * - ``allow_ring_version_rollback``
+     - ``false``
+     - Refuse an older latest manifest than the one in local agent state.
+       Enable only for a deliberate operator-managed fleet rollback.
    * - ``read_key``
      -
      - Optional value for ``X-Ring-Manager-Read-Key``. Prefer this for
@@ -142,6 +146,12 @@ StatsD metrics:
     agent.bytes_downloaded
     agent.checksum_failures
     agent.install_failures
+    agent.operator_attention
+    agent.operator_attention.journal
+    agent.operator_attention.backup_files
+    agent.operator_attention.local_failures
 
 Recon remains the best source for the current installed version and detailed
-per-source error text; StatsD is intended for rates, timings, and alerting.
+per-source error text; ``operator_attention`` identifies leftover journals,
+rollback backups, or local failures needing node-local follow-up.
+StatsD is intended for rates, timings, and alerting.

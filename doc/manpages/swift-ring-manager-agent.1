@@ -135,6 +135,19 @@ ring-manager source. Leftover files matching
 .B *.ring-manager-backup-*
 mean rollback was incomplete and require operator attention. Success state and
 recon are written only after the whole manifest install completes.
+.PP
+Recon includes an
+.B operator_attention
+object. When
+.B operator_attention.needed
+is true, inspect the node-local journal, backup files, filesystem health, and
+agent log. The same condition is emitted through statsd as
+.B agent.operator_attention.
+More specific counters are
+.B agent.operator_attention.journal,
+.B agent.operator_attention.backup_files,
+and
+.B agent.operator_attention.local_failures.
 
 .SH RECON
 .PP

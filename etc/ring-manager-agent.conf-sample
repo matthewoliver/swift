@@ -32,6 +32,11 @@
 # Randomize the configured URL order before each sync pass. This can spread
 # storage-node pull traffic across equivalent read-only ring-manager servers.
 # shuffle_ring_manager_urls = false
+#
+# Refuse to install a latest manifest older than the manifest recorded in the
+# local agent state file. Keep this disabled unless an operator is deliberately
+# rolling the fleet back to an older published ring version.
+# allow_ring_version_rollback = false
 
 # Optional read-only authentication values sent when fetching from
 # ring-manager. Prefer read_key for agents so storage nodes do not hold the
@@ -75,6 +80,7 @@
 
 # Recon cache path and local state file. The agent writes
 # ring-manager-agent.recon for /recon/ring_manager_agent and stores its last
-# installed manifest in state_file.
+# installed manifest in state_file. Recon includes operator_attention when
+# local journal, backup, or filesystem state needs node-local follow-up.
 # recon_cache_path = /var/cache/swift
 # state_file = /var/cache/swift/ring-manager-agent-state.json

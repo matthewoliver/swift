@@ -27,7 +27,7 @@ from swift.common.daemon import Daemon, run_daemon
 from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
     RECON_RING_MANAGER_AGENT_FILE
 from swift.common.utils import config_true_value, dump_recon_cache, \
-    fsync, get_logger, list_from_csv, lock_path, md5, non_negative_float, \
+    fsync, get_logger, list_from_csv, lock_path, non_negative_float, \
     parse_options
 from swift.ring_manager.common import load_secret_from_conf, NormalTimestamp, \
     normal_timestamp, stats_increment, stats_timing, validate_relative_api_url
@@ -42,6 +42,8 @@ DEFAULT_STATE_FILE = 'ring-manager-agent-state.json'
 DEFAULT_LOCK_TIMEOUT = 10.0
 LOCK_NAME = 'ring-manager-agent'
 INSTALL_JOURNAL = '.ring-manager-agent-install.json'
+BACKUP_MARKER = '.ring-manager-backup-'
+OPERATOR_ATTENTION_FILE_LIMIT = 20
 
 
 class RingManagerAgentError(Exception):
@@ -83,6 +85,8 @@ class RingManagerAgent(Daemon):
             raise RingManagerAgentError('ring_manager_urls is required')
         self.shuffle_ring_manager_urls = config_true_value(conf.get(
             'shuffle_ring_manager_urls', 'false'))
+        self.allow_ring_version_rollback = config_true_value(conf.get(
+            'allow_ring_version_rollback', 'false'))
 
         self.swift_dir = conf.get('swift_dir', DEFAULT_SWIFT_DIR)
         self.interval = non_negative_float(
@@ -199,7 +203,7 @@ class RingManagerAgent(Daemon):
             raise RingManagerAgentError(
                 'manifest file name %r is not safe for swift_dir' % name)
         if (name.startswith('.') or name == INSTALL_JOURNAL or
-                '.tmp-' in name or '.ring-manager-backup-' in name):
+                '.tmp-' in name or BACKUP_MARKER in name):
             raise RingManagerAgentError(
                 'manifest file name %r is reserved for ring-manager-agent' %
                 name)
@@ -277,6 +281,60 @@ class RingManagerAgent(Daemon):
                 return default
             raise
 
+    def _read_state(self):
+        try:
+            state = self._read_json(self.state_file, {})
+        except (IOError, ValueError) as err:
+            raise RingManagerAgentLocalError(
+                'local ring-manager agent state read failed: %s' % err)
+        if not isinstance(state, dict):
+            raise RingManagerAgentLocalError(
+                'local ring-manager agent state must be an object')
+        return state
+
+    def _manifest_timestamp(self, manifest, field_name):
+        value = manifest.get('created_at')
+        if value in (None, ''):
+            raise RingManagerAgentError('%s has no created_at' % field_name)
+        try:
+            return NormalTimestamp(value).internal
+        except (TypeError, ValueError, AssertionError):
+            raise RingManagerAgentError(
+                '%s has invalid created_at %r' % (field_name, value))
+
+    def _state_manifest_timestamp(self, state):
+        value = state.get('latest_ring_created_at')
+        if value in (None, ''):
+            manifest = state.get('manifest', {})
+            if isinstance(manifest, dict):
+                value = manifest.get('created_at')
+        if value in (None, ''):
+            return None
+        try:
+            return NormalTimestamp(value).internal
+        except (TypeError, ValueError, AssertionError):
+            raise RingManagerAgentLocalError(
+                'local ring-manager agent state has invalid latest ring '
+                'created_at %r' % value)
+
+    def _check_manifest_not_rollback(self, source_url, manifest):
+        if self.allow_ring_version_rollback:
+            return
+        state = self._read_state()
+        installed_created_at = self._state_manifest_timestamp(state)
+        if installed_created_at is None:
+            return
+        manifest_created_at = self._manifest_timestamp(
+            manifest, 'latest manifest')
+        if manifest_created_at >= installed_created_at:
+            return
+        installed_version = state.get('latest_ring_version')
+        raise RingManagerAgentError(
+            'source %s latest manifest version %s created at %s is older '
+            'than installed version %s created at %s' % (
+                source_url, manifest.get('version'), manifest_created_at,
+                installed_version, installed_created_at))
+
     def _delete_file_durable(self, path):
         try:
             os.unlink(path)
@@ -296,15 +354,10 @@ class RingManagerAgent(Daemon):
             raise
 
     def _verify_existing(self, path, file_info):
-        return self._verified_existing_etag(path, file_info) is not None
-
-    def _verified_existing_etag(self, path, file_info):
         body = self._read_file(path)
         if body is None:
-            return None
-        if not self._body_matches(body, file_info):
-            return None
-        return md5(body, usedforsecurity=False).hexdigest()
+            return False
+        return self._body_matches(body, file_info)
 
     def _body_matches(self, body, file_info):
         expected_bytes = file_info.get('bytes')
@@ -351,8 +404,9 @@ class RingManagerAgent(Daemon):
     def _stage_file(self, source_url, version, file_info):
         local_path = self._artifact_path(file_info)
         headers = {}
-        if file_info.get('sha256'):
-            etag = self._verified_existing_etag(local_path, file_info)
+        if file_info.get('sha256') and self._verify_existing(
+                local_path, file_info):
+            etag = file_info.get('md5')
             if etag:
                 headers['If-None-Match'] = etag
 
@@ -448,8 +502,8 @@ class RingManagerAgent(Daemon):
             had_existing = os.path.exists(local_path)
             staged['had_existing'] = had_existing
             if had_existing:
-                staged['backup_path'] = '%s.ring-manager-backup-%s' % (
-                    local_path, uuid.uuid4().hex)
+                staged['backup_path'] = '%s%s%s' % (
+                    local_path, BACKUP_MARKER, uuid.uuid4().hex)
         journal_written = self._write_install_journal(version, install_files)
         for staged in install_files:
             backup_path = staged.get('backup_path')
@@ -574,51 +628,127 @@ class RingManagerAgent(Daemon):
                 self._fsync_dir_strict(directory)
 
     def _recover_install_journal(self):
-        journal = self._read_json(self.install_journal)
-        if not journal:
+        missing = object()
+        try:
+            journal = self._read_json(self.install_journal, missing)
+        except Exception as err:
+            raise RingManagerAgentLocalError(
+                'unable to read ring install journal %s: %s' % (
+                    self.install_journal, err))
+        if journal is missing:
             return
+        if not isinstance(journal, dict):
+            raise RingManagerAgentLocalError(
+                'ring install journal %s is malformed' % self.install_journal)
         files = journal.get('files')
         if not isinstance(files, list):
-            raise RingManagerAgentError(
+            raise RingManagerAgentLocalError(
                 'ring install journal %s is malformed' % self.install_journal)
         errors = []
         synced_dirs = set()
-        for entry in reversed(files):
-            local_path = entry.get('local_path')
-            temp_path = entry.get('temp_path')
-            backup_path = entry.get('backup_path')
-            file_info = entry.get('file_info') or {}
-            try:
-                if backup_path and os.path.exists(backup_path):
-                    os.rename(backup_path, local_path)
-                    synced_dirs.add(os.path.dirname(local_path))
-                elif entry.get('had_existing') and self._verify_existing(
-                        local_path, file_info):
-                    raise RingManagerAgentError(
-                        'missing rollback backup %s for %s' % (
-                            backup_path, local_path))
-                elif not entry.get('had_existing') and self._verify_existing(
-                        local_path, file_info):
-                    os.unlink(local_path)
-                    synced_dirs.add(os.path.dirname(local_path))
-                if temp_path:
-                    try:
-                        os.unlink(temp_path)
-                        synced_dirs.add(os.path.dirname(temp_path))
-                    except OSError as err:
-                        if err.errno != errno.ENOENT:
-                            raise
-            except Exception as err:
-                errors.append('%s: %s' % (local_path, err))
-        for directory in synced_dirs:
-            if directory:
-                self._fsync_dir_strict(directory)
-        if errors:
-            raise RingManagerAgentError(
-                'ring install journal recovery failed: %s' %
-                '; '.join(errors))
-        self._clear_install_journal()
+        try:
+            for entry in reversed(files):
+                local_path = entry.get('local_path')
+                temp_path = entry.get('temp_path')
+                backup_path = entry.get('backup_path')
+                file_info = entry.get('file_info') or {}
+                try:
+                    if backup_path and os.path.exists(backup_path):
+                        os.rename(backup_path, local_path)
+                        synced_dirs.add(os.path.dirname(local_path))
+                    elif entry.get('had_existing') and self._verify_existing(
+                            local_path, file_info):
+                        raise RingManagerAgentError(
+                            'missing rollback backup %s for %s' % (
+                                backup_path, local_path))
+                    elif (not entry.get('had_existing') and
+                          self._verify_existing(local_path, file_info)):
+                        os.unlink(local_path)
+                        synced_dirs.add(os.path.dirname(local_path))
+                    if temp_path:
+                        try:
+                            os.unlink(temp_path)
+                            synced_dirs.add(os.path.dirname(temp_path))
+                        except OSError as err:
+                            if err.errno != errno.ENOENT:
+                                raise
+                except Exception as err:
+                    errors.append('%s: %s' % (local_path, err))
+            for directory in synced_dirs:
+                if directory:
+                    self._fsync_dir_strict(directory)
+            if errors:
+                raise RingManagerAgentLocalError(
+                    'ring install journal recovery failed: %s' %
+                    '; '.join(errors))
+            self._clear_install_journal()
+        except RingManagerAgentLocalError:
+            raise
+        except Exception as err:
+            raise RingManagerAgentLocalError(
+                'ring install journal recovery failed: %s' % err)
         stats_increment(self.logger, 'agent.install_recoveries')
+
+    def _operator_attention_status(self, err=None, source_errors=None):
+        source_errors = list(source_errors or [])
+        reasons = []
+        backup_files = []
+        install_journal_path = None
+        scan_error = None
+
+        if isinstance(err, RingManagerAgentLocalError):
+            reasons.append('local_failure')
+        if source_errors:
+            reasons.append('source_errors')
+
+        try:
+            if os.path.exists(self.install_journal):
+                install_journal_path = self.install_journal
+                reasons.append('install_journal_present')
+            names = os.listdir(self.swift_dir)
+            for name in sorted(names):
+                if BACKUP_MARKER in name:
+                    backup_files.append(os.path.join(self.swift_dir, name))
+            if backup_files:
+                reasons.append('rollback_backups_present')
+        except OSError as scan_err:
+            scan_error = str(scan_err)
+            if scan_err.errno != errno.ENOENT:
+                reasons.append('attention_scan_failed')
+
+        reasons = sorted(set(reasons))
+        status = {
+            'needed': bool(reasons),
+            'reasons': reasons,
+            'source_errors': len(source_errors),
+            'install_journal_path': install_journal_path,
+            'backup_files_count': len(backup_files),
+            'backup_files': backup_files[:OPERATOR_ATTENTION_FILE_LIMIT],
+        }
+        if len(backup_files) > OPERATOR_ATTENTION_FILE_LIMIT:
+            status['backup_files_truncated'] = True
+        if scan_error:
+            status['scan_error'] = scan_error
+        return status
+
+    def _emit_operator_attention_metrics(self, status):
+        if not status.get('needed'):
+            return
+        stats_increment(self.logger, 'agent.operator_attention')
+        if status.get('install_journal_path'):
+            stats_increment(self.logger, 'agent.operator_attention.journal')
+        backup_count = status.get('backup_files_count', 0)
+        if backup_count:
+            stats_increment(
+                self.logger, 'agent.operator_attention.backup_files',
+                backup_count)
+        reasons = status.get('reasons') or []
+        if 'local_failure' in reasons:
+            stats_increment(
+                self.logger, 'agent.operator_attention.local_failures')
+        if 'source_errors' in reasons:
+            stats_increment(
+                self.logger, 'agent.operator_attention.source_errors')
 
     def _sync_manifest_files(self, source_url, manifest):
         version = str(manifest.get('version', ''))
@@ -679,9 +809,11 @@ class RingManagerAgent(Daemon):
 
     def _write_state(self, source_url, version, manifest, installed_files,
                      synced_at):
+        created_at = self._manifest_timestamp(manifest, 'latest manifest')
         state = {
             'source': source_url,
             'latest_ring_version': version,
+            'latest_ring_created_at': created_at,
             'synced_at': synced_at,
             'swift_dir': self.swift_dir,
             'files': installed_files,
@@ -696,12 +828,22 @@ class RingManagerAgent(Daemon):
             self.logger.exception('Exception creating recon cache path: %s' %
                                   err)
             return
+        if stats.get('success'):
+            # Recon cache updates merge nested keys, so success must delete
+            # stale failure fields instead of relying on omission.
+            stats = dict(stats)
+            stats.setdefault('source_errors', {})
+            stats.setdefault('sources', {})
         dump_recon_cache({'ring_manager_agent': stats},
                          self.recon_cache, self.logger)
 
     def _success_stats(self, source_url, started_at, ended_at, synced_at,
-                       result):
+                       result, source_errors=None):
+        source_errors = list(source_errors or [])
         stats = dict(result)
+        operator_attention = self._operator_attention_status(
+            source_errors=source_errors)
+        self._emit_operator_attention_metrics(operator_attention)
         stats.update({
             'source': source_url,
             'success': True,
@@ -712,12 +854,17 @@ class RingManagerAgent(Daemon):
             'last_success': ended_at.internal,
             'last_synced_at': synced_at,
             'error': {},
+            'operator_attention': operator_attention,
         })
+        if source_errors:
+            stats['source_errors'] = source_errors
         return stats
 
     def _failure_stats(self, started_at, err, source_errors):
         ended_at = self._timestamp()
         attempted_at = ended_at.internal
+        operator_attention = self._operator_attention_status(err)
+        self._emit_operator_attention_metrics(operator_attention)
         return {
             'sources': list(self.ring_manager_urls),
             'success': False,
@@ -726,11 +873,13 @@ class RingManagerAgent(Daemon):
             'last_attempted_at': attempted_at,
             'error': str(err),
             'source_errors': source_errors,
+            'operator_attention': operator_attention,
         }
 
     def _sync_from_source(self, source_url):
         manifest = self._json_request(
             source_url, '/api/v1/rings/releases/latest/manifest/')
+        self._check_manifest_not_rollback(source_url, manifest)
         version, installed_files, downloaded, unchanged = \
             self._sync_manifest_files(source_url, manifest)
         synced_at = self._timestamp_internal()
@@ -800,7 +949,8 @@ class RingManagerAgent(Daemon):
                 self.logger, 'agent.files.installed',
                 result.get('files_installed', 0))
             self._dump_recon(self._success_stats(
-                source_url, started_at, ended_at, synced_at, result))
+                source_url, started_at, ended_at, synced_at, result,
+                source_errors=source_errors))
             return result
 
         err = RingManagerAgentError(

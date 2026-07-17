@@ -1789,6 +1789,26 @@ sync_lock_timeout = 9
         self.assertEqual(1, counts['sync.attempts'])
         self.assertEqual(1, counts['sync.failures'])
 
+    def test_sync_success_recon_clears_stale_source_errors(self):
+        routes = self._routes()
+        routes[('GET', '/api/v1/rings/releases/release-1/files/'
+                'account.ring.gz')] = FakeResponse(
+            b'x' * len(self.artifact_body))
+
+        with self.assertRaises(RingManagerSyncError):
+            self._syncer(FakeOpener(routes)).sync()
+
+        recon_stats = self._read_recon()['ring_manager_sync']
+        self.assertFalse(recon_stats['success'])
+        self.assertIn('source_errors', recon_stats)
+
+        result = self._syncer(FakeOpener(self._routes())).sync()
+
+        self.assertEqual('release-1', result['latest_ring_version'])
+        recon_stats = self._read_recon()['ring_manager_sync']
+        self.assertTrue(recon_stats['success'])
+        self.assertNotIn('source_errors', recon_stats)
+
 
 if __name__ == '__main__':
     unittest.main()

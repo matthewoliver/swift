@@ -1069,6 +1069,12 @@ class RingManagerSync(object):
             self.logger.exception('Exception creating recon cache path: %s' %
                                   err)
             return
+        if sync_stats.get('success'):
+            # Recon cache updates merge nested keys, so success must delete
+            # stale failure fields instead of relying on omission.
+            sync_stats = dict(sync_stats)
+            sync_stats.setdefault('source_errors', {})
+            sync_stats.setdefault('sources', {})
         dump_recon_cache({'ring_manager_sync': sync_stats},
                          self.recon_cache, self.logger)
 
