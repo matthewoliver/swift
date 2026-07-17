@@ -258,6 +258,12 @@ The response includes ``desired_updated_at`` and ``desired_reason`` when they
 were recorded with the pointer.
 It returns ``404 Not Found`` until an operator selects a desired release.
 
+CLI equivalent:
+
+.. code-block:: console
+
+    $ swift-ring-manager versions desired
+
 ``PUT /api/v1/rings/releases/desired/``
 -------------------------------------------------
 
@@ -265,6 +271,17 @@ Selects an existing known release as desired.
 The request must include ``expected_desired`` so concurrent operators and
 queued release builds cannot silently overwrite newer intent.
 Use JSON ``null`` to assert that no desired release is currently selected.
+
+CLI equivalent:
+
+.. code-block:: console
+
+    $ swift-ring-manager versions set-desired release-42 \
+        --expected-desired release-41 \
+        --reason "validated canary rollout"
+
+Use ``--expect-no-desired`` instead of ``--expected-desired`` when the
+current selection is empty.
 
 .. code-block:: json
 
@@ -283,9 +300,9 @@ The selector is writable, so readonly and standby servers reject it.
 manifest with ``desired: true``.
 It also returns ``404 Not Found`` until a desired release exists.
 
-The storage-node agent and replica sync continue using ``latest`` in this
-slice.
-Desired-aware agent consumption and pointer replication are separate work.
+The storage-node agent continues using ``latest`` in this slice.
+Replica sync preserves both pointers, while desired-aware agent consumption is
+separate work.
 
 ``GET /api/v1/rings/releases/<version>/files/<file_name>``
 -----------------------------------------------------------------

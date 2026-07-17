@@ -638,6 +638,160 @@ nodes:
         }, json.loads(opener.requests[0]['body'].decode('ascii')))
         self.assertEqual('release-demo', json.loads(stdout)['version'])
 
+    def test_version_markers(self):
+        self.assertEqual('', cli._version_markers({}))
+        self.assertEqual('[latest]', cli._version_markers({
+            'latest': True,
+        }))
+        self.assertEqual('[desired]', cli._version_markers({
+            'desired': True,
+        }))
+        self.assertEqual('[latest, desired]', cli._version_markers({
+            'latest': True,
+            'desired': True,
+        }))
+
+    def test_versions_list_prints_markers_by_default(self):
+        body = {
+            'meta': {'total_count': 1},
+            'objects': [{
+                'version': 'release-demo',
+                'latest': True,
+                'desired': True,
+                'state': 'published',
+                'created_at': '1779789600.00000',
+                'files': [
+                    {'name': 'account.ring.gz'},
+                    {'name': 'object.ring.gz'},
+                ],
+            }],
+        }
+        opener = FakeOpener({
+            ('GET', '/api/v1/rings/releases/'): json_response(body),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'versions', 'list',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        headings = stdout.splitlines()[0]
+        self.assertLess(headings.index('MARKERS'), headings.index('VERSION'))
+        self.assertNotIn('LATEST', headings)
+        self.assertNotIn('DESIRED', headings)
+        self.assertIn('[latest, desired]', stdout)
+        self.assertIn('release-demo', stdout)
+        self.assertIn('2', stdout)
+
+    def test_versions_list_json_preserves_pointer_flags(self):
+        body = {
+            'meta': {'total_count': 1},
+            'objects': [{
+                'version': 'release-demo',
+                'latest': True,
+                'desired': False,
+            }],
+        }
+        opener = FakeOpener({
+            ('GET', '/api/v1/rings/releases/'): json_response(body),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--json', 'versions', 'list',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual(body, json.loads(stdout))
+
+    def test_versions_publish_can_leave_desired_unchanged(self):
+        opener = FakeOpener({})
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--dry-run',
+            'versions', 'publish',
+            '--version', 'release-staged',
+            '--no-desired',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual([], opener.requests)
+        self.assertEqual({
+            'method': 'POST',
+            'path': '/api/v1/rings/releases/',
+            'body': {
+                'version': 'release-staged',
+                'set_desired': False,
+            },
+        }, json.loads(stdout))
+
+    def test_versions_desired_gets_selected_release(self):
+        opener = FakeOpener({
+            ('GET', '/api/v1/rings/releases/desired/'): json_response({
+                'version': 'release-2',
+                'desired': True,
+            }),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--read-key', 'reader',
+            'versions', 'desired',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('release-2', json.loads(stdout)['version'])
+        self.assertEqual('GET', opener.requests[0]['method'])
+        self.assertEqual('reader',
+                         opener.requests[0]['headers'][
+                             'x-ring-manager-read-key'])
+
+    def test_versions_set_desired_uses_expected_release(self):
+        def set_desired(request):
+            self.assertEqual({
+                'version': 'release-2',
+                'expected_desired': 'release-1',
+                'reason': 'canary validation passed',
+            }, json.loads(request['body'].decode('ascii')))
+            self.assertEqual(
+                'secret', request['headers']['x-ring-manager-admin-key'])
+            return json_response({
+                'version': 'release-2',
+                'desired': True,
+            })
+
+        opener = FakeOpener({
+            ('PUT', '/api/v1/rings/releases/desired/'): set_desired,
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--admin-key', 'secret',
+            'versions', 'set-desired', 'release-2',
+            '--expected-desired', 'release-1',
+            '--reason', 'canary validation passed',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('release-2', json.loads(stdout)['version'])
+
+    def test_versions_set_desired_can_expect_no_selection(self):
+        opener = FakeOpener({})
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--dry-run',
+            'versions', 'set-desired', 'baseline-1',
+            '--expect-no-desired',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual([], opener.requests)
+        self.assertEqual({
+            'method': 'PUT',
+            'path': '/api/v1/rings/releases/desired/',
+            'body': {
+                'version': 'baseline-1',
+                'expected_desired': None,
+            },
+        }, json.loads(stdout))
+
     def test_builds_show_fetches_build_job(self):
         opener = FakeOpener({
             ('GET', '/api/v1/rings/builds/build-1/'):

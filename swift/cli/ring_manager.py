@@ -463,6 +463,22 @@ def _device_state(row):
     return 'active'
 
 
+def _file_count(row):
+    files = row.get('files') or []
+    return len(files)
+
+
+def _version_markers(row):
+    markers = []
+    if row.get('latest'):
+        markers.append('latest')
+    if row.get('desired'):
+        markers.append('desired')
+    if not markers:
+        return ''
+    return '[%s]' % ', '.join(markers)
+
+
 def _format_rings_list(value):
     return _format_table(_collection_rows(value), (
         ('ID', 'id'),
@@ -485,6 +501,16 @@ def _format_devices_list(value):
         ('WEIGHT', 'weight'),
         ('STATE', _device_state),
         ('META', 'meta'),
+    ))
+
+
+def _format_versions_list(value):
+    return _format_table(_collection_rows(value), (
+        ('MARKERS', _version_markers),
+        ('VERSION', 'version'),
+        ('STATE', 'state'),
+        ('CREATED', 'created_at'),
+        ('FILES', _file_count),
     ))
 
 
@@ -819,6 +845,8 @@ def _versions_publish_payload(args):
         payload['seed'] = args.seed
     if args.format_version is not None:
         payload['format_version'] = args.format_version
+    if args.no_desired:
+        payload['set_desired'] = False
     payload.update(_parse_key_values(args.set_values))
     return payload
 
@@ -833,6 +861,23 @@ def _versions_show(client, args):
     version = args.version or 'latest'
     return client.request(
         'GET', '/api/v1/rings/releases/%s/' % quote(version, safe=''))
+
+
+def _versions_set_desired_payload(args):
+    payload = {
+        'version': args.version,
+        'expected_desired': (
+            None if args.expect_no_desired else args.expected_desired),
+    }
+    if args.reason is not None:
+        payload['reason'] = args.reason
+    return payload
+
+
+def _versions_set_desired(client, args):
+    return _request_or_dry_run(
+        client, args, 'PUT', '/api/v1/rings/releases/desired/',
+        _versions_set_desired_payload(args))
 
 
 def _versions_manifest(client, args):
@@ -1310,7 +1355,8 @@ def make_parser():
     ver_sub = versions.add_subparsers(dest='versions_command')
     ver_sub.required = True
     versions_list = ver_sub.add_parser('list', help='List published releases.')
-    versions_list.set_defaults(func=_versions_list)
+    versions_list.set_defaults(
+        func=_versions_list, formatter=_format_versions_list)
     versions_publish = ver_sub.add_parser(
         'publish', help='Build artifacts and publish a complete release.')
     versions_publish.add_argument(
@@ -1326,6 +1372,9 @@ def make_parser():
         '--format-version', type=int, choices=(1, 2),
         help='Serialized ring format version. Default: Swift default.')
     versions_publish.add_argument(
+        '--no-desired', action='store_true',
+        help='Publish without selecting the release for agent installation.')
+    versions_publish.add_argument(
         '--set', dest='set_values', action='append', default=[],
         help='Set an arbitrary JSON field as KEY=VALUE.')
     versions_publish.set_defaults(func=_versions_publish)
@@ -1336,6 +1385,26 @@ def make_parser():
     versions_latest = ver_sub.add_parser(
         'latest', help='Show the latest published release.')
     versions_latest.set_defaults(func=_versions_show, version='latest')
+    versions_desired = ver_sub.add_parser(
+        'desired',
+        help='Show the cluster release selected for installation.')
+    versions_desired.set_defaults(func=_versions_show, version='desired')
+    versions_set_desired = ver_sub.add_parser(
+        'set-desired',
+        help='Select a known cluster release for agent installation.')
+    versions_set_desired.add_argument(
+        'version', help='Known cluster release to select.')
+    desired_expectation = \
+        versions_set_desired.add_mutually_exclusive_group(required=True)
+    desired_expectation.add_argument(
+        '--expected-desired',
+        help='Require this cluster release to be currently desired.')
+    desired_expectation.add_argument(
+        '--expect-no-desired', action='store_true',
+        help='Require that no cluster release is currently desired.')
+    versions_set_desired.add_argument(
+        '--reason', help='Optional operator-visible selection reason.')
+    versions_set_desired.set_defaults(func=_versions_set_desired)
     versions_manifest = ver_sub.add_parser(
         'manifest', help='Show a release manifest.')
     versions_manifest.add_argument(
