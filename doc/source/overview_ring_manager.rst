@@ -179,6 +179,16 @@ set.
 Unchanged enabled rings are carried forward from their latest immutable
 per-ring artifacts, so every release manifest remains a complete cluster
 snapshot.
+Every persisted manifest is a known immutable release.
+``latest`` records publication order, while ``desired`` is the explicitly
+selected installation target.
+Normal publication updates both pointers, but an operator can stage a known
+release by leaving ``desired`` unchanged and later selecting a release with a
+compare-and-set request.
+The API calculates both annotations from ``index.json`` without changing a
+manifest.
+Current storage-node agents and replica sync still consume ``latest``;
+desired-aware agent installs and desired-pointer sync are separate slices.
 Disabled rings remain editable but are omitted from releases and cannot be
 selected for publication.
 ``POST /api/v1/rings/<ring_id>/versions/`` also creates a persistent job.

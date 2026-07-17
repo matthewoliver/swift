@@ -320,6 +320,10 @@ class TestRingManagerApplication(unittest.TestCase):
                          body['links']['ring_versions'])
         self.assertEqual('/api/v1/rings/releases/latest/',
                          body['links']['latest_ring_version'])
+        self.assertEqual('/api/v1/rings/releases/desired/',
+                         body['links']['desired_ring_version'])
+        self.assertEqual('/api/v1/rings/releases/desired/manifest/',
+                         body['links']['desired_ring_version_manifest'])
         self.assertEqual('primary', body['mode'])
         self.assertTrue(body['writable'])
 
@@ -336,6 +340,7 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual('primary', body['mode'])
         self.assertTrue(body['writable'])
         self.assertEqual(self.latest_version, body['latest_ring_version'])
+        self.assertIsNone(body['desired_ring_version'])
         self.assertEqual('external', body['ring_build_executor'])
         self.assertEqual(0, body['ring_builds']['total'])
         self.assertEqual({
@@ -1239,6 +1244,13 @@ class TestRingManagerApplication(unittest.TestCase):
             ('^/api/v1/rings/releases/latest/files/'
              '(?P<file_name>[^/]+)/?$',
              ('GET',), 'latest_ring_version_file'),
+            ('^/api/v1/rings/releases/desired/?$',
+             ('GET', 'PUT'), 'desired_ring_version'),
+            ('^/api/v1/rings/releases/desired/manifest/?$',
+             ('GET',), 'desired_ring_version_manifest'),
+            ('^/api/v1/rings/releases/desired/files/'
+             '(?P<file_name>[^/]+)/?$',
+             ('GET',), 'desired_ring_version_file'),
             ('^/api/v1/rings/releases/(?P<version>[^/]+)/?$',
              ('GET',), 'ring_version_detail'),
             ('^/api/v1/rings/releases/(?P<version>[^/]+)/manifest/?$',
@@ -1345,6 +1357,7 @@ class TestRingManagerApplication(unittest.TestCase):
             item for item in body['objects']
             if item['version'] == self.latest_version)
         self.assertTrue(latest['latest'])
+        self.assertFalse(latest['desired'])
         self.assertEqual(
             '/api/v1/rings/releases/%s/' % quote(
                 self.latest_version, safe=''),
@@ -1367,6 +1380,8 @@ class TestRingManagerApplication(unittest.TestCase):
         })
         self.assertEqual(202, resp.status_int)
         self.assertEqual('queued', body['state'])
+        self.assertTrue(body['request']['set_desired'])
+        self.assertIsNone(body['request']['expected_desired'])
         self.assertTrue(resp.headers['Location'].endswith(
             body['resource_uri']))
         logger = debug_logger()
@@ -1375,6 +1390,8 @@ class TestRingManagerApplication(unittest.TestCase):
         body = build['result']
         self.assertEqual('release-demo', body['version'])
         self.assertTrue(body['latest'])
+        self.assertTrue(body['desired'])
+        self.assertEqual('updated', body['desired_update']['status'])
         self.assertEqual([{
             'ring_id': 'object-0',
             'swift_ring_version': body['rings'][0]['swift_ring_version'],
@@ -1454,6 +1471,60 @@ class TestRingManagerApplication(unittest.TestCase):
             for ring in body['rings'])
         self.assertEqual(first_versions['object-1'],
                          second_versions['object-1'])
+
+    def test_publish_can_stage_release_without_selecting_desired(self):
+        self._disable_initial_rings()
+        self._make_publishable_object_ring('object-0', 0)
+        self.app.store.set_desired_ring_version(
+            self.latest_version, None, timestamp='1779783600.00000')
+
+        result = self.app.publisher.publish({
+            'version': 'release-staged',
+            'rings': ['object-0'],
+            'set_desired': False,
+        })
+
+        self.assertTrue(result['latest'])
+        self.assertFalse(result['desired'])
+        self.assertNotIn('desired_update', result)
+        self.assertEqual(
+            self.latest_version,
+            self.app.store.get_desired_ring_version_id())
+
+    def test_publish_desired_conflict_keeps_known_release(self):
+        self._disable_initial_rings()
+        self._make_publishable_object_ring('object-0', 0)
+
+        result = self.app.publisher.publish({
+            'version': 'release-conflict',
+            'rings': ['object-0'],
+            'set_latest': False,
+            'set_desired': True,
+            'expected_desired': 'release-stale',
+        })
+
+        self.assertEqual('release-conflict', result['version'])
+        self.assertFalse(result['latest'])
+        self.assertFalse(result['desired'])
+        self.assertEqual('conflict', result['desired_update']['status'])
+        self.assertEqual(
+            'release-stale', result['desired_update']['expected_desired'])
+        self.assertIsNone(result['desired_update']['actual_desired'])
+        self.assertTrue(
+            self.app.store.ring_version_exists('release-conflict'))
+        self.assertIsNone(self.app.store.get_desired_ring_version_id())
+
+    def test_publish_rejects_expected_desired_without_selection(self):
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-invalid-desired',
+            'rings': ['1'],
+            'set_desired': False,
+            'expected_desired': self.latest_version,
+        })
+
+        self.assertEqual(400, resp.status_int)
+        self.assertEqual(
+            'expected_desired requires set_desired=true', body['error'])
 
     def test_publish_auto_selects_v2_for_large_device_ids(self):
         self._disable_initial_rings()
@@ -2042,6 +2113,113 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertTrue(resp.headers['Location'].endswith(
             '/api/v1/rings/releases/%s/files/%s' % (
                 quote(self.latest_version, safe=''), self.artifact_name)))
+
+    def test_desired_ring_version_selection_and_reads(self):
+        for path in (
+                '/api/v1/rings/releases/desired/',
+                '/api/v1/rings/releases/desired/manifest/',
+                '/api/v1/rings/releases/desired/files/%s' %
+                self.artifact_name):
+            resp, _body = self.get_json(path)
+            self.assertEqual(404, resp.status_int)
+
+        with mock.patch.object(
+                NormalTimestamp, 'now',
+                return_value=NormalTimestamp(1779789600)):
+            resp, body = self.json_request(
+                '/api/v1/rings/releases/desired/', 'PUT', {
+                    'version': self.latest_version,
+                    'expected_desired': None,
+                    'reason': 'initial rollout',
+                })
+
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(self.latest_version, body['version'])
+        self.assertTrue(body['latest'])
+        self.assertTrue(body['desired'])
+        self.assertEqual('1779789600.00000', body['desired_updated_at'])
+        self.assertEqual('initial rollout', body['desired_reason'])
+        self.assertEqual('updated', body['desired_update']['status'])
+        self.assertEqual(
+            self.latest_version,
+            self.app.store.get_state_index()['desired_ring_version'])
+
+        resp, body = self.get_json('/api/v1/rings/releases/desired/')
+        self.assertEqual(200, resp.status_int)
+        self.assertTrue(body['desired'])
+        resp, body = self.get_json(
+            '/api/v1/rings/releases/desired/manifest/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(self.latest_version, body['version'])
+        self.assertTrue(body['desired'])
+
+        req = Request.blank(
+            '/api/v1/rings/releases/desired/files/%s' % self.artifact_name)
+        resp = req.get_response(self.app)
+        self.assertEqual(307, resp.status_int)
+        self.assertTrue(resp.headers['Location'].endswith(
+            '/api/v1/rings/releases/%s/files/%s' % (
+                quote(self.latest_version, safe=''), self.artifact_name)))
+
+        resp, body = self.json_request(
+            '/api/v1/rings/releases/desired/', 'PUT', {
+                'version': 'older-version',
+                'expected_desired': self.latest_version,
+                'reason': 'roll back',
+            })
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('older-version', body['version'])
+        self.assertFalse(body['latest'])
+        self.assertTrue(body['desired'])
+        self.assertFalse(self.app.store.get_ring_version(
+            self.latest_version)['desired'])
+
+    def test_desired_ring_version_compare_and_set_conflict(self):
+        self.app.store.set_desired_ring_version(
+            self.latest_version, None, timestamp='1779789600.00000')
+
+        resp, body = self.json_request(
+            '/api/v1/rings/releases/desired/', 'PUT', {
+                'version': 'older-version',
+                'expected_desired': None,
+            })
+
+        self.assertEqual(409, resp.status_int)
+        self.assertIsNone(body['expected_desired'])
+        self.assertEqual(self.latest_version, body['actual_desired'])
+        self.assertEqual(
+            self.latest_version,
+            self.app.store.get_desired_ring_version_id())
+
+    def test_desired_ring_version_put_validates_request(self):
+        for payload, error in (
+                ({'expected_desired': None}, 'version is required'),
+                ({'version': self.latest_version},
+                 'expected_desired is required'),
+                ({'version': self.latest_version,
+                  'expected_desired': ''},
+                 'expected_desired must be a release version or null')):
+            resp, body = self.json_request(
+                '/api/v1/rings/releases/desired/', 'PUT', payload)
+            self.assertEqual(400, resp.status_int)
+            self.assertEqual(error, body['error'])
+
+    def test_desired_ring_version_rejects_readonly_mode(self):
+        app = RingManagerApplication({
+            'ring_manager_state_dir': self.state_dir,
+            'ring_artifact_dir': self.artifact_dir,
+            'ring_builder_dir': self.testdir,
+            'ring_manager_mode': 'readonly',
+        }, logger=debug_logger())
+
+        resp, body = self.json_request(
+            '/api/v1/rings/releases/desired/', 'PUT', {
+                'version': self.latest_version,
+                'expected_desired': None,
+            }, app=app)
+
+        self.assertEqual(403, resp.status_int)
+        self.assertIn('readonly', body['error'])
 
     def test_ring_version_file_streams_with_validators(self):
         path = '/api/v1/rings/releases/%s/files/%s' % (

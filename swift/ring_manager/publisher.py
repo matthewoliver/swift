@@ -25,7 +25,8 @@ from swift.ring_manager.builder import RingBuilderManager, \
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
     NormalTimestamp, normal_timestamp, stats_increment, stats_timing, \
     validate_artifact_version_id
-from swift.ring_manager.store import RingVersionNotFound
+from swift.ring_manager.store import RingDesiredVersionConflict, \
+    RingVersionNotFound
 
 
 class RingBuilderPublisherError(RingBuilderManagerError):
@@ -420,6 +421,13 @@ class RingBuilderPublisher(object):
         payload = dict(payload or {})
         if config_true_value(str(payload.get('artifact_only', 'false'))):
             return self.publish_artifact(payload)
+        set_latest = not config_true_value(str(payload.get(
+            'no_latest', 'false')))
+        if 'set_latest' in payload:
+            set_latest = config_true_value(str(payload['set_latest']))
+        set_desired = set_latest
+        if 'set_desired' in payload:
+            set_desired = config_true_value(str(payload['set_desired']))
         publish_version = validate_artifact_version_id(
             payload.get('version') or
             ('release-%s' % self._timestamp_internal()), 'release version')
@@ -501,8 +509,41 @@ class RingBuilderPublisher(object):
             'carried_forward': carried_forward,
         }
         self.store.save_ring_version(manifest)
-        self.store.set_latest_ring_version(publish_version)
+        if set_latest:
+            self.store.set_latest_ring_version(publish_version)
+        desired_update = None
+        if set_desired:
+            expected_desired = payload.get(
+                'expected_desired', self.store.get_desired_ring_version_id())
+            try:
+                desired_update = self.store.set_desired_ring_version(
+                    publish_version, expected_desired,
+                    timestamp=created_at,
+                    reason=payload.get('desired_reason'))
+            except RingDesiredVersionConflict as err:
+                desired_update = {
+                    'status': 'conflict',
+                    'version': publish_version,
+                    'expected_desired': err.expected,
+                    'actual_desired': err.actual,
+                }
+                stats_increment(
+                    self.logger, 'ring_releases.desired.conflicts')
+                if self.logger is not None:
+                    self.logger.warning(
+                        'Published ring release %(version)s but did not '
+                        'select it as desired: expected %(expected)r, '
+                        'actual %(actual)r', {
+                            'version': publish_version,
+                            'expected': err.expected,
+                            'actual': err.actual,
+                        })
+            else:
+                stats_increment(
+                    self.logger, 'ring_releases.desired.%s' %
+                    desired_update['status'])
         public_manifest = self.store.get_ring_version_manifest(
             publish_version)
-        public_manifest['latest'] = True
+        if desired_update is not None:
+            public_manifest['desired_update'] = desired_update
         return public_manifest

@@ -261,6 +261,9 @@ class RingManagerApplication(object):
             'ring_builds': '/api/v1/rings/builds/',
             'ring_versions': '/api/v1/rings/releases/',
             'latest_ring_version': '/api/v1/rings/releases/latest/',
+            'desired_ring_version': '/api/v1/rings/releases/desired/',
+            'desired_ring_version_manifest':
+                '/api/v1/rings/releases/desired/manifest/',
         }
 
     def _service_document(self, api_version=None):
@@ -777,8 +780,10 @@ class RingManagerApplication(object):
         index_error = None
         try:
             latest_version = self.store.get_latest_ring_version_id()
+            desired_version = self.store.get_desired_ring_version_id()
         except (IOError, ValueError) as err:
             latest_version = None
+            desired_version = None
             index_error = str(err)
         body = {
             'service': self.server_type,
@@ -787,6 +792,7 @@ class RingManagerApplication(object):
             'mode': self.mode,
             'writable': self.writable,
             'latest_ring_version': latest_version,
+            'desired_ring_version': desired_version,
             'ring_build_executor': self.ring_build_executor,
             'build_job_lease_timeout': self.build_job_lease_timeout,
             'ring_builds': self.store.ring_build_queue_stats(

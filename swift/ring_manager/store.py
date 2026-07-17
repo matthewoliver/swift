@@ -23,9 +23,9 @@ from urllib.parse import quote, unquote
 
 from swift.common.utils import config_true_value, fsync, fsync_dir, lock_path
 from swift.ring_manager.common import DEFAULT_BUILD_JOB_LEASE_TIMEOUT, \
-    StateChangeHook, normal_timestamp_float, normal_timestamp_internal, \
-    resolve_artifact_path, validate_artifact_version_id, \
-    validate_path_component
+    RESERVED_ARTIFACT_VERSION_IDS, StateChangeHook, normal_timestamp_float, \
+    normal_timestamp_internal, resolve_artifact_path, \
+    validate_artifact_version_id, validate_path_component
 
 
 class RingNotFound(KeyError):
@@ -67,6 +67,15 @@ class RingBuildVersionConflict(Exception):
 
 class RingBuildStateConflict(Exception):
     pass
+
+
+class RingDesiredVersionConflict(Exception):
+    def __init__(self, expected, actual):
+        self.expected = expected
+        self.actual = actual
+        super(RingDesiredVersionConflict, self).__init__(
+            'desired ring version changed from %r to %r' % (
+                expected, actual))
 
 
 TERMINAL_RING_BUILD_STATES = ('completed', 'failed', 'cancelled')
@@ -325,7 +334,7 @@ class RingManagerStore(object):
             version, file_info)
         return public_file
 
-    def _public_ring_version(self, version, latest=False):
+    def _public_ring_version(self, version, latest=False, desired=False):
         public_version = copy.deepcopy(version)
         public_version.pop('_artifact_root', None)
         public_version.pop('_manifest_path', None)
@@ -334,12 +343,14 @@ class RingManagerStore(object):
         public_version['version'] = self._ring_version_id(version)
         public_version['resource_uri'] = self._ring_version_uri(version)
         public_version['latest'] = latest or bool(version.get('latest'))
+        public_version['desired'] = bool(desired)
         public_version['files'] = [
             self._public_ring_version_file(version, file_info)
             for file_info in version.get('files', [])]
         return public_version
 
-    def _manifest_for_ring_version(self, version, latest=False):
+    def _manifest_for_ring_version(self, version, latest=False,
+                                   desired=False):
         manifest = copy.deepcopy(version.get('manifest', {}))
         for key in ('path', 'artifact_dir', '_artifact_root',
                     '_manifest_path'):
@@ -347,6 +358,7 @@ class RingManagerStore(object):
         manifest['version'] = self._ring_version_id(version)
         manifest['resource_uri'] = self._ring_version_uri(version)
         manifest['latest'] = latest or bool(version.get('latest'))
+        manifest['desired'] = bool(desired)
         for key in ('cluster_id', 'cluster', 'state', 'created_at', 'rings'):
             if key in version and key not in manifest:
                 manifest[key] = version[key]
@@ -1069,10 +1081,12 @@ class RingManagerStore(object):
 
     def list_ring_versions(self, cluster_id=None):
         latest_id = self.get_latest_ring_version_id()
+        desired_id = self.get_desired_ring_version_id()
         return [
             self._public_ring_version(
                 version,
-                latest=self._ring_version_id(version) == latest_id)
+                latest=self._ring_version_id(version) == latest_id,
+                desired=self._ring_version_id(version) == desired_id)
             for version in self._ring_versions()
             if self._matches_cluster(version, cluster_id)
         ]
@@ -1114,29 +1128,82 @@ class RingManagerStore(object):
         except RingVersionNotFound:
             return None
 
+    def _desired_ring_version_id(self):
+        desired_id = self._state_index().get('desired_ring_version')
+        if desired_id in (None, ''):
+            return None
+        return str(desired_id)
+
+    def _find_desired_ring_version(self):
+        desired_id = self._desired_ring_version_id()
+        if desired_id is None:
+            raise RingVersionNotFound('desired')
+        return self._find_ring_version(desired_id)
+
+    def get_desired_ring_version_id(self):
+        return self._desired_ring_version_id()
+
+    def get_desired_ring_version(self):
+        index = self._state_index()
+        desired_id = index.get('desired_ring_version')
+        if desired_id in (None, ''):
+            raise RingVersionNotFound('desired')
+        version = self._find_ring_version(desired_id)
+        public_version = self._public_ring_version(
+            version,
+            latest=self._ring_version_id(version) ==
+            self.get_latest_ring_version_id(),
+            desired=True)
+        if index.get('desired_updated_at') is not None:
+            public_version['desired_updated_at'] = \
+                index['desired_updated_at']
+        if index.get('desired_reason') is not None:
+            public_version['desired_reason'] = index['desired_reason']
+        return public_version
+
     def get_ring_version(self, version_id):
         if version_id == 'latest':
             version = self._find_latest_ring_version()
-            return self._public_ring_version(version, latest=True)
+            return self._public_ring_version(
+                version, latest=True,
+                desired=self._ring_version_id(version) ==
+                self.get_desired_ring_version_id())
+        if version_id == 'desired':
+            return self.get_desired_ring_version()
         version = self._find_ring_version(version_id)
         return self._public_ring_version(
             version,
             latest=self._ring_version_id(version) ==
-            self.get_latest_ring_version_id())
+            self.get_latest_ring_version_id(),
+            desired=self._ring_version_id(version) ==
+            self.get_desired_ring_version_id())
 
     def get_ring_version_manifest(self, version_id):
         if version_id == 'latest':
             version = self._find_latest_ring_version()
-            return self._manifest_for_ring_version(version, latest=True)
+            return self._manifest_for_ring_version(
+                version, latest=True,
+                desired=self._ring_version_id(version) ==
+                self.get_desired_ring_version_id())
+        if version_id == 'desired':
+            version = self._find_desired_ring_version()
+            return self._manifest_for_ring_version(
+                version,
+                latest=self._ring_version_id(version) ==
+                self.get_latest_ring_version_id(), desired=True)
         version = self._find_ring_version(version_id)
         return self._manifest_for_ring_version(
             version,
             latest=self._ring_version_id(version) ==
-            self.get_latest_ring_version_id())
+            self.get_latest_ring_version_id(),
+            desired=self._ring_version_id(version) ==
+            self.get_desired_ring_version_id())
 
     def get_concrete_ring_version_id(self, version_id):
         if version_id == 'latest':
             return self._ring_version_id(self._find_latest_ring_version())
+        if version_id == 'desired':
+            return self._ring_version_id(self._find_desired_ring_version())
         return self._ring_version_id(self._find_ring_version(version_id))
 
     def get_ring_version_file(self, version_id, file_name):
@@ -1160,6 +1227,10 @@ class RingManagerStore(object):
         version = copy.deepcopy(version)
         version_id = validate_artifact_version_id(
             self._ring_version_id(version), 'release version')
+        if version_id in RESERVED_ARTIFACT_VERSION_IDS:
+            raise ValueError(
+                'published ring version %s is reserved for an API selector' %
+                version_id)
         if self.ring_version_exists(version_id):
             raise ValueError(
                 'published ring version %s already exists' % version_id)
@@ -1170,10 +1241,47 @@ class RingManagerStore(object):
         return self._public_ring_version(version)
 
     def set_latest_ring_version(self, version_id):
-        index = self._state_index()
-        index['latest_ring_version'] = str(version_id)
-        self._write_json_file(self._state_dir_path('index.json'), index)
-        return copy.deepcopy(index)
+        def mutate(index):
+            index['latest_ring_version'] = str(version_id)
+            return True, copy.deepcopy(index)
+        return self._mutate_state_index(mutate)
+
+    def set_desired_ring_version(self, version_id, expected_desired,
+                                 timestamp=None, reason=None):
+        version_id = self._ring_version_id(
+            self._find_ring_version(version_id))
+        expected_desired = None if expected_desired is None else \
+            str(expected_desired)
+        timestamp = normal_timestamp_internal(timestamp)
+
+        def mutate(index):
+            current = index.get('desired_ring_version')
+            current = None if current in (None, '') else str(current)
+            if current != expected_desired:
+                raise RingDesiredVersionConflict(expected_desired, current)
+            if current == version_id:
+                return False, {
+                    'status': 'unchanged',
+                    'version': version_id,
+                    'previous_desired': current,
+                    'updated_at': index.get('desired_updated_at'),
+                    'reason': index.get('desired_reason'),
+                }
+            index['desired_ring_version'] = version_id
+            index['desired_updated_at'] = timestamp
+            if reason in (None, ''):
+                index.pop('desired_reason', None)
+            else:
+                index['desired_reason'] = str(reason)
+            return True, {
+                'status': 'updated',
+                'version': version_id,
+                'previous_desired': current,
+                'updated_at': timestamp,
+                'reason': index.get('desired_reason'),
+            }
+
+        return self._mutate_state_index(mutate)
 
     def _timestamp_float(self, obj, keys=('created_at', 'updated_at')):
         for key in keys:

@@ -50,6 +50,8 @@ Example response::
         {"id": "v1", "url": "/api/v1/"}
       ],
       "links": {
+        "desired_ring_version": "/api/v1/rings/releases/desired/",
+        "desired_ring_version_manifest": "/api/v1/rings/releases/desired/manifest/",
         "latest_ring_version": "/api/v1/rings/releases/latest/",
         "ring_builds": "/api/v1/rings/builds/",
         "ring_versions": "/api/v1/rings/releases/",
@@ -198,6 +200,10 @@ Queued, deferred, building, and completed jobs return ``409 Conflict``.
 Lists known releases in the standard collection envelope.
 The optional ``cluster_id`` query parameter filters the collection.
 File entries include a download URL, byte count, MD5 digest when present, and SHA-256 integrity digest when present.
+``latest`` identifies the most recently published release, while ``desired``
+identifies the known release selected as the installation target.
+Both booleans are calculated from mutable index pointers and are not written
+into immutable release manifests.
 
 ``POST /api/v1/rings/releases/``
 ---------------------------------
@@ -220,6 +226,11 @@ An explicit ``format_version: 1`` fails for a builder that needs wider IDs;
 use ``format_version: 2`` to force v2 output.
 Reusing a published release version returns ``400 Bad Request``.
 An active job for the same explicit release version returns ``409 Conflict``.
+Normal publish requests update both ``latest`` and ``desired``.
+Set ``set_desired`` to false to stage a known release without selecting it.
+The persistent job records the current desired value as ``expected_desired``;
+the worker changes the pointer only if that value still matches.
+This prevents a stale queued job from overwriting a newer operator selection.
 
 ``GET /api/v1/rings/releases/<version>/``
 ------------------------------------------------
@@ -239,6 +250,43 @@ The response includes release metadata and public file entries without local pat
 Returns the release selected by ``latest_ring_version`` in the state index, or by a release marked ``latest`` when no index value exists.
 The corresponding ``.../latest/manifest/`` resource returns its public manifest.
 
+``GET /api/v1/rings/releases/desired/``
+-------------------------------------------------
+
+Returns the known release selected for installation.
+The response includes ``desired_updated_at`` and ``desired_reason`` when they
+were recorded with the pointer.
+It returns ``404 Not Found`` until an operator selects a desired release.
+
+``PUT /api/v1/rings/releases/desired/``
+-------------------------------------------------
+
+Selects an existing known release as desired.
+The request must include ``expected_desired`` so concurrent operators and
+queued release builds cannot silently overwrite newer intent.
+Use JSON ``null`` to assert that no desired release is currently selected.
+
+.. code-block:: json
+
+    {
+      "version": "release-42",
+      "expected_desired": "release-41",
+      "reason": "validated canary rollout"
+    }
+
+A matching selection is idempotent.
+An unknown release returns ``404 Not Found`` and an outdated expectation
+returns ``409 Conflict`` without changing the pointer.
+The selector is writable, so readonly and standby servers reject it.
+
+``GET /api/v1/rings/releases/desired/manifest/`` returns the selected public
+manifest with ``desired: true``.
+It also returns ``404 Not Found`` until a desired release exists.
+
+The storage-node agent and replica sync continue using ``latest`` in this
+slice.
+Desired-aware agent consumption and pointer replication are separate work.
+
 ``GET /api/v1/rings/releases/<version>/files/<file_name>``
 -----------------------------------------------------------------
 
@@ -247,6 +295,8 @@ The server resolves the manifest path below ``ring_artifact_dir`` and rejects le
 The response uses the file's MD5 digest as the HTTP ETag and exposes its SHA-256 digest in ``X-Checksum-Sha256``.
 HEAD, ``If-None-Match``, and single or multiple byte ranges use Swift's normal conditional response handling.
 The ``.../latest/files/<file_name>`` selector redirects to the concrete immutable version URL.
+The corresponding ``.../desired/files/<file_name>`` selector redirects to the
+selected immutable version, or returns ``404 Not Found`` when none is set.
 
 Replica pull workflow
 =====================
@@ -258,6 +308,8 @@ It validates the supplied byte counts and SHA-256 digests.
 The command records local paths rather than source URLs, writes the release
 manifest, and advances the mutable latest_ring_version pointer only after the
 pull completes.
+Desired-pointer replication follows separately, so this sync workflow still
+tracks ``latest`` only.
 Existing valid artefacts use If-None-Match and may receive 304 Not Modified.
 
 One or more source URLs may be supplied directly or through the dedicated
@@ -578,8 +630,9 @@ Service status
 ``GET /api/v1/ring_manager/status/``
 ------------------------------------
 
-Returns the service mode, latest published release, executor mode, build queue
-summary, and replica synchronization freshness information.
+Returns the service mode, latest published release, desired installation
+target, executor mode, build queue summary, and replica synchronization
+freshness information.
 
 Example response::
 
@@ -590,6 +643,7 @@ Example response::
       "version": "<swift version>",
       "writable": false,
       "latest_ring_version": "release-42",
+      "desired_ring_version": "release-41",
       "ring_manager_sync": {
         "applicable": true,
         "source": "https://primary.example.com:6205",

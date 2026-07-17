@@ -35,7 +35,7 @@ from swift.ring_manager.common import NormalTimestamp, stats_increment
 from swift.ring_manager.routing import Route
 from swift.ring_manager.store import RingAlreadyExists, RingBuildNotFound, \
     RingBuildPublishedVersionConflict, RingBuildStateConflict, \
-    RingBuildVersionConflict, \
+    RingBuildVersionConflict, RingDesiredVersionConflict, \
     RingNotFound, RingVersionFileNotFound, RingVersionNotFound
 
 
@@ -131,6 +131,13 @@ class RingController(object):
             Route(r'^/api/v1/rings/releases/latest/files/'
                   r'(?P<file_name>[^/]+)/?$',
                   ('GET',), self.latest_ring_version_file),
+            Route(r'^/api/v1/rings/releases/desired/?$',
+                  ('GET', 'PUT'), self.desired_ring_version),
+            Route(r'^/api/v1/rings/releases/desired/manifest/?$',
+                  ('GET',), self.desired_ring_version_manifest),
+            Route(r'^/api/v1/rings/releases/desired/files/'
+                  r'(?P<file_name>[^/]+)/?$',
+                  ('GET',), self.desired_ring_version_file),
             Route(r'^/api/v1/rings/releases/(?P<version>[^/]+)/?$',
                   ('GET',), self.ring_version_detail),
             Route(r'^/api/v1/rings/releases/(?P<version>[^/]+)/manifest/?$',
@@ -817,7 +824,40 @@ class RingController(object):
         self._validate_release_build_request(payload)
 
     def _enqueue_ring_build(self, payload, timestamp=None, extra=None):
+        payload = copy.deepcopy(payload)
         self._validate_ring_build_request(payload)
+        if not config_true_value(str(
+                payload.get('artifact_only', 'false'))):
+            set_latest = not config_true_value(str(payload.get(
+                'no_latest', 'false')))
+            if 'set_latest' in payload:
+                set_latest = config_true_value(str(payload['set_latest']))
+            set_desired = set_latest
+            if 'set_desired' in payload:
+                set_desired = config_true_value(
+                    str(payload['set_desired']))
+            payload['set_desired'] = set_desired
+            if not set_desired and 'expected_desired' in payload:
+                raise RingBuilderPublisherError(
+                    'expected_desired requires set_desired=true')
+            if not set_desired and 'desired_reason' in payload:
+                raise RingBuilderPublisherError(
+                    'desired_reason requires set_desired=true')
+            if set_desired and 'expected_desired' not in payload:
+                payload['expected_desired'] = \
+                    self._store.get_desired_ring_version_id()
+            expected_desired = payload.get('expected_desired')
+            if (set_desired and (
+                    expected_desired == '' or (
+                        expected_desired is not None and
+                        not isinstance(expected_desired, str)))):
+                raise RingBuilderPublisherError(
+                    'expected_desired must be a release version or null')
+            desired_reason = payload.get('desired_reason')
+            if (desired_reason is not None and
+                    not isinstance(desired_reason, str)):
+                raise RingBuilderPublisherError(
+                    'desired_reason must be a string')
         timestamp = NormalTimestamp.now().internal \
             if timestamp is None else timestamp
         build = self._store.create_ring_build(
@@ -967,6 +1007,60 @@ class RingController(object):
             return HTTPNotFound(request=req)
         return self._json_response(req, version)
 
+    def desired_ring_version(self, req):
+        if req.method == 'PUT':
+            payload = self._json_request_body(req)
+            version = payload.get('version')
+            if version in (None, ''):
+                return self._json_error(
+                    req, HTTPBadRequest, 'version is required')
+            if not isinstance(version, str):
+                return self._json_error(
+                    req, HTTPBadRequest, 'version must be a string')
+            if 'expected_desired' not in payload:
+                return self._json_error(
+                    req, HTTPBadRequest, 'expected_desired is required')
+            expected_desired = payload['expected_desired']
+            if expected_desired == '':
+                return self._json_error(
+                    req, HTTPBadRequest,
+                    'expected_desired must be a release version or null')
+            if (expected_desired is not None and
+                    not isinstance(expected_desired, str)):
+                return self._json_error(
+                    req, HTTPBadRequest,
+                    'expected_desired must be a release version or null')
+            reason = payload.get('reason')
+            if reason is not None and not isinstance(reason, str):
+                return self._json_error(
+                    req, HTTPBadRequest, 'reason must be a string')
+            try:
+                update = self._store.set_desired_ring_version(
+                    version, expected_desired,
+                    timestamp=NormalTimestamp.now().internal,
+                    reason=reason)
+                selected = self._store.get_desired_ring_version()
+            except RingVersionNotFound:
+                return HTTPNotFound(request=req)
+            except RingDesiredVersionConflict as err:
+                stats_increment(
+                    self._logger, 'ring_releases.desired.conflicts')
+                return self._json_response(req, {
+                    'error': str(err),
+                    'expected_desired': err.expected,
+                    'actual_desired': err.actual,
+                }, status=409)
+            selected['desired_update'] = update
+            stats_increment(
+                self._logger,
+                'ring_releases.desired.%s' % update['status'])
+            return self._json_response(req, selected)
+        try:
+            version = self._store.get_desired_ring_version()
+        except RingVersionNotFound:
+            return HTTPNotFound(request=req)
+        return self._json_response(req, version)
+
     def ring_version_detail(self, req, version):
         try:
             version = self._store.get_ring_version(unquote(version))
@@ -976,6 +1070,9 @@ class RingController(object):
 
     def latest_ring_version_manifest(self, req):
         return self.ring_version_manifest(req, 'latest')
+
+    def desired_ring_version_manifest(self, req):
+        return self.ring_version_manifest(req, 'desired')
 
     def ring_version_manifest(self, req, version):
         try:
@@ -989,6 +1086,17 @@ class RingController(object):
         try:
             concrete_version = self._store.get_concrete_ring_version_id(
                 'latest')
+        except RingVersionNotFound:
+            return HTTPNotFound(request=req)
+        location = '/api/v1/rings/releases/%s/files/%s' % (
+            quote(concrete_version, safe=''), quote(file_name, safe=''))
+        return HTTPTemporaryRedirect(
+            request=req, headers={'Location': location})
+
+    def desired_ring_version_file(self, req, file_name):
+        try:
+            concrete_version = self._store.get_concrete_ring_version_id(
+                'desired')
         except RingVersionNotFound:
             return HTTPNotFound(request=req)
         location = '/api/v1/rings/releases/%s/files/%s' % (
