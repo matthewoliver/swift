@@ -19,12 +19,14 @@ import tempfile
 import unittest
 
 from urllib.parse import urlparse
+from unittest import mock
 
 from swift.common.recon import RECON_RING_MANAGER_FILE
 from swift.common.swob import Request
 from swift.common.utils import md5
 from swift.ring_manager.common import NormalTimestamp
 from swift.ring_manager.server import RingManagerApplication
+from swift.ring_manager import sync
 from swift.ring_manager.sync import RingManagerSync, RingManagerSyncError
 from test.debug_logger import debug_logger
 
@@ -160,17 +162,22 @@ class TestRingManagerSync(unittest.TestCase):
              'account.ring.gz'): artifact,
         }
 
-    def _syncer(self, opener, time_func=NormalTimestamp.now, logger=None):
+    def _syncer(self, opener, time_func=NormalTimestamp.now, logger=None,
+                **kwargs):
+        sync_kwargs = {
+            'admin_key': 'secret',
+            'timeout': 12,
+            'opener': opener,
+            'recon_cache_path': self.recon_cache_path,
+            'logger': logger or debug_logger(),
+            'time_func': time_func,
+        }
+        sync_kwargs.update(kwargs)
         return RingManagerSync(
             'http://primary.example.com:6205',
             self.state_dir,
             self.artifact_dir,
-            admin_key='secret',
-            timeout=12,
-            opener=opener,
-            recon_cache_path=self.recon_cache_path,
-            logger=logger or debug_logger(),
-            time_func=time_func)
+            **sync_kwargs)
 
     def _make_state_hook(self):
         hook_path = os.path.join(self.testdir, 'state-hook')
@@ -316,6 +323,68 @@ class TestRingManagerSync(unittest.TestCase):
             self.assertEqual('secret',
                              req['headers']['x-ring-manager-admin-key'])
             self.assertEqual(12, req['timeout'])
+
+    def test_sync_uses_read_key_when_configured(self):
+        opener = FakeOpener(self._routes())
+
+        self._syncer(opener, read_key='reader').sync()
+
+        for request in opener.requests:
+            self.assertEqual(
+                'reader', request['headers']['x-ring-manager-read-key'])
+            self.assertNotIn('x-ring-manager-admin-key',
+                             request['headers'])
+
+    def test_sync_uses_read_auth_token_when_configured(self):
+        opener = FakeOpener(self._routes())
+
+        self._syncer(
+            opener, auth_token='admin-token',
+            read_auth_token='reader-token').sync()
+
+        for request in opener.requests:
+            self.assertEqual('reader-token',
+                             request['headers']['x-auth-token'])
+            self.assertNotIn('x-ring-manager-admin-key',
+                             request['headers'])
+
+    def test_sync_parser_accepts_read_credentials(self):
+        from swift.ring_manager.sync import _make_parser
+
+        options, args = _make_parser().parse_args([
+            'https://primary.example.com:6205',
+            '--ring-manager-state-dir', self.state_dir,
+            '--ring-artifact-dir', self.artifact_dir,
+            '--read-key', 'reader',
+            '--read-auth-token', 'reader-token',
+        ])
+
+        self.assertEqual(['https://primary.example.com:6205'], args)
+        self.assertEqual('reader', options.read_key)
+        self.assertEqual('reader-token', options.read_auth_token)
+
+    def test_sync_main_passes_read_credentials(self):
+        with mock.patch.object(sync, 'RingManagerSync') as syncer:
+            syncer.return_value.sync.return_value = {
+                'latest_ring_version': 'release-1',
+                'rings_synced': 1,
+                'ring_versions_synced': 1,
+                'manifest_files_downloaded': 1,
+                'manifest_files_unchanged': 0,
+            }
+            status = sync.main([
+                'https://primary.example.com:6205',
+                '--ring-manager-state-dir', self.state_dir,
+                '--ring-artifact-dir', self.artifact_dir,
+                '--read-key', 'reader',
+                '--read-auth-token', 'reader-token',
+                '--quiet',
+            ])
+
+        self.assertEqual(0, status)
+        self.assertEqual('reader', syncer.call_args[1]['read_key'])
+        self.assertEqual('reader-token',
+                         syncer.call_args[1]['read_auth_token'])
 
     def test_sync_runs_state_change_hook_for_json_writes(self):
         hook_path, log_path = self._make_state_hook()

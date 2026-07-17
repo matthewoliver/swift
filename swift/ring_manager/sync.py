@@ -48,7 +48,8 @@ class RingManagerSync(object):
     """
 
     def __init__(self, source_url, state_dir, artifact_dir, admin_key=None,
-                 auth_token=None, timeout=30, opener=None,
+                 auth_token=None, read_key=None, read_auth_token=None,
+                 timeout=30, opener=None,
                  recon_cache_path=DEFAULT_RECON_CACHE_PATH, recon_dump=True,
                  logger=None, time_func=NormalTimestamp.now,
                  state_change_hook=None, state_change_hook_timeout=None):
@@ -61,6 +62,8 @@ class RingManagerSync(object):
         self.source_url = source_url.rstrip('/')
         self.state_dir = state_dir
         self.artifact_dir = artifact_dir
+        self.read_key = read_key
+        self.read_auth_token = read_auth_token
         self.admin_key = admin_key
         self.auth_token = auth_token
         self.timeout = timeout
@@ -87,9 +90,14 @@ class RingManagerSync(object):
 
     def _headers(self, extra=None):
         headers = {'User-Agent': USER_AGENT}
-        if self.admin_key:
+        has_read_credentials = self.read_key or self.read_auth_token
+        if self.read_key:
+            headers['X-Ring-Manager-Read-Key'] = self.read_key
+        elif not has_read_credentials and self.admin_key:
             headers['X-Ring-Manager-Admin-Key'] = self.admin_key
-        if self.auth_token:
+        if self.read_auth_token:
+            headers['X-Auth-Token'] = self.read_auth_token
+        elif not has_read_credentials and self.auth_token:
             headers['X-Auth-Token'] = self.auth_token
         if extra:
             headers.update(extra)
@@ -465,8 +473,14 @@ def _make_parser():
         '--admin-key', dest='admin_key',
         help='Value for X-Ring-Manager-Admin-Key when fetching from source.')
     parser.add_option(
+        '--read-key', dest='read_key',
+        help='Value for X-Ring-Manager-Read-Key when fetching from source.')
+    parser.add_option(
         '--auth-token', dest='auth_token',
         help='Value for X-Auth-Token when fetching from source.')
+    parser.add_option(
+        '--read-auth-token', dest='read_auth_token',
+        help='Read-only value for X-Auth-Token when fetching from source.')
     parser.add_option(
         '--timeout', dest='timeout', type='float', default=30,
         help='HTTP request timeout in seconds. Default: 30')
@@ -537,6 +551,8 @@ def main(argv=None):
             options.artifact_dir,
             admin_key=options.admin_key,
             auth_token=options.auth_token,
+            read_key=options.read_key,
+            read_auth_token=options.read_auth_token,
             timeout=options.timeout,
             recon_cache_path=options.recon_cache_path,
             recon_dump=options.recon_dump,
