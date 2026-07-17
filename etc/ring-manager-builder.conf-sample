@@ -21,3 +21,11 @@
 # ring_manager_state_dir = /etc/swift/ring-manager-state
 # ring_artifact_dir = /etc/swift/ring-manager-artifacts
 # ring_builder_dir = /etc/swift
+#
+# Optional best-effort command to run after each state JSON write or delete.
+# Use the same command as ring-manager-server when both workers should record
+# one external state history. It runs in ring_manager_state_dir and receives
+# RING_MANAGER_STATE_ACTION, RING_MANAGER_STATE_DIR,
+# RING_MANAGER_STATE_PATH, and RING_MANAGER_STATE_RELPATH.
+# ring_manager_state_change_hook =
+# ring_manager_state_change_hook_timeout = 30

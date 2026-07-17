@@ -14,6 +14,8 @@
 
 import os
 import stat
+import shlex
+import subprocess
 
 from swift.common.utils.timestamp import NormalTimestamp
 
@@ -29,7 +31,80 @@ DEFAULT_RING_BUILD_EXECUTOR = 'external'
 RING_BUILD_EXECUTORS = ('external', 'manager')
 DEFAULT_RING_BUILD_MANAGER_WORKERS = 1
 DEFAULT_BUILD_JOB_LEASE_TIMEOUT = 3600
+DEFAULT_STATE_CHANGE_HOOK_TIMEOUT = 30
 RESERVED_ARTIFACT_VERSION_IDS = frozenset(('desired', 'latest'))
+
+
+class StateChangeHook(object):
+    """Best-effort hook for external state history or audit integrations."""
+
+    def __init__(self, command=None, state_dir=None, timeout=None,
+                 logger=None):
+        self.command = command
+        self.state_dir = os.path.abspath(state_dir) if state_dir else None
+        self.timeout = (DEFAULT_STATE_CHANGE_HOOK_TIMEOUT
+                        if timeout is None else float(timeout))
+        if self.timeout < 0:
+            raise ValueError(
+                'ring_manager_state_change_hook_timeout must be non-negative')
+        self.logger = logger
+
+    def _log_warning(self, msg, *args):
+        if self.logger:
+            self.logger.warning(msg, *args)
+
+    def _relpath(self, path):
+        path = os.path.abspath(path)
+        if not self.state_dir:
+            return path
+        try:
+            return os.path.relpath(path, self.state_dir)
+        except ValueError:
+            return path
+
+    def run(self, action, path):
+        if not self.command:
+            return
+        try:
+            argv = shlex.split(self.command)
+        except ValueError as err:
+            self._log_warning(
+                'Invalid ring-manager state change hook command %r: %s',
+                self.command, err)
+            return
+        if not argv:
+            return
+        path = os.path.abspath(path)
+        relpath = self._relpath(path)
+        env = os.environ.copy()
+        env.update({
+            'RING_MANAGER_STATE_ACTION': action,
+            'RING_MANAGER_STATE_DIR': self.state_dir or '',
+            'RING_MANAGER_STATE_PATH': path,
+            'RING_MANAGER_STATE_RELPATH': relpath,
+        })
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=self.state_dir, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = proc.communicate(timeout=self.timeout or None)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            self._log_warning(
+                'Ring-manager state change hook timed out after %s seconds '
+                'for %s %s', self.timeout, action, relpath)
+            return
+        except (OSError, ValueError) as err:
+            self._log_warning(
+                'Unable to run ring-manager state change hook %r for %s %s: '
+                '%s', self.command, action, relpath, err)
+            return
+        if proc.returncode:
+            output = (stderr or stdout or b'').decode('utf-8', 'replace')
+            self._log_warning(
+                'Ring-manager state change hook exited %s for %s %s: %s',
+                proc.returncode, action, relpath, output.strip())
 
 
 def validate_path_component(value, field_name):

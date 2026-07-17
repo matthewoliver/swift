@@ -264,6 +264,8 @@ recon middleware is configured.
 State and recon timestamp fields use Swift ``NormalTimestamp.internal``
 strings, such as ``1700000000.00000``; elapsed sync time remains numeric
 seconds.
+Use ``--state-change-hook`` to run the same best-effort local state-history
+command used by the server and builder daemon after synchronized JSON writes.
 
 Per-ring artifact builds
 ========================

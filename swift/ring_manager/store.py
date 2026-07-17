@@ -23,8 +23,9 @@ from urllib.parse import quote, unquote
 
 from swift.common.utils import config_true_value, fsync, fsync_dir, lock_path
 from swift.ring_manager.common import DEFAULT_BUILD_JOB_LEASE_TIMEOUT, \
-    normal_timestamp_float, normal_timestamp_internal, resolve_artifact_path, \
-    validate_artifact_version_id, validate_path_component
+    StateChangeHook, normal_timestamp_float, normal_timestamp_internal, \
+    resolve_artifact_path, validate_artifact_version_id, \
+    validate_path_component
 
 
 class RingNotFound(KeyError):
@@ -78,9 +79,14 @@ class RingManagerStore(object):
     BUILDER_OWNED_RING_FIELDS = (
         'part_power', 'num_replicas', 'min_part_hours', 'overload')
 
-    def __init__(self, state_dir=None, ring_artifact_dir=None):
+    def __init__(self, state_dir=None, ring_artifact_dir=None,
+                 state_change_hook=None, state_change_hook_timeout=None,
+                 logger=None):
         self.state_dir = state_dir
         self.ring_artifact_dir = ring_artifact_dir
+        self.state_change_hook = StateChangeHook(
+            state_change_hook, state_dir=state_dir,
+            timeout=state_change_hook_timeout, logger=logger)
 
     def _safe_id(self, object_id):
         return quote(str(object_id), safe='')
@@ -106,6 +112,7 @@ class RingManagerStore(object):
         body = json.dumps(
             value, sort_keys=True, indent=2).encode('ascii') + b'\n'
         self._write_file_durable(path, body)
+        self.state_change_hook.run('write', path)
 
     def _temporary_state_file(self, path):
         directory = os.path.dirname(path)
@@ -171,6 +178,7 @@ class RingManagerStore(object):
         directory = os.path.dirname(path)
         if directory:
             fsync_dir(directory)
+        self.state_change_hook.run('delete', path)
         return True
 
     def _state_dir_path(self, *parts):

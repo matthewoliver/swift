@@ -113,6 +113,10 @@ the directory.
 New directory parents and deletes are fsynced as well.
 This keeps prior state intact when a write fails before the rename and makes
 completed updates durable across a host crash.
+An optional state-change hook runs after JSON writes and deletes so operators
+can record external audit or history data without making that backend a Swift
+dependency.
+Hook failures are logged and do not roll back the completed state change.
 
 Immutable downloads
 ===================

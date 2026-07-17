@@ -29,7 +29,7 @@ from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
     DEFAULT_BUILD_JOB_LEASE_TIMEOUT, DEFAULT_RING_ARTIFACT_DIR, \
     DEFAULT_RING_BUILD_EXECUTOR, DEFAULT_RING_BUILD_MANAGER_WORKERS, \
     DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
-    NormalTimestamp, RING_BUILD_EXECUTORS
+    DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, NormalTimestamp, RING_BUILD_EXECUTORS
 from swift.ring_manager.controllers import ring as ring_controller
 from swift.ring_manager import http, routing
 from swift.ring_manager.builder_daemon import RingBuildWorker
@@ -68,7 +68,13 @@ class RingManagerApplication(object):
         ring_artifact_dir = conf.get(
             'ring_artifact_dir', DEFAULT_RING_ARTIFACT_DIR)
         self.store = store or RingManagerStore(
-            state_dir=state_dir, ring_artifact_dir=ring_artifact_dir)
+            state_dir=state_dir,
+            ring_artifact_dir=ring_artifact_dir,
+            state_change_hook=conf.get('ring_manager_state_change_hook'),
+            state_change_hook_timeout=non_negative_float(conf.get(
+                'ring_manager_state_change_hook_timeout',
+                DEFAULT_STATE_CHANGE_HOOK_TIMEOUT)),
+            logger=self.logger)
         self.ring_builder_dir = conf.get(
             'ring_builder_dir', DEFAULT_RING_BUILDER_DIR)
         self.builder_lock_timeout = non_negative_float(conf.get(

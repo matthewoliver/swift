@@ -2762,6 +2762,20 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.testdir)
 
+    def _make_state_hook(self, fail=False):
+        hook_path = os.path.join(self.testdir, 'state-hook')
+        log_path = os.path.join(self.testdir, 'state-hook.log')
+        with open(hook_path, 'w') as fp:
+            fp.write('#!/bin/sh\n')
+            fp.write('printf "%s|%s|%s|%s\\n" '
+                     '"$RING_MANAGER_STATE_ACTION" '
+                     '"$RING_MANAGER_STATE_RELPATH" '
+                     '"$RING_MANAGER_STATE_PATH" "$PWD" >> "$1"\n')
+            if fail:
+                fp.write('exit 3\n')
+        os.chmod(hook_path, 0o755)
+        return hook_path, log_path
+
     def test_store_uses_unique_temp_paths_for_same_state_file(self):
         path = os.path.join(self.state_dir, 'index.json')
         fd1, temp_path1 = self.store._temporary_state_file(path)
@@ -2817,6 +2831,61 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
             releases_dir,
             target_dir,
         ], [call[0][0] for call in mock_dir.call_args_list])
+
+    def test_store_runs_state_change_hook_after_write_and_delete(self):
+        hook_path, log_path = self._make_state_hook()
+        store = RingManagerStore(
+            self.state_dir,
+            state_change_hook='%s %s' % (hook_path, log_path),
+            state_change_hook_timeout=5,
+            logger=debug_logger())
+        path = os.path.join(self.state_dir, 'rings', 'account.json')
+
+        store._write_json_file(path, {'id': 'account'})
+        self.assertTrue(store._delete_state_file(path))
+
+        with open(log_path) as fp:
+            lines = [line.rstrip('\n').split('|') for line in fp]
+        self.assertEqual([
+            ['write', 'rings/account.json', path, self.state_dir],
+            ['delete', 'rings/account.json', path, self.state_dir],
+        ], lines)
+
+    def test_store_keeps_write_when_state_hook_fails(self):
+        hook_path, log_path = self._make_state_hook(fail=True)
+        logger = debug_logger()
+        store = RingManagerStore(
+            self.state_dir,
+            state_change_hook='%s %s' % (hook_path, log_path),
+            state_change_hook_timeout=5,
+            logger=logger)
+        path = os.path.join(self.state_dir, 'index.json')
+
+        store._write_json_file(path, {'version': 1})
+
+        with open(path) as fp:
+            self.assertEqual({'version': 1}, json.load(fp))
+        self.assertIn('state change hook exited 3',
+                      logger.get_lines_for_level('warning')[-1])
+
+    def test_server_and_builder_configure_state_change_hook(self):
+        hook_path, log_path = self._make_state_hook()
+        command = '%s %s' % (hook_path, log_path)
+        conf = {
+            'ring_manager_state_dir': self.state_dir,
+            'ring_artifact_dir': self.testdir,
+            'ring_builder_dir': self.testdir,
+            'ring_manager_state_change_hook': command,
+            'ring_manager_state_change_hook_timeout': '5',
+        }
+
+        app = RingManagerApplication(conf, logger=debug_logger())
+        builder = RingManagerBuilder(conf)
+
+        self.assertEqual(command, app.store.state_change_hook.command)
+        self.assertEqual(5, app.store.state_change_hook.timeout)
+        self.assertEqual(command, builder.store.state_change_hook.command)
+        self.assertEqual(5, builder.store.state_change_hook.timeout)
 
 
 class TestRingManagerAuthMiddleware(unittest.TestCase):

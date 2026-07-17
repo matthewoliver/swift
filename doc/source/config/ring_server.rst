@@ -57,6 +57,15 @@ Server options
     Root of the directory-backed JSON state.
     The default is ``/etc/swift/ring-manager-state``.
 
+``ring_manager_state_change_hook``
+    Optional best-effort command to run after each state JSON write or delete.
+    The command is split with shell-like quoting and executed without a shell.
+    Use a wrapper script for multi-step work.
+
+``ring_manager_state_change_hook_timeout``
+    Seconds to wait for the state-change hook.
+    The default is ``30``; use ``0`` for no timeout.
+
 ``ring_artifact_dir``
     Root directory for immutable ring artefacts referenced by release manifests.
     The default is ``/etc/swift/ring-manager-artifacts``.
@@ -96,8 +105,8 @@ Builder worker configuration
 ----------------------------
 
 ``swift-ring-manager-builder`` reads ``ring-manager-builder.conf``.
-Its state, artifact, builder-directory, builder-lock, and lease settings must
-match the server.
+Its state, artifact, builder-directory, builder-lock, lease, and state-hook
+settings must match the server.
 ``concurrency`` controls concurrent claim attempts, while builder locks and
 the scoped FIFO queue keep overlapping work safe.
 ``interval`` is the idle poll interval and defaults to ``5`` seconds.
@@ -112,6 +121,46 @@ the scoped FIFO queue keep overlapping work safe.
     The default is ``1000``.
     The request is rejected before a builder is loaded when this limit is
     exceeded.
+
+State change hooks
+==================
+
+Ring-manager can call an operator-defined command after a state JSON file is
+written or deleted.
+This supports audit or history integrations without adding git or another
+history backend as a Swift runtime dependency.
+It does not run for immutable artefact files.
+
+The hook is best effort.
+Ring-manager logs invalid commands, launch failures, non-zero exits, and
+timeouts, but does not roll back the completed state change.
+It runs with ``ring_manager_state_dir`` as its current directory and receives:
+
+``RING_MANAGER_STATE_ACTION``
+    ``write`` or ``delete``.
+
+``RING_MANAGER_STATE_DIR``
+    Absolute configured state directory.
+
+``RING_MANAGER_STATE_PATH``
+    Absolute path to the changed JSON file.
+
+``RING_MANAGER_STATE_RELPATH``
+    Path to the changed JSON file relative to the state directory.
+
+For example, a local wrapper can record git history after every state change::
+
+    #!/bin/sh
+    set -eu
+    git add -- "$RING_MANAGER_STATE_RELPATH"
+    git diff --cached --quiet -- "$RING_MANAGER_STATE_RELPATH" || \
+        git commit -m "ring-manager state $RING_MANAGER_STATE_ACTION: $RING_MANAGER_STATE_RELPATH"
+
+Configure the same wrapper on the server and builder daemon when both should
+record one history::
+
+    ring_manager_state_change_hook = /usr/local/bin/ring-manager-state-history
+    ring_manager_state_change_hook_timeout = 30
 
 High availability modes
 =======================
@@ -135,7 +184,8 @@ For example::
     swift-ring-manager-sync https://primary.example.com:6205 \
         --ring-manager-state-dir /etc/swift/ring-manager-state \
         --ring-artifact-dir /etc/swift/ring-manager-artifacts \
-        --admin-key changeme
+        --admin-key changeme \
+        --state-change-hook /usr/local/bin/ring-manager-state-history
 
 The source URL is supplied explicitly in this initial utility.
 Source failover and configuration-file support are separate follow-on work.

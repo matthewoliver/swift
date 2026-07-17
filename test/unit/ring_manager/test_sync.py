@@ -172,6 +172,16 @@ class TestRingManagerSync(unittest.TestCase):
             logger=debug_logger(),
             time_func=time_func)
 
+    def _make_state_hook(self):
+        hook_path = os.path.join(self.testdir, 'state-hook')
+        log_path = os.path.join(self.testdir, 'state-hook.log')
+        with open(hook_path, 'w') as fp:
+            fp.write('#!/bin/sh\n')
+            fp.write('printf "%s|%s\\n" "$RING_MANAGER_STATE_ACTION" '
+                     '"$RING_MANAGER_STATE_RELPATH" >> "$1"\n')
+        os.chmod(hook_path, 0o755)
+        return hook_path, log_path
+
     def _read_recon(self):
         with open(os.path.join(
                 self.recon_cache_path, RECON_RING_MANAGER_FILE)) as fp:
@@ -289,6 +299,31 @@ class TestRingManagerSync(unittest.TestCase):
             self.assertEqual('secret',
                              req['headers']['x-ring-manager-admin-key'])
             self.assertEqual(12, req['timeout'])
+
+    def test_sync_runs_state_change_hook_for_json_writes(self):
+        hook_path, log_path = self._make_state_hook()
+        syncer = RingManagerSync(
+            'http://primary.example.com:6205',
+            self.state_dir,
+            self.artifact_dir,
+            admin_key='secret',
+            timeout=12,
+            opener=FakeOpener(self._routes()),
+            recon_cache_path=self.recon_cache_path,
+            state_change_hook='%s %s' % (hook_path, log_path),
+            state_change_hook_timeout=5,
+            logger=debug_logger())
+
+        syncer.sync()
+
+        with open(log_path) as fp:
+            lines = [line.rstrip('\n') for line in fp]
+        self.assertEqual([
+            'write|rings/account.json',
+            'write|ring-versions/account/12.json',
+            'write|releases/release-1/manifest.json',
+            'write|index.json',
+        ], lines)
 
     def test_sync_rejects_bad_checksum(self):
         os.makedirs(self.state_dir)

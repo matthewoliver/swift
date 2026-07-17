@@ -26,7 +26,8 @@ from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
     RECON_RING_MANAGER_FILE
 from swift.common.utils import NullLogger, dump_recon_cache, get_logger, mkdirs
 from swift.common.utils import md5
-from swift.ring_manager.common import NormalTimestamp, normal_timestamp
+from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
+    NormalTimestamp, StateChangeHook, normal_timestamp
 
 
 USER_AGENT = 'swift-ring-manager-sync'
@@ -48,7 +49,8 @@ class RingManagerSync(object):
     def __init__(self, source_url, state_dir, artifact_dir, admin_key=None,
                  auth_token=None, timeout=30, opener=None,
                  recon_cache_path=DEFAULT_RECON_CACHE_PATH, recon_dump=True,
-                 logger=None, time_func=NormalTimestamp.now):
+                 logger=None, time_func=NormalTimestamp.now,
+                 state_change_hook=None, state_change_hook_timeout=None):
         if not source_url:
             raise RingManagerSyncError('source_url is required')
         if not state_dir:
@@ -68,6 +70,9 @@ class RingManagerSync(object):
         self.recon_dump = recon_dump
         self.logger = logger or NullLogger()
         self.time_func = time_func
+        self.state_change_hook = StateChangeHook(
+            state_change_hook, state_dir=state_dir,
+            timeout=state_change_hook_timeout, logger=self.logger)
 
     def _timestamp(self, timestamp=None):
         timestamp = self.time_func() if timestamp is None else timestamp
@@ -154,6 +159,7 @@ class RingManagerSync(object):
     def _write_json_atomic(self, path, value):
         body = json.dumps(value, sort_keys=True, indent=2).encode('ascii')
         self._write_file_atomic(path, body + b'\n')
+        self.state_change_hook.run('write', path)
 
     def _read_json(self, path, default):
         try:
@@ -449,6 +455,14 @@ def _make_parser():
         default=True,
         help='Do not write ring-manager sync stats to recon cache.')
     parser.add_option(
+        '--state-change-hook', dest='state_change_hook',
+        help='Command to run after each ring-manager state JSON write.')
+    parser.add_option(
+        '--state-change-hook-timeout', dest='state_change_hook_timeout',
+        type='float', default=DEFAULT_STATE_CHANGE_HOOK_TIMEOUT,
+        help='Seconds to wait for --state-change-hook. Use 0 for no timeout. '
+             'Default: %default')
+    parser.add_option(
         '-q', '--quiet', action='store_true', default=False,
         help='Do not print a successful sync summary.')
     return parser
@@ -471,6 +485,8 @@ def main(argv=None):
             timeout=options.timeout,
             recon_cache_path=options.recon_cache_path,
             recon_dump=options.recon_dump,
+            state_change_hook=options.state_change_hook,
+            state_change_hook_timeout=options.state_change_hook_timeout,
             logger=get_logger({}, log_route=USER_AGENT))
         result = syncer.sync()
     except RingManagerSyncError as err:
