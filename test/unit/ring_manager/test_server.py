@@ -346,6 +346,10 @@ class TestRingManagerApplication(unittest.TestCase):
             'stale': False,
             'can_serve_published_reads': False,
             'published_state_promote_ready': False,
+            'sync_transaction_pending': False,
+            'sync_transaction': {
+                'pending': False,
+            },
             'promotion_blockers': [],
             'reasons': ['mode_not_replicated'],
         }, body['ring_manager_sync'])
@@ -431,6 +435,8 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertTrue(sync['stale'])
         self.assertFalse(sync['can_serve_published_reads'])
         self.assertFalse(sync['published_state_promote_ready'])
+        self.assertTrue(sync['sync_transaction_pending'])
+        self.assertEqual({'pending': True}, sync['sync_transaction'])
         self.assertEqual(['sync_transaction_pending'], sync['reasons'])
         self.assertEqual(['sync_transaction_pending'],
                          sync['promotion_blockers'])

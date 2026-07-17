@@ -192,12 +192,17 @@ State-change hook metrics include::
     sync.builder_files.downloaded
     sync.builder_files.unchanged
     sync.builder_files.skipped_disabled
+    sync.transaction.pending
+    sync.transaction.recoveries
+    sync.transaction.rollbacks
+    sync.transaction.committed_cleanups
+    sync.transaction.recovery_failures
     sync.bytes_downloaded
 
 Metrics intentionally avoid build IDs, ring versions, URLs, device names, and
 artefact file names.
 Use recon and logs for high-cardinality detail.
-Agent and sync-transaction metrics arrive with their respective components.
+Agent metrics arrive with their respective component.
 
 State change hooks
 ==================
@@ -371,8 +376,13 @@ and ``latest_ring_version`` is not advanced. Immutable artifact files may be
 left on disk after a failed attempt because they are addressed by checksum and
 are not visible through ``latest`` until the state commit succeeds. A pending
 sync transaction journal makes status fail closed with
-``sync_transaction_pending`` until the next sync run recovers it. Overlapping
-sync processes are serialized by a local ``ring-manager-sync`` lock.
+``sync_transaction_pending`` until the next sync run recovers it. Recon
+includes a ``sync_transaction`` summary; recovery details mirror the
+``sync.transaction.*`` StatsD counters when the utility observes or recovers
+a pending transaction journal. The transaction ``action`` is ``none``,
+``rollback``, ``cleanup``, or ``failed``. Overlapping sync processes are
+serialized by a local
+``ring-manager-sync`` lock.
 When the selected source is a replica, the local state preserves its upstream
 ``last_synced_at`` rather than stamping the downstream replica with the
 current time.

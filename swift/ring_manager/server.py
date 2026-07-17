@@ -276,6 +276,10 @@ class RingManagerApplication(object):
             'stale': False,
             'can_serve_published_reads': False,
             'published_state_promote_ready': False,
+            'sync_transaction_pending': False,
+            'sync_transaction': {
+                'pending': False,
+            },
             'promotion_blockers': [],
             'reasons': [],
         }
@@ -294,6 +298,8 @@ class RingManagerApplication(object):
 
         status['stale'] = True
         if self._sync_transaction_pending():
+            status['sync_transaction_pending'] = True
+            status['sync_transaction']['pending'] = True
             status['reasons'].append('sync_transaction_pending')
             status['promotion_blockers'].append('sync_transaction_pending')
             return status

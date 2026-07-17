@@ -300,6 +300,53 @@ class RingManagerSync(object):
     def _sync_journal_path(self):
         return self._state_path(RING_MANAGER_SYNC_JOURNAL)
 
+    def _default_sync_transaction_stats(self):
+        return {
+            'pending': False,
+            'recovered': False,
+            'action': 'none',
+            'committed': False,
+            'entries': 0,
+            'staged_builders': 0,
+        }
+
+    def _sync_transaction_summary(self, journal):
+        committed = bool(journal.get('committed'))
+        return {
+            'pending': True,
+            'recovered': True,
+            'action': 'cleanup' if committed else 'rollback',
+            'committed': committed,
+            'entries': len(journal.get('entries', [])),
+            'staged_builders': len(journal.get('staged_builders', [])),
+        }
+
+    def _failed_sync_transaction_summary(self):
+        return {
+            'pending': os.path.exists(self._sync_journal_path()),
+            'recovered': False,
+            'action': 'failed',
+            'committed': False,
+            'entries': 0,
+            'staged_builders': 0,
+            'recovery_failed': True,
+        }
+
+    def _record_sync_transaction_metrics(self, sync_transaction):
+        if not sync_transaction or not sync_transaction.get('pending'):
+            return
+        stats_increment(self.logger, 'sync.transaction.pending')
+        if sync_transaction.get('recovery_failed'):
+            stats_increment(self.logger, 'sync.transaction.recovery_failures')
+            return
+        if sync_transaction.get('recovered'):
+            stats_increment(self.logger, 'sync.transaction.recoveries')
+        if sync_transaction.get('committed'):
+            stats_increment(
+                self.logger, 'sync.transaction.committed_cleanups')
+        else:
+            stats_increment(self.logger, 'sync.transaction.rollbacks')
+
     def _write_sync_journal(self, journal):
         self._write_file_atomic(
             self._sync_journal_path(), self._json_body(journal))
@@ -392,15 +439,17 @@ class RingManagerSync(object):
     def _recover_sync_transaction(self):
         journal = self._read_sync_journal()
         if journal is None:
-            return
+            return self._default_sync_transaction_stats()
+        summary = self._sync_transaction_summary(journal)
         if journal.get('committed'):
             self._cleanup_backups(journal.get('entries', []))
             self._cleanup_staged_builder_paths(
                 journal.get('staged_builders', []))
             self._remove_sync_journal()
-            return
+            return summary
         self._rollback_sync_journal(journal)
         self._remove_sync_journal()
+        return summary
 
     def _record_journal_entry(self, journal, entry):
         journal['entries'].append(entry)
@@ -965,8 +1014,10 @@ class RingManagerSync(object):
                          self.recon_cache, self.logger)
 
     def _sync_stats(self, source_url, started_at, ended_at, synced_at, result,
-                    source_errors=None):
+                    source_errors=None, sync_transaction=None):
         stats = dict(result)
+        stats['sync_transaction'] = (
+            sync_transaction or self._default_sync_transaction_stats())
         stats.update({
             'source': source_url,
             'success': True,
@@ -984,7 +1035,7 @@ class RingManagerSync(object):
         return stats
 
     def _failure_stats(self, started_at, err, source_url=None,
-                       source_errors=None):
+                       source_errors=None, sync_transaction=None):
         ended_at = self._timestamp()
         attempted_at = ended_at.internal
         stats = {
@@ -994,6 +1045,8 @@ class RingManagerSync(object):
             'last_attempt': ended_at.internal,
             'last_attempted_at': attempted_at,
             'error': str(err),
+            'sync_transaction': (
+                sync_transaction or self._default_sync_transaction_stats()),
         }
         if len(self.source_urls) > 1:
             stats['sources'] = list(self.source_urls)
@@ -1119,7 +1172,7 @@ class RingManagerSync(object):
         }, synced_at, ended_at
 
     def _record_failure(self, started_at, err, source_url=None,
-                        source_errors=None):
+                        source_errors=None, sync_transaction=None):
         ended_at = self._timestamp()
         stats_increment(self.logger, 'sync.failures')
         stats_timing(
@@ -1127,7 +1180,7 @@ class RingManagerSync(object):
             float(ended_at) - float(started_at))
         self._dump_recon(self._failure_stats(
             started_at, err, source_url=source_url,
-            source_errors=source_errors))
+            source_errors=source_errors, sync_transaction=sync_transaction))
 
     def sync(self):
         started_at = self._timestamp()
@@ -1137,18 +1190,24 @@ class RingManagerSync(object):
                     self.state_dir, timeout=self.sync_lock_timeout,
                     name='ring-manager-sync'):
                 try:
-                    self._recover_sync_transaction()
+                    sync_transaction = self._recover_sync_transaction()
                 except RingManagerSyncLocalError as err:
-                    self._record_failure(started_at, err)
+                    sync_transaction = \
+                        self._failed_sync_transaction_summary()
+                    self._record_sync_transaction_metrics(sync_transaction)
+                    self._record_failure(
+                        started_at, err,
+                        sync_transaction=sync_transaction)
                     raise
-                return self._sync_locked(started_at)
+                self._record_sync_transaction_metrics(sync_transaction)
+                return self._sync_locked(started_at, sync_transaction)
         except swift_exceptions.LockTimeout as err:
             local_err = RingManagerSyncLocalError(
                 'local ring-manager sync lock failed: %s' % err)
             self._record_failure(started_at, local_err)
             raise local_err
 
-    def _sync_locked(self, started_at):
+    def _sync_locked(self, started_at, sync_transaction):
         source_errors = []
         last_source = None
         last_error = None
@@ -1160,7 +1219,8 @@ class RingManagerSync(object):
             except RingManagerSyncLocalError as err:
                 self._record_failure(
                     started_at, err, source_url=source_url,
-                    source_errors=source_errors)
+                    source_errors=source_errors,
+                    sync_transaction=sync_transaction)
                 raise
             except Exception as err:
                 last_error = err
@@ -1209,13 +1269,15 @@ class RingManagerSync(object):
             self._dump_recon(
                 self._sync_stats(
                     source_url, started_at, ended_at, synced_at, result,
-                    source_errors=source_errors))
+                    source_errors=source_errors,
+                    sync_transaction=sync_transaction))
             return result
 
         if len(self.source_urls) == 1 and last_error is not None:
             self._record_failure(
                 started_at, last_error, source_url=last_source,
-                source_errors=source_errors)
+                source_errors=source_errors,
+                sync_transaction=sync_transaction)
             raise last_error
         err = RingManagerSyncError(
             'all ring-manager sources failed: %s' % '; '.join(
@@ -1223,7 +1285,7 @@ class RingManagerSync(object):
                 for item in source_errors))
         self._record_failure(
             started_at, err, source_url=last_source,
-            source_errors=source_errors)
+            source_errors=source_errors, sync_transaction=sync_transaction)
         raise err
 
 

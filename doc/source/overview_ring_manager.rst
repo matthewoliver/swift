@@ -47,7 +47,9 @@ local latest pointer advances, while disabled-ring builders remain skipped.
 The transaction journal makes status and promotion readiness fail closed until
 the next sync run either restores the previous local state or finishes cleanup.
 The utility records its result through /recon/ring_manager when the recon
-middleware is in the pipeline.
+middleware is in the pipeline. Recon includes a ``sync_transaction`` summary,
+and StatsD emits ``sync.transaction.*`` counters when a transaction journal is
+pending, recovered, rolled back, cleaned up, or fails recovery.
 Its state and recon timestamp fields use Swift ``NormalTimestamp.internal``
 strings, while elapsed sync time remains numeric seconds.
 

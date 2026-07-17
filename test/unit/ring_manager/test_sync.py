@@ -334,6 +334,14 @@ class TestRingManagerSync(unittest.TestCase):
                          recon_stats['source'])
         self.assertEqual('release-1',
                          recon_stats['latest_ring_version'])
+        self.assertEqual({
+            'action': 'none',
+            'committed': False,
+            'entries': 0,
+            'pending': False,
+            'recovered': False,
+            'staged_builders': 0,
+        }, recon_stats['sync_transaction'])
         self.assertEqual(1, recon_stats['manifest_files_downloaded'])
         self.assertEqual(0, recon_stats['builder_files_synced'])
         self.assertEqual(1, recon_stats['rings_synced'])
@@ -864,9 +872,10 @@ class TestRingManagerSync(unittest.TestCase):
         opener = FakeOpener({
             ('GET', '/api/v1/ring_manager/status/'): json_response({}),
         })
+        logger = debug_logger()
         with self.assertRaises(RingManagerSyncError):
             self._syncer(
-                opener, builder_dir=builder_dir,
+                opener, logger=logger, builder_dir=builder_dir,
                 sync_builder_files=True).sync()
 
         self.assertEqual(
@@ -880,6 +889,75 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertFalse(os.path.exists('%s.sync-backup-test' % builder_path))
         self.assertFalse(os.path.exists(staged_builder))
         self.assertFalse(os.path.exists(journal_path))
+        recon_stats = self._read_recon()['ring_manager_sync']
+        self.assertFalse(recon_stats['success'])
+        self.assertEqual({
+            'action': 'rollback',
+            'committed': False,
+            'entries': 2,
+            'pending': True,
+            'recovered': True,
+            'staged_builders': 1,
+        }, recon_stats['sync_transaction'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync.transaction.pending'])
+        self.assertEqual(1, counts['sync.transaction.recoveries'])
+        self.assertEqual(1, counts['sync.transaction.rollbacks'])
+
+    def test_sync_recovers_committed_transaction_before_fetching_source(self):
+        os.makedirs(os.path.join(self.state_dir, 'rings'))
+        live_ring = {
+            'id': 'account',
+            'name': 'Committed Account',
+            'ring_type': 'account',
+            'builder_files': ['account.builder'],
+        }
+        old_ring = dict(live_ring, name='Old Account')
+        ring_path = os.path.join(self.state_dir, 'rings', 'account.json')
+        ring_backup = '%s.sync-backup-test' % ring_path
+        with open(ring_path, 'w') as fp:
+            json.dump(live_ring, fp)
+        with open(ring_backup, 'w') as fp:
+            json.dump(old_ring, fp)
+
+        journal_path = os.path.join(
+            self.state_dir, RING_MANAGER_SYNC_JOURNAL)
+        with open(journal_path, 'w') as fp:
+            json.dump({
+                'committed': True,
+                'entries': [{
+                    'kind': 'state',
+                    'path': ring_path,
+                    'backup_path': ring_backup,
+                }],
+                'staged_builders': [],
+            }, fp)
+
+        opener = FakeOpener({
+            ('GET', '/api/v1/ring_manager/status/'): json_response({}),
+        })
+        logger = debug_logger()
+        with self.assertRaises(RingManagerSyncError):
+            self._syncer(opener, logger=logger).sync()
+
+        with open(ring_path) as fp:
+            self.assertEqual(live_ring, json.load(fp))
+        self.assertFalse(os.path.exists(ring_backup))
+        self.assertFalse(os.path.exists(journal_path))
+        recon_stats = self._read_recon()['ring_manager_sync']
+        self.assertFalse(recon_stats['success'])
+        self.assertEqual({
+            'action': 'cleanup',
+            'committed': True,
+            'entries': 1,
+            'pending': True,
+            'recovered': True,
+            'staged_builders': 0,
+        }, recon_stats['sync_transaction'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync.transaction.pending'])
+        self.assertEqual(1, counts['sync.transaction.recoveries'])
+        self.assertEqual(1, counts['sync.transaction.committed_cleanups'])
 
     def test_sync_records_recon_when_journal_recovery_fails(self):
         os.makedirs(self.state_dir)
@@ -898,8 +976,19 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertFalse(recon_stats['success'])
         self.assertIn('sync journal must be an object',
                       recon_stats['error'])
+        self.assertEqual({
+            'action': 'failed',
+            'committed': False,
+            'entries': 0,
+            'pending': True,
+            'recovered': False,
+            'recovery_failed': True,
+            'staged_builders': 0,
+        }, recon_stats['sync_transaction'])
         counts = logger.statsd_client.get_stats_counts()
         self.assertEqual(1, counts['sync.failures'])
+        self.assertEqual(1, counts['sync.transaction.pending'])
+        self.assertEqual(1, counts['sync.transaction.recovery_failures'])
 
     def test_sync_aborts_on_invalid_local_index_without_fallback(self):
         os.makedirs(self.state_dir)

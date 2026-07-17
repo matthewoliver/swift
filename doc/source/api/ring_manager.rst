@@ -273,6 +273,8 @@ state JSON are restored and ``latest`` is not advanced.
 Disabled-ring builders are skipped by default.
 Its latest success or error is available from /recon/ring_manager when the
 recon middleware is configured.
+The recon result includes a ``sync_transaction`` summary, with recovery
+details when the utility observes or recovers a pending journal.
 State and recon timestamp fields use Swift ``NormalTimestamp.internal``
 strings, such as ``1700000000.00000``; elapsed sync time remains numeric
 seconds.
@@ -593,6 +595,10 @@ Example response::
         "stale": false,
         "can_serve_published_reads": true,
         "published_state_promote_ready": false,
+        "sync_transaction_pending": false,
+        "sync_transaction": {
+          "pending": false
+        },
         "promotion_blockers": ["mode_not_standby"],
         "reasons": []
       }
@@ -606,7 +612,9 @@ Missing, malformed, stale, future-dated, or version-mismatched metadata fails
 closed for freshness and promotion reporting with ``fresh: false`` and
 ``stale: true``. A pending ``swift-ring-manager-sync`` transaction journal
 also fails closed with the ``sync_transaction_pending`` reason and promotion
-blocker until the next sync run recovers or cleans up the journal.
+blocker until the next sync run recovers or cleans up the journal. The same
+state is also exposed as the low-cardinality
+``ring_manager_sync.sync_transaction.pending`` status field.
 
 Stale sync metadata does not disable the read API.
 A read-only or standby server continues serving its last successfully
