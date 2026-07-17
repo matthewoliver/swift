@@ -24,9 +24,14 @@
 # ionice_priority =
 
 [ring-manager-agent]
-# Comma-separated list of ring-manager servers to poll. Prefer read-only
-# ring-manager servers here so large clusters do not all pull from the primary.
-# The agent tries each URL in order until one sync succeeds.
+# Agent operating mode. Enforce mode installs the selected manifest. Observe
+# mode only inventories and validates local *.ring.gz files; it does not
+# contact ring-manager or write under swift_dir.
+# mode = enforce
+#
+# Comma-separated list of ring-manager servers to poll in enforce mode. Prefer
+# read-only ring-manager servers here so large clusters do not all pull from
+# the primary. The agent tries each URL in order until one sync succeeds.
 # ring_manager_urls = https://ring-ro-1.example.com:6205, https://ring-ro-2.example.com:6205
 #
 # Randomize the configured URL order before each sync pass. This can spread
@@ -71,16 +76,14 @@
 # lock_timeout = 10
 
 # Directory where account.ring.gz, container.ring.gz, and object ring files are
-# installed. Usually this should be the same swift_dir used by the local Swift
-# storage services. Downloaded replacements are staged in this directory,
-# fsynced, verified, and installed with a durable install journal and rollback
-# backups. A leftover .ring-manager-agent-install.json is recovered before the
-# next sync; leftover *.ring-manager-backup-* files require operator attention.
+# observed or installed. Usually this should be the same swift_dir used by the
+# local Swift storage services. Enforce mode stages, fsyncs, verifies, and
+# installs downloads with a durable journal and rollback backups.
 # swift_dir = /etc/swift
 
 # Recon cache path and local state file. The agent writes
-# ring-manager-agent.recon for /recon/ring_manager_agent and stores its last
-# installed manifest in state_file. Recon includes operator_attention when
-# local journal, backup, or filesystem state needs node-local follow-up.
+# ring-manager-agent.recon for /recon/ring_manager_agent. Enforce mode stores
+# its last installed manifest in state_file. Recon includes mode and
+# operator_attention when invalid rings or local state need node-local follow-up.
 # recon_cache_path = /var/cache/swift
 # state_file = /var/cache/swift/ring-manager-agent-state.json

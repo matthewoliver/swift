@@ -26,14 +26,17 @@ from swift.common.concurrency import socket, urllib_request
 from swift.common.daemon import Daemon, run_daemon
 from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
     RECON_RING_MANAGER_AGENT_FILE
+from swift.common.ring import RingData
 from swift.common.utils import config_true_value, dump_recon_cache, \
-    fsync, get_logger, list_from_csv, lock_path, non_negative_float, \
+    fsync, get_logger, list_from_csv, lock_path, md5, non_negative_float, \
     parse_options
 from swift.ring_manager.common import load_secret_from_conf, NormalTimestamp, \
     normal_timestamp, stats_increment, stats_timing, validate_relative_api_url
 
 
 USER_AGENT = 'swift-ring-manager-agent'
+DEFAULT_MODE = 'enforce'
+AGENT_MODES = ('enforce', 'observe')
 DEFAULT_INTERVAL = 300.0
 DEFAULT_JITTER = 30.0
 DEFAULT_REQUEST_TIMEOUT = 30.0
@@ -60,11 +63,12 @@ class RingManagerAgentInstallError(RingManagerAgentLocalError):
 
 class RingManagerAgent(Daemon):
     """
-    Pull the latest published ring artifacts onto a storage node.
+    Observe or enforce published ring state on a storage node.
 
-    The agent consumes the ring-manager latest manifest API, verifies each
+    Enforce mode consumes the ring-manager latest manifest API, verifies each
     artifact against the manifest metadata, and installs the ring files into
-    ``swift_dir`` using same-directory atomic renames.
+    ``swift_dir`` using same-directory atomic renames. Observe mode only
+    inventories and validates local ring files.
     """
 
     def __init__(self, conf, logger=None, opener=None, sleep=time.sleep,
@@ -77,11 +81,16 @@ class RingManagerAgent(Daemon):
         self.random_func = random_func
         self.time_func = time_func
 
+        self.mode = str(conf.get('mode', DEFAULT_MODE)).strip().lower()
+        if self.mode not in AGENT_MODES:
+            raise RingManagerAgentError(
+                'mode must be one of %s' % ', '.join(AGENT_MODES))
+
         urls = []
         urls.extend(list_from_csv(conf.get('ring_manager_urls')))
         urls.extend(list_from_csv(conf.get('ring_manager_url')))
         self.ring_manager_urls = [url.rstrip('/') for url in urls if url]
-        if not self.ring_manager_urls:
+        if self.mode != 'observe' and not self.ring_manager_urls:
             raise RingManagerAgentError('ring_manager_urls is required')
         self.shuffle_ring_manager_urls = config_true_value(conf.get(
             'shuffle_ring_manager_urls', 'false'))
@@ -354,10 +363,15 @@ class RingManagerAgent(Daemon):
             raise
 
     def _verify_existing(self, path, file_info):
+        return self._verified_existing_etag(path, file_info) is not None
+
+    def _verified_existing_etag(self, path, file_info):
         body = self._read_file(path)
         if body is None:
-            return False
-        return self._body_matches(body, file_info)
+            return None
+        if not self._body_matches(body, file_info):
+            return None
+        return md5(body, usedforsecurity=False).hexdigest()
 
     def _body_matches(self, body, file_info):
         expected_bytes = file_info.get('bytes')
@@ -404,9 +418,8 @@ class RingManagerAgent(Daemon):
     def _stage_file(self, source_url, version, file_info):
         local_path = self._artifact_path(file_info)
         headers = {}
-        if file_info.get('sha256') and self._verify_existing(
-                local_path, file_info):
-            etag = file_info.get('md5')
+        if file_info.get('sha256'):
+            etag = self._verified_existing_etag(local_path, file_info)
             if etag:
                 headers['If-None-Match'] = etag
 
@@ -689,9 +702,10 @@ class RingManagerAgent(Daemon):
                 'ring install journal recovery failed: %s' % err)
         stats_increment(self.logger, 'agent.install_recoveries')
 
-    def _operator_attention_status(self, err=None, source_errors=None):
+    def _operator_attention_status(self, err=None, source_errors=None,
+                                   additional_reasons=None):
         source_errors = list(source_errors or [])
-        reasons = []
+        reasons = list(additional_reasons or [])
         backup_files = []
         install_journal_path = None
         scan_error = None
@@ -730,6 +744,119 @@ class RingManagerAgent(Daemon):
         if scan_error:
             status['scan_error'] = scan_error
         return status
+
+    def _ring_file_inventory(self, name):
+        path = os.path.join(self.swift_dir, name)
+        info = {
+            'name': name,
+            'path': path,
+        }
+        try:
+            before = os.stat(path)
+            info.update({
+                'bytes': before.st_size,
+                'mtime': self._timestamp_internal(before.st_mtime),
+            })
+            digest = hashlib.sha256()
+            with open(path, 'rb') as fp:
+                while True:
+                    chunk = fp.read(65536)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            ring_data = RingData.load(path)
+            after = os.stat(path)
+            before_identity = (
+                before.st_ino, before.st_size,
+                getattr(before, 'st_mtime_ns', before.st_mtime))
+            after_identity = (
+                after.st_ino, after.st_size,
+                getattr(after, 'st_mtime_ns', after.st_mtime))
+            if before_identity != after_identity:
+                raise RingManagerAgentLocalError(
+                    'ring file changed during inventory')
+            info.update({
+                'status': 'valid',
+                'sha256': digest.hexdigest(),
+                'swift_ring_version': ring_data.version,
+                'part_power': ring_data.part_power,
+                'replicas': ring_data.replica_count,
+            })
+        except Exception as err:
+            info.update({
+                'status': 'error',
+                'error': str(err),
+            })
+        return info
+
+    def _observe_local_rings(self):
+        try:
+            names = sorted(
+                name for name in os.listdir(self.swift_dir)
+                if name.endswith('.ring.gz'))
+        except OSError as err:
+            raise RingManagerAgentLocalError(
+                'unable to inventory local rings in %s: %s' % (
+                    self.swift_dir, err))
+        files = [self._ring_file_inventory(name) for name in names]
+        valid = sum(item['status'] == 'valid' for item in files)
+        invalid = len(files) - valid
+        return {
+            'mode': 'observe',
+            'files_observed': len(files),
+            'files_valid': valid,
+            'files_invalid': invalid,
+            'files': files,
+        }
+
+    def observe_once(self):
+        started_at = self._timestamp()
+        stats_increment(self.logger, 'agent.observe.attempts')
+        try:
+            result = self._observe_local_rings()
+        except Exception as err:
+            ended_at = self._timestamp()
+            stats_increment(self.logger, 'agent.observe.failures')
+            stats_timing(
+                self.logger, 'agent.observe.timing',
+                float(ended_at) - float(started_at))
+            stats = self._failure_stats(started_at, err, [])
+            self._dump_recon(stats)
+            raise
+
+        ended_at = self._timestamp()
+        observed_at = ended_at.internal
+        attention_reasons = []
+        if result['files_invalid']:
+            attention_reasons.append('invalid_ring_files')
+        operator_attention = self._operator_attention_status(
+            additional_reasons=attention_reasons)
+        self._emit_operator_attention_metrics(operator_attention)
+        recon = dict(result)
+        recon.update({
+            'success': True,
+            'swift_dir': self.swift_dir,
+            'observe_time': float(ended_at) - float(started_at),
+            'last_attempt': observed_at,
+            'last_attempted_at': observed_at,
+            'last_success': observed_at,
+            'last_observed_at': observed_at,
+            'error': {},
+            'operator_attention': operator_attention,
+        })
+        stats_increment(self.logger, 'agent.observe.successes')
+        stats_timing(
+            self.logger, 'agent.observe.timing',
+            float(ended_at) - float(started_at))
+        stats_increment(
+            self.logger, 'agent.observe.files', result['files_observed'])
+        stats_increment(
+            self.logger, 'agent.observe.files_valid', result['files_valid'])
+        stats_increment(
+            self.logger, 'agent.observe.files_invalid',
+            result['files_invalid'])
+        self._dump_recon(recon)
+        return result
 
     def _emit_operator_attention_metrics(self, status):
         if not status.get('needed'):
@@ -845,6 +972,7 @@ class RingManagerAgent(Daemon):
             source_errors=source_errors)
         self._emit_operator_attention_metrics(operator_attention)
         stats.update({
+            'mode': self.mode,
             'source': source_url,
             'success': True,
             'swift_dir': self.swift_dir,
@@ -866,6 +994,7 @@ class RingManagerAgent(Daemon):
         operator_attention = self._operator_attention_status(err)
         self._emit_operator_attention_metrics(operator_attention)
         return {
+            'mode': self.mode,
             'sources': list(self.ring_manager_urls),
             'success': False,
             'sync_time': float(ended_at) - float(started_at),
@@ -975,11 +1104,18 @@ class RingManagerAgent(Daemon):
             raise
 
     def run_once(self, *args, **kwargs):
+        if self.mode == 'observe':
+            result = self.observe_once()
+            self.logger.info(
+                'Observed %(files_observed)d local ring files: '
+                '%(files_valid)d valid, %(files_invalid)d invalid' % result)
+            return result
         result = self.sync_once()
         self.logger.info(
             'Synced ring-manager version %(latest_ring_version)s: '
             '%(files_downloaded)d files downloaded, '
             '%(files_unchanged)d unchanged' % result)
+        return result
 
     def run_forever(self, *args, **kwargs):
         if self.jitter:
@@ -989,7 +1125,7 @@ class RingManagerAgent(Daemon):
             try:
                 self.run_once(*args, **kwargs)
             except Exception:
-                self.logger.exception('Error syncing rings from ring-manager')
+                self.logger.exception('Error running ring-manager agent')
             elapsed = float(self._timestamp()) - float(started_at)
             delay = max(0.0, self.interval - elapsed)
             if self.jitter:

@@ -5,8 +5,9 @@ Ring Manager Agent Configuration
 --------------------------------
 
 This document describes the configuration options available for the
-ring-manager agent. The agent runs on Swift storage nodes and installs the
-latest published ring files from one or more ring-manager servers.
+ring-manager agent. The agent runs on Swift storage nodes. In ``enforce``
+mode it installs the latest published ring files from ring-manager servers.
+In ``observe`` mode it inventories and validates local ring files only.
 
 An example configuration can be found at
 ``etc/ring-manager-agent.conf-sample`` in the source code repository.
@@ -50,9 +51,16 @@ The ring-manager agent uses the common Swift daemon options, including
    * - Option
      - Default
      - Description
+   * - ``mode``
+     - ``enforce``
+     - ``enforce`` polls ring-manager and installs ring files. ``observe``
+       reads local ``*.ring.gz`` files, validates their Swift ring format, and
+       reports inventory without contacting ring-manager or writing under
+       ``swift_dir``.
    * - ``ring_manager_urls``
      -
-     - Comma-separated list of ring-manager base URLs. The agent tries each
+     - Comma-separated list of URLs. Required in ``enforce`` mode and unused
+       in ``observe`` mode. The agent tries each
        URL in order until one sync succeeds.
    * - ``ring_manager_url``
      -
@@ -125,10 +133,11 @@ process reads them before dropping privileges. Empty files, loose group/other
 permissions, symlinks, directories, control characters, embedded newlines, and
 configured inline/file pairs fail closed at startup.
 
-The agent writes recon data under ``/recon/ring_manager_agent``. A successful
-payload includes the selected source URL, the latest ring version, installed
-file counts, timing information, and ``swift_dir``. A failed payload includes
-the attempted sources and per-source error messages.
+The agent writes recon data under ``/recon/ring_manager_agent``. Every payload
+includes ``mode``. A successful ``observe`` payload includes each local ring
+file's size, modification time, SHA-256 checksum, Swift ring version, part
+power, replica count, and validation status. Invalid local ring files set
+``operator_attention`` without turning inventory into a transport failure.
 
 When ``log_statsd_host`` is configured, the agent also emits low-cardinality
 StatsD metrics:
@@ -146,6 +155,13 @@ StatsD metrics:
     agent.bytes_downloaded
     agent.checksum_failures
     agent.install_failures
+    agent.observe.attempts
+    agent.observe.successes
+    agent.observe.failures
+    agent.observe.timing
+    agent.observe.files
+    agent.observe.files_valid
+    agent.observe.files_invalid
     agent.operator_attention
     agent.operator_attention.journal
     agent.operator_attention.backup_files

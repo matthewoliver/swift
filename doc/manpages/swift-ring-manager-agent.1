@@ -15,7 +15,7 @@
 .TH SWIFT-RING-MANAGER-AGENT "1" "May 2026" "OpenStack Swift"
 
 .SH NAME
-swift\-ring\-manager\-agent \- install Swift ring files from ring-manager
+swift\-ring\-manager\-agent \- observe or install Swift ring files
 
 .SH SYNOPSIS
 .B swift\-ring\-manager\-agent
@@ -24,11 +24,10 @@ swift\-ring\-manager\-agent \- install Swift ring files from ring-manager
 .SH DESCRIPTION
 .PP
 .B swift-ring-manager-agent
-is a storage-node daemon that polls one or more ring-manager servers for the
-latest published ring manifest, downloads changed ring artifacts, verifies
-their byte counts and SHA-256 checksums, and installs them into the local
-Swift configuration directory. Installs are performed under a local agent lock
-with staged files, an install journal, and rollback backups.
+is a storage-node daemon with enforce and observe modes. Enforce mode polls
+ring-manager for the latest published manifest and installs verified files.
+Observe mode inventories and validates local ring files without contacting
+ring-manager or writing under the Swift configuration directory.
 .PP
 The daemon is intended to be managed with
 .B swift-init

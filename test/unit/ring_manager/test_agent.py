@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import array
 import hashlib
 import json
 import os
@@ -24,6 +25,7 @@ from urllib.parse import urlparse
 import swift.ring_manager.agent as agent_mod
 from swift.common.concurrency import urllib_request
 from swift.common.recon import RECON_RING_MANAGER_AGENT_FILE
+from swift.common.ring import RingData
 from swift.common.utils import md5
 from swift.ring_manager.agent import INSTALL_JOURNAL, RingManagerAgent, \
     RingManagerAgentError
@@ -136,6 +138,7 @@ class TestRingManagerAgent(unittest.TestCase):
 
     def _manifest_for_version(self, version, body=None, created_at=None):
         body = self.ring_body if body is None else body
+        etag = md5(body, usedforsecurity=False).hexdigest()
         sha256 = hashlib.sha256(body).hexdigest()
         return {
             'version': version,
@@ -149,6 +152,7 @@ class TestRingManagerAgent(unittest.TestCase):
                     'url': '/api/v1/rings/releases/%s/files/'
                     'object.ring.gz' % version,
                     'bytes': len(body),
+                    'md5': etag,
                     'sha256': sha256,
                 },
             ],
@@ -181,6 +185,21 @@ class TestRingManagerAgent(unittest.TestCase):
         with open(self.state_file, 'w') as fp:
             json.dump(state, fp)
 
+    def _write_ring(self, name='object.ring.gz', version=7):
+        os.makedirs(self.swift_dir, exist_ok=True)
+        path = os.path.join(self.swift_dir, name)
+        RingData(
+            [array.array('H', [0, 1, 0, 1]),
+             array.array('H', [0, 1, 0, 1])],
+            [
+                {'id': 0, 'region': 1, 'zone': 0},
+                {'id': 1, 'region': 1, 'zone': 1},
+            ],
+            30,
+            version=version,
+        ).save(path)
+        return path
+
     def _routes(self):
         manifest_path = '/api/v1/rings/releases/latest/manifest/'
         file_path = '/api/v1/rings/releases/release-1/files/object.ring.gz'
@@ -201,6 +220,7 @@ class TestRingManagerAgent(unittest.TestCase):
                 'name': name,
                 'url': path,
                 'bytes': len(body),
+                'md5': md5(body, usedforsecurity=False).hexdigest(),
                 'sha256': sha256,
             })
             routes[('GET', 'ring.example.com:6205', path)] = \
@@ -233,6 +253,7 @@ class TestRingManagerAgent(unittest.TestCase):
 
         stats = self._recon_stats()
         self.assertTrue(stats['success'])
+        self.assertEqual('enforce', stats['mode'])
         self.assertEqual('release-1', stats['latest_ring_version'])
         self.assertEqual(1, stats['files_downloaded'])
         self.assertEqual(0, stats['files_unchanged'])
@@ -252,6 +273,115 @@ class TestRingManagerAgent(unittest.TestCase):
             'agent.sync.timing',
             [call[0][0] for call in
              logger.statsd_client.calls['timing']])
+
+    def test_observe_mode_inventories_without_url_or_local_writes(self):
+        ring_path = self._write_ring()
+        with open(ring_path, 'rb') as fp:
+            ring_body = fp.read()
+        before = sorted(os.listdir(self.swift_dir))
+        logger = debug_logger()
+        opener = FakeOpener({})
+
+        result = self._agent(
+            opener, urls='', logger=logger, mode='observe').run_once()
+
+        self.assertEqual({
+            'mode': 'observe',
+            'files_observed': 1,
+            'files_valid': 1,
+            'files_invalid': 0,
+        }, dict((key, result[key]) for key in (
+            'mode', 'files_observed', 'files_valid', 'files_invalid')))
+        self.assertEqual([], opener.requests)
+        self.assertEqual(before, sorted(os.listdir(self.swift_dir)))
+        self.assertFalse(os.path.exists(self.state_file))
+        with open(ring_path, 'rb') as fp:
+            self.assertEqual(ring_body, fp.read())
+
+        observed = result['files'][0]
+        self.assertEqual('object.ring.gz', observed['name'])
+        self.assertEqual(ring_path, observed['path'])
+        self.assertEqual('valid', observed['status'])
+        self.assertEqual(7, observed['swift_ring_version'])
+        self.assertEqual(2, observed['part_power'])
+        self.assertEqual(2.0, observed['replicas'])
+        self.assertEqual(
+            hashlib.sha256(ring_body).hexdigest(), observed['sha256'])
+
+        stats = self._recon_stats()
+        self.assertTrue(stats['success'])
+        self.assertEqual('observe', stats['mode'])
+        self.assertEqual(1, stats['files_observed'])
+        self.assertEqual(1, stats['files_valid'])
+        self.assertEqual(0, stats['files_invalid'])
+        self.assertFalse(stats['operator_attention']['needed'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['agent.observe.attempts'])
+        self.assertEqual(1, counts['agent.observe.successes'])
+        self.assertEqual(1, counts['agent.observe.files'])
+        self.assertEqual(1, counts['agent.observe.files_valid'])
+        self.assertEqual(0, counts['agent.observe.files_invalid'])
+
+    def test_observe_mode_reports_invalid_ring_without_installing(self):
+        os.makedirs(self.swift_dir)
+        ring_path = os.path.join(self.swift_dir, 'object.ring.gz')
+        with open(ring_path, 'wb') as fp:
+            fp.write(b'not a swift ring')
+        logger = debug_logger()
+        opener = FakeOpener({})
+
+        result = self._agent(
+            opener, urls='', logger=logger, mode='observe').run_once()
+
+        self.assertEqual(1, result['files_observed'])
+        self.assertEqual(0, result['files_valid'])
+        self.assertEqual(1, result['files_invalid'])
+        self.assertEqual('error', result['files'][0]['status'])
+        self.assertTrue(result['files'][0]['error'])
+        self.assertEqual([], opener.requests)
+        self.assertFalse(os.path.exists(self.state_file))
+        with open(ring_path, 'rb') as fp:
+            self.assertEqual(b'not a swift ring', fp.read())
+
+        stats = self._recon_stats()
+        self.assertTrue(stats['success'])
+        self.assertEqual(
+            ['invalid_ring_files'],
+            stats['operator_attention']['reasons'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['agent.observe.files_invalid'])
+        self.assertEqual(1, counts['agent.operator_attention'])
+
+    def test_observe_mode_does_not_create_missing_swift_dir(self):
+        logger = debug_logger()
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(
+                FakeOpener({}), urls='', logger=logger,
+                mode='observe').run_once()
+
+        self.assertIn('unable to inventory local rings', str(cm.exception))
+        self.assertFalse(os.path.exists(self.swift_dir))
+        self.assertFalse(os.path.exists(self.state_file))
+        stats = self._recon_stats()
+        self.assertFalse(stats['success'])
+        self.assertEqual('observe', stats['mode'])
+        self.assertIn('local_failure',
+                      stats['operator_attention']['reasons'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['agent.observe.attempts'])
+        self.assertEqual(1, counts['agent.observe.failures'])
+        self.assertNotIn('agent.observe.successes', counts)
+
+    def test_agent_mode_validation_and_url_requirement(self):
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(FakeOpener({}), mode='invalid')
+        self.assertIn('mode must be one of enforce, observe',
+                      str(cm.exception))
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(FakeOpener({}), urls='', mode='enforce')
+        self.assertIn('ring_manager_urls is required', str(cm.exception))
 
     def test_sync_once_rejects_older_manifest_than_state(self):
         os.makedirs(self.swift_dir)
