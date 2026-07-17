@@ -34,7 +34,7 @@ from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
     DEFAULT_RING_ARTIFACT_DIR, DEFAULT_RING_BUILD_EXECUTOR, \
     DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
     DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD, \
-    NormalTimestamp
+    NormalTimestamp, RING_MANAGER_SYNC_JOURNAL
 from swift.ring_manager.server import app_factory, \
     DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS, RingManagerApplication
 from swift.ring_manager.middleware.auth import RingManagerAuthMiddleware
@@ -413,6 +413,27 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertTrue(sync['published_state_promote_ready'])
         self.assertEqual([], sync['promotion_blockers'])
         self.assertEqual([], sync['reasons'])
+
+    def test_standby_status_blocks_pending_sync_transaction(self):
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+        self._write_json(RING_MANAGER_SYNC_JOURNAL, {
+            'committed': False,
+            'entries': [],
+            'staged_builders': [],
+        })
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=self._status_app())
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertFalse(sync['fresh'])
+        self.assertTrue(sync['stale'])
+        self.assertFalse(sync['can_serve_published_reads'])
+        self.assertFalse(sync['published_state_promote_ready'])
+        self.assertEqual(['sync_transaction_pending'], sync['reasons'])
+        self.assertEqual(['sync_transaction_pending'],
+                         sync['promotion_blockers'])
 
     def test_standby_status_blocks_promotion_without_sync_source(self):
         self._write_sync_index(self._timestamp_seconds_ago(10), source=None)

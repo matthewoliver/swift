@@ -37,6 +37,7 @@ DEFAULT_BUILD_JOB_LEASE_TIMEOUT = 3600
 DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD = 300
 DEFAULT_STATE_CHANGE_HOOK_TIMEOUT = 30
 RESERVED_ARTIFACT_VERSION_IDS = frozenset(('desired', 'latest'))
+RING_MANAGER_SYNC_JOURNAL = '.ring-manager-sync-transaction.json'
 
 
 def stats_increment(logger, metric, step=1):

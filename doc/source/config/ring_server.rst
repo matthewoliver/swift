@@ -283,6 +283,11 @@ Command-line options override values from this section.
    * - ``request_timeout``
      - ``30``
      - HTTP request timeout in seconds.
+   * - ``sync_lock_timeout``
+     - ``30``
+     - Seconds to wait for the local ``swift-ring-manager-sync`` lock before
+       failing the sync attempt. This prevents overlapping sync processes from
+       committing mutable state concurrently.
    * - ``recon_cache_path``
      - ``/var/cache/swift``
      - Recon cache directory for ``ring-manager.recon``.
@@ -360,6 +365,14 @@ The syncer tries sources in order.
 Remote source failures are recorded and fall through to the next source.
 Local state, index, artifact, or cleanup failures abort the attempt rather
 than mixing a partially written local state with a later source.
+Mutable state JSON and synced builder files are committed with rollback
+backups. If that local commit fails, the previous mutable state is restored
+and ``latest_ring_version`` is not advanced. Immutable artifact files may be
+left on disk after a failed attempt because they are addressed by checksum and
+are not visible through ``latest`` until the state commit succeeds. A pending
+sync transaction journal makes status fail closed with
+``sync_transaction_pending`` until the next sync run recovers it. Overlapping
+sync processes are serialized by a local ``ring-manager-sync`` lock.
 When the selected source is a replica, the local state preserves its upstream
 ``last_synced_at`` rather than stamping the downstream replica with the
 current time.
@@ -378,6 +391,9 @@ admin-only endpoints.
 Builder sync requires admin credentials, verifies the byte count, SHA-256
 digest, and Swift builder loadability, and writes files below
 ``ring_builder_dir`` before the local ``latest_ring_version`` advances.
+Synced builder files are committed together with mutable state JSON using
+rollback backups; if the local commit fails, the previous builder files and
+state JSON are restored and ``latest`` is not advanced.
 Disabled-ring builders are skipped by default.
 The command records its latest attempt in ring-manager.recon below the
 recon cache directory.

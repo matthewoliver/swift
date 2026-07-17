@@ -21,17 +21,19 @@ import uuid
 
 from urllib.parse import quote, urljoin, urlparse
 
+from swift.common import exceptions as swift_exceptions
 from swift.common.concurrency import socket, urllib_request
 from swift.common.ring.builder import RingBuilder
 from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
     RECON_RING_MANAGER_FILE
 from swift.common.utils import NullLogger, config_true_value, \
-    dump_recon_cache, get_logger, list_from_csv, mkdirs, \
-    non_negative_float, readconf
+    dump_recon_cache, fsync, fsync_dir, get_logger, list_from_csv, \
+    lock_path, mkdirs, non_negative_float, readconf
 from swift.common.utils import md5
 from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
-    DEFAULT_RING_BUILDER_DIR, load_secret, NormalTimestamp, StateChangeHook, \
-    normal_timestamp, stats_increment, stats_timing, validate_path_component, \
+    DEFAULT_RING_BUILDER_DIR, load_secret, NormalTimestamp, \
+    RING_MANAGER_SYNC_JOURNAL, StateChangeHook, normal_timestamp, \
+    stats_increment, stats_timing, validate_path_component, \
     validate_relative_api_url
 
 
@@ -63,7 +65,8 @@ class RingManagerSync(object):
                  recon_cache_path=DEFAULT_RECON_CACHE_PATH, recon_dump=True,
                  logger=None, time_func=NormalTimestamp.now,
                  state_change_hook=None, state_change_hook_timeout=None,
-                 builder_dir=None, sync_builder_files=False):
+                 builder_dir=None, sync_builder_files=False,
+                 sync_lock_timeout=30):
         if not source_url:
             raise RingManagerSyncError('source_url is required')
         if not state_dir:
@@ -101,6 +104,7 @@ class RingManagerSync(object):
         self.recon_dump = recon_dump
         self.logger = logger or NullLogger()
         self.time_func = time_func
+        self.sync_lock_timeout = sync_lock_timeout
         self.state_change_hook = StateChangeHook(
             state_change_hook, state_dir=state_dir,
             timeout=state_change_hook_timeout, logger=self.logger)
@@ -211,8 +215,28 @@ class RingManagerSync(object):
 
     def _mkdirs(self, path):
         directory = os.path.dirname(path)
-        if directory and not os.path.isdir(directory):
+        self._ensure_directory_durable(directory)
+
+    def _ensure_directory_durable(self, directory):
+        if not directory or os.path.isdir(directory):
+            return
+        missing = []
+        path = directory
+        while path and not os.path.isdir(path):
+            missing.append(path)
+            parent = os.path.dirname(path)
+            if parent == path:
+                break
+            path = parent
+        try:
             os.makedirs(directory)
+        except OSError as err:
+            if err.errno != errno.EEXIST or not os.path.isdir(directory):
+                raise
+        for created in reversed(missing):
+            parent = os.path.dirname(created)
+            if parent:
+                fsync_dir(parent)
 
     def _write_file_atomic(self, path, body):
         temp_path = None
@@ -221,8 +245,13 @@ class RingManagerSync(object):
             temp_path = '%s.tmp-%s' % (path, uuid.uuid4().hex)
             with open(temp_path, 'wb') as fp:
                 fp.write(body)
+                fp.flush()
+                fsync(fp.fileno())
             os.rename(temp_path, path)
             temp_path = None
+            directory = os.path.dirname(path)
+            if directory:
+                fsync_dir(directory)
         except RingManagerSyncLocalError:
             raise
         except Exception as err:
@@ -239,31 +268,288 @@ class RingManagerSync(object):
                             'local ring-manager sync cleanup failed for %s: '
                             '%s' % (temp_path, err))
 
+    def _json_body(self, value):
+        return json.dumps(value, sort_keys=True, indent=2).encode(
+            'ascii') + b'\n'
+
     def _write_json_atomic(self, path, value):
-        body = json.dumps(value, sort_keys=True, indent=2).encode('ascii')
-        self._write_file_atomic(path, body + b'\n')
+        self._write_file_atomic(path, self._json_body(value))
         self.state_change_hook.run('write', path)
 
-    def _write_builder_file_atomic(self, path, body, ring_id):
+    def _stage_json_write(self, state_writes, path, value):
+        state_writes.append({
+            'path': path,
+            'body': self._json_body(value),
+        })
+
+    def _backup_existing_path(self, path):
+        if not os.path.exists(path):
+            return None
+        backup_path = '%s.sync-backup-%s' % (path, uuid.uuid4().hex)
+        try:
+            os.link(path, backup_path)
+            directory = os.path.dirname(path)
+            if directory:
+                fsync_dir(directory)
+        except OSError as err:
+            raise RingManagerSyncLocalError(
+                'local ring-manager sync backup failed for %s: %s' %
+                (path, err))
+        return backup_path
+
+    def _sync_journal_path(self):
+        return self._state_path(RING_MANAGER_SYNC_JOURNAL)
+
+    def _write_sync_journal(self, journal):
+        self._write_file_atomic(
+            self._sync_journal_path(), self._json_body(journal))
+
+    def _remove_sync_journal(self):
+        path = self._sync_journal_path()
+        try:
+            os.unlink(path)
+            directory = os.path.dirname(path)
+            if directory:
+                fsync_dir(directory)
+        except OSError as err:
+            if err.errno != errno.ENOENT:
+                raise RingManagerSyncLocalError(
+                    'local ring-manager sync journal cleanup failed for %s: '
+                    '%s' % (path, err))
+
+    def _read_sync_journal(self):
+        path = self._sync_journal_path()
+        journal = self._read_json(path, None)
+        if journal is None:
+            return None
+        if not isinstance(journal, dict):
+            raise RingManagerSyncLocalError(
+                'local ring-manager sync journal must be an object')
+        entries = journal.get('entries', [])
+        staged_builders = journal.get('staged_builders', [])
+        if not isinstance(entries, list) or not isinstance(
+                staged_builders, list):
+            raise RingManagerSyncLocalError(
+                'local ring-manager sync journal has invalid contents')
+        return journal
+
+    def _cleanup_staged_builder_paths(self, paths):
+        errors = []
+        for path in paths:
+            if not path:
+                continue
+            try:
+                os.unlink(path)
+                directory = os.path.dirname(path)
+                if directory:
+                    fsync_dir(directory)
+            except OSError as err:
+                if err.errno != errno.ENOENT:
+                    errors.append('%s: %s' % (path, err))
+        if errors:
+            raise RingManagerSyncLocalError(
+                'local ring-manager builder sync cleanup failed: %s' %
+                '; '.join(errors))
+
+    def _rollback_journal_entry(self, entry):
+        path = entry['path']
+        backup_path = entry.get('backup_path')
+        if backup_path:
+            try:
+                os.rename(backup_path, path)
+            except OSError as err:
+                if err.errno != errno.ENOENT:
+                    raise
+            else:
+                directory = os.path.dirname(path)
+                if directory:
+                    fsync_dir(directory)
+            return
+        try:
+            os.unlink(path)
+            directory = os.path.dirname(path)
+            if directory:
+                fsync_dir(directory)
+        except OSError as err:
+            if err.errno != errno.ENOENT:
+                raise
+
+    def _rollback_sync_journal(self, journal):
+        while journal.get('entries'):
+            entry = journal['entries'][-1]
+            try:
+                self._rollback_journal_entry(entry)
+            except OSError as err:
+                raise RingManagerSyncLocalError(
+                    'local ring-manager sync rollback failed for %s: %s' %
+                    (entry.get('path'), err))
+            journal['entries'].pop()
+            self._write_sync_journal(journal)
+        self._cleanup_staged_builder_paths(journal.get('staged_builders', []))
+        journal['staged_builders'] = []
+        self._write_sync_journal(journal)
+
+    def _recover_sync_transaction(self):
+        journal = self._read_sync_journal()
+        if journal is None:
+            return
+        if journal.get('committed'):
+            self._cleanup_backups(journal.get('entries', []))
+            self._cleanup_staged_builder_paths(
+                journal.get('staged_builders', []))
+            self._remove_sync_journal()
+            return
+        self._rollback_sync_journal(journal)
+        self._remove_sync_journal()
+
+    def _record_journal_entry(self, journal, entry):
+        journal['entries'].append(entry)
+        self._write_sync_journal(journal)
+
+    def _commit_path_body(self, touched, journal, path, body, kind='state'):
+        backup_path = self._backup_existing_path(path)
+        entry = {
+            'kind': kind,
+            'path': path,
+            'backup_path': backup_path,
+        }
+        self._record_journal_entry(journal, entry)
+        touched.append(entry)
+        self._write_file_atomic(path, body)
+
+    def _cleanup_backups(self, touched):
+        for entry in touched:
+            backup_path = entry.get('backup_path')
+            if not backup_path:
+                continue
+            try:
+                os.unlink(backup_path)
+                directory = os.path.dirname(backup_path)
+                if directory:
+                    fsync_dir(directory)
+            except OSError as err:
+                if err.errno != errno.ENOENT:
+                    self.logger.warning(
+                        'Unable to remove ring-manager sync backup %s: %s',
+                        backup_path, err)
+
+    def _cleanup_staged_builders(self, staged_builders):
+        errors = []
+        for builder in staged_builders:
+            temp_path = builder.get('temp_path')
+            if not temp_path:
+                continue
+            try:
+                os.unlink(temp_path)
+                builder['temp_path'] = None
+                directory = os.path.dirname(temp_path)
+                if directory:
+                    fsync_dir(directory)
+            except OSError as err:
+                if err.errno != errno.ENOENT:
+                    errors.append('%s: %s' % (temp_path, err))
+        if errors:
+            raise RingManagerSyncLocalError(
+                'local ring-manager builder sync cleanup failed: %s' %
+                '; '.join(errors))
+
+    def _commit_staged_builder(self, touched, journal, builder):
+        path = builder['path']
+        temp_path = builder['temp_path']
+        backup_path = self._backup_existing_path(path)
+        entry = {
+            'kind': 'builder',
+            'path': path,
+            'backup_path': backup_path,
+        }
+        self._record_journal_entry(journal, entry)
+        touched.append(entry)
+        try:
+            os.rename(temp_path, path)
+            builder['temp_path'] = None
+            directory = os.path.dirname(path)
+            if directory:
+                fsync_dir(directory)
+        except OSError as err:
+            raise RingManagerSyncLocalError(
+                'local ring-manager builder sync install failed for %s: %s' %
+                (path, err))
+
+    def _commit_sync_transaction(self, state_writes, staged_builders,
+                                 latest_write):
+        journal = {
+            'committed': False,
+            'entries': [],
+            'staged_builders': [
+                builder['temp_path'] for builder in staged_builders
+                if builder.get('temp_path')],
+        }
+        self._write_sync_journal(journal)
+        touched = []
+        state_paths = []
+        try:
+            for write in state_writes:
+                self._commit_path_body(
+                    touched, journal, write['path'], write['body'])
+                state_paths.append(write['path'])
+            for builder in staged_builders:
+                self._commit_staged_builder(touched, journal, builder)
+            self._commit_path_body(
+                touched, journal, latest_write['path'], latest_write['body'])
+            state_paths.append(latest_write['path'])
+            journal['committed'] = True
+            self._write_sync_journal(journal)
+        except Exception:
+            rollback_err = None
+            try:
+                self._rollback_sync_journal(journal)
+            except RingManagerSyncLocalError as err:
+                rollback_err = err
+            try:
+                self._cleanup_staged_builders(staged_builders)
+            except RingManagerSyncLocalError as err:
+                if rollback_err is None:
+                    rollback_err = err
+            if rollback_err is not None:
+                raise rollback_err
+            self._remove_sync_journal()
+            raise
+        self._cleanup_backups(touched)
+        self._remove_sync_journal()
+        for path in state_paths:
+            self.state_change_hook.run('write', path)
+
+    def _stage_builder_file(self, path, body, ring_id):
         temp_path = None
         try:
             self._mkdirs(path)
-            temp_path = '%s.tmp-%s' % (path, uuid.uuid4().hex)
+            temp_path = '%s.sync-%s' % (path, uuid.uuid4().hex)
             with open(temp_path, 'wb') as fp:
                 fp.write(body)
+                fp.flush()
+                fsync(fp.fileno())
+            directory = os.path.dirname(temp_path)
+            if directory:
+                fsync_dir(directory)
             try:
-                RingBuilder.load(temp_path)
+                builder = RingBuilder.load(temp_path)
             except Exception as err:
                 raise RingManagerSyncError(
                     'downloaded builder for ring %s could not be loaded: %s' %
                     (ring_id, err))
-            os.rename(temp_path, path)
+            record = {
+                'path': path,
+                'temp_path': temp_path,
+                'ring_id': ring_id,
+                'builder': builder,
+            }
             temp_path = None
+            return record
         except RingManagerSyncError:
             raise
         except Exception as err:
             raise RingManagerSyncLocalError(
-                'local ring-manager builder sync write failed for %s: %s' %
+                'local ring-manager builder sync stage failed for %s: %s' %
                 (path, err))
         finally:
             if temp_path:
@@ -462,10 +748,11 @@ class RingManagerSync(object):
             self._stage_local_builder_names(local_rings)
         return len(local_rings), local_rings
 
-    def _write_rings(self, rings):
+    def _stage_rings(self, state_writes, rings):
         synced = 0
         for local_ring in rings:
-            self._write_json_atomic(
+            self._stage_json_write(
+                state_writes,
                 self._state_path(
                     'rings', '%s.json' % self._safe_id(local_ring['id'])),
                 local_ring)
@@ -497,7 +784,8 @@ class RingManagerSync(object):
                 return None
         return md5(body, usedforsecurity=False).hexdigest()
 
-    def _download_builder_file(self, source_url, ring, metadata, local_path):
+    def _download_builder_file(self, source_url, ring, metadata, local_path,
+                               staged_builders):
         ring_id = str(ring['id'])
         file_info = metadata.get('file')
         if not isinstance(file_info, dict):
@@ -535,43 +823,21 @@ class RingManagerSync(object):
             file_info = dict(file_info)
             file_info['sha256'] = expected_sha256
         self._verify_download(body, file_info, url)
-        temp_verify_path = '%s.verify-%s' % (local_path, uuid.uuid4().hex)
-        try:
-            self._mkdirs(temp_verify_path)
-            with open(temp_verify_path, 'wb') as fp:
-                fp.write(body)
-            try:
-                builder = RingBuilder.load(temp_verify_path)
-            except Exception as err:
-                raise RingManagerSyncError(
-                    'downloaded builder for ring %s could not be loaded: %s' %
-                    (ring_id, err))
-            expected_version = metadata.get('builder_version')
-            if expected_version not in (None, '') and \
-                    str(builder.version) != str(expected_version):
-                raise RingManagerSyncError(
-                    'downloaded builder for ring %s version %s did not match '
-                    'metadata version %s' % (
-                        ring_id, builder.version, expected_version))
-        except RingManagerSyncError:
-            raise
-        except Exception as err:
-            raise RingManagerSyncLocalError(
-                'local ring-manager builder sync validation failed for %s: '
-                '%s' % (local_path, err))
-        finally:
-            try:
-                os.unlink(temp_verify_path)
-            except OSError as err:
-                if err.errno != errno.ENOENT:
-                    raise RingManagerSyncLocalError(
-                        'local ring-manager builder sync cleanup failed for '
-                        '%s: %s' % (temp_verify_path, err))
+        staged_builder = self._stage_builder_file(local_path, body, ring_id)
+        builder = staged_builder['builder']
+        expected_version = metadata.get('builder_version')
+        if expected_version not in (None, '') and \
+                str(builder.version) != str(expected_version):
+            self._cleanup_staged_builders([staged_builder])
+            raise RingManagerSyncError(
+                'downloaded builder for ring %s version %s did not match '
+                'metadata version %s' % (
+                    ring_id, builder.version, expected_version))
         stats_increment(self.logger, 'sync.bytes_downloaded', len(body))
-        self._write_builder_file_atomic(local_path, body, ring_id)
+        staged_builders.append(staged_builder)
         return 'downloaded'
 
-    def _sync_builder_files(self, source_url, rings):
+    def _sync_builder_files(self, source_url, rings, staged_builders):
         stats = {
             'builder_files_synced': 0,
             'builder_files_downloaded': 0,
@@ -595,7 +861,7 @@ class RingManagerSync(object):
             file_name = self._local_builder_file_name(ring)
             local_path = self._builder_path(file_name)
             result = self._download_builder_file(
-                source_url, ring, metadata, local_path)
+                source_url, ring, metadata, local_path, staged_builders)
             stats['builder_files_synced'] += 1
             if result == 'downloaded':
                 stats['builder_files_downloaded'] += 1
@@ -607,6 +873,7 @@ class RingManagerSync(object):
                                      manifest):
         synced = 0
         downloaded = unchanged = 0
+        ring_versions = []
         for ring in manifest.get('rings', []):
             if not isinstance(ring, dict):
                 continue
@@ -651,15 +918,24 @@ class RingManagerSync(object):
             local_version.pop('latest', None)
             local_version.pop('resource_uri', None)
             local_version['files'] = localized_files
-            self._write_json_atomic(
-                self._state_path(
-                    'ring-versions', self._safe_id(ring_id),
-                    '%s.json' % self._safe_id(version_id)),
-                local_version)
+            ring_versions.append({
+                'ring_id': ring_id,
+                'version_id': version_id,
+                'body': local_version,
+            })
             synced += 1
-        return synced, downloaded, unchanged
+        return synced, downloaded, unchanged, ring_versions
 
-    def _write_latest(self, source_url, version, synced_at):
+    def _stage_ring_artifact_versions(self, state_writes, ring_versions):
+        for version in ring_versions:
+            self._stage_json_write(
+                state_writes,
+                self._state_path(
+                    'ring-versions', self._safe_id(version['ring_id']),
+                    '%s.json' % self._safe_id(version['version_id'])),
+                version['body'])
+
+    def _latest_write(self, source_url, version, synced_at):
         index_path = self._state_path('index.json')
         index = self._read_json(index_path, {})
         if not isinstance(index, dict):
@@ -671,7 +947,10 @@ class RingManagerSync(object):
             'latest_ring_version': version,
             'synced_at': synced_at,
         }
-        self._write_json_atomic(index_path, index)
+        return {
+            'path': index_path,
+            'body': self._json_body(index),
+        }
 
     def _dump_recon(self, sync_stats):
         if not self.recon_dump:
@@ -781,29 +1060,46 @@ class RingManagerSync(object):
             (source_url, mode))
 
     def _sync_from_source(self, source_url):
-        source_status = self._validate_source(source_url)
-        manifest = self._json_request(
-            source_url, '/api/v1/rings/releases/latest/manifest/')
-        version, local_manifest, downloaded, unchanged = \
-            self._sync_manifest_files(source_url, manifest)
-        source_latest = source_status.get('latest_ring_version')
-        if source_latest not in (None, '') and str(source_latest) != version:
-            raise RingManagerSyncError(
-                'source %s status latest version %s does not match latest '
-                'manifest version %s' % (source_url, source_latest, version))
-        _rings, ring_objects = self._sync_rings(source_url)
-        builder_stats = self._sync_builder_files(source_url, ring_objects)
-        rings = self._write_rings(ring_objects)
-        per_ring, per_ring_downloaded, per_ring_unchanged = \
-            self._sync_ring_artifact_versions(source_url, version, manifest)
+        staged_builders = []
+        try:
+            source_status = self._validate_source(source_url)
+            manifest = self._json_request(
+                source_url, '/api/v1/rings/releases/latest/manifest/')
+            version, local_manifest, downloaded, unchanged = \
+                self._sync_manifest_files(source_url, manifest)
+            source_latest = source_status.get('latest_ring_version')
+            if source_latest not in (None, '') and str(source_latest) != \
+                    version:
+                raise RingManagerSyncError(
+                    'source %s status latest version %s does not match latest '
+                    'manifest version %s' % (
+                        source_url, source_latest, version))
+            _rings, ring_objects = self._sync_rings(source_url)
+            builder_stats = self._sync_builder_files(
+                source_url, ring_objects, staged_builders)
+            per_ring, per_ring_downloaded, per_ring_unchanged, \
+                ring_versions = self._sync_ring_artifact_versions(
+                    source_url, version, manifest)
 
-        self._write_json_atomic(
-            self._state_path(
-                'releases', self._safe_id(version), 'manifest.json'),
-            local_manifest)
+            state_writes = []
+            rings = self._stage_rings(state_writes, ring_objects)
+            self._stage_ring_artifact_versions(state_writes, ring_versions)
+            self._stage_json_write(
+                state_writes,
+                self._state_path(
+                    'releases', self._safe_id(version), 'manifest.json'),
+                local_manifest)
+            commit_at = self._timestamp()
+            synced_at = source_status.get('sync_timestamp') or \
+                commit_at.internal
+            latest_write = self._latest_write(source_url, version, synced_at)
+            self._commit_sync_transaction(
+                state_writes, staged_builders, latest_write)
+        except Exception:
+            self._cleanup_staged_builders(staged_builders)
+            raise
+
         ended_at = self._timestamp()
-        synced_at = source_status.get('sync_timestamp') or ended_at.internal
-        self._write_latest(source_url, version, synced_at)
 
         return {
             'latest_ring_version': version,
@@ -836,6 +1132,23 @@ class RingManagerSync(object):
     def sync(self):
         started_at = self._timestamp()
         stats_increment(self.logger, 'sync.attempts')
+        try:
+            with lock_path(
+                    self.state_dir, timeout=self.sync_lock_timeout,
+                    name='ring-manager-sync'):
+                try:
+                    self._recover_sync_transaction()
+                except RingManagerSyncLocalError as err:
+                    self._record_failure(started_at, err)
+                    raise
+                return self._sync_locked(started_at)
+        except swift_exceptions.LockTimeout as err:
+            local_err = RingManagerSyncLocalError(
+                'local ring-manager sync lock failed: %s' % err)
+            self._record_failure(started_at, local_err)
+            raise local_err
+
+    def _sync_locked(self, started_at):
         source_errors = []
         last_source = None
         last_error = None
@@ -965,6 +1278,10 @@ def _make_parser():
     parser.add_option(
         '--timeout', dest='timeout', type='float',
         help='HTTP request timeout in seconds. Default: 30')
+    parser.add_option(
+        '--sync-lock-timeout', dest='sync_lock_timeout', type='float',
+        help='Seconds to wait for the local ring-manager sync lock. '
+             'Default: 30')
     parser.add_option(
         '--recon-cache-path', dest='recon_cache_path',
         help='Directory for ring-manager recon cache data. Default: %s' %
@@ -1105,6 +1422,9 @@ def _resolve_sync_conf(options, args):
 
     timeout = _option_or_conf(
         options, 'timeout', conf, ('request_timeout', 'timeout'), default=30)
+    sync_lock_timeout = _option_or_conf(
+        options, 'sync_lock_timeout', conf, ('sync_lock_timeout',),
+        default=30)
     hook_timeout = _option_or_conf(
         options, 'state_change_hook_timeout', conf,
         ('state_change_hook_timeout',),
@@ -1141,6 +1461,8 @@ def _resolve_sync_conf(options, args):
         'read_key_file': read_key_file,
         'read_auth_token': read_auth_token,
         'timeout': _non_negative_float_option(timeout, 'timeout'),
+        'sync_lock_timeout': _non_negative_float_option(
+            sync_lock_timeout, 'sync_lock_timeout'),
         'recon_cache_path': _option_or_conf(
             options, 'recon_cache_path', conf, ('recon_cache_path',),
             default=DEFAULT_RECON_CACHE_PATH),
@@ -1190,6 +1512,7 @@ def main(argv=None):
             read_key_file=sync_conf['read_key_file'],
             read_auth_token=sync_conf['read_auth_token'],
             timeout=sync_conf['timeout'],
+            sync_lock_timeout=sync_conf['sync_lock_timeout'],
             recon_cache_path=sync_conf['recon_cache_path'],
             recon_dump=sync_conf['recon_dump'],
             state_change_hook=sync_conf['state_change_hook'],

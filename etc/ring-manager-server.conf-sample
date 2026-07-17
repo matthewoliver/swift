@@ -101,6 +101,9 @@ use = egg:swift#ring_manager
 # sync_builder_files = false
 # ring_builder_dir = /etc/swift
 # request_timeout = 30
+# Seconds to wait for the local sync lock before failing the sync attempt.
+# sync_lock_timeout = 30
+#
 # recon_cache_path = /var/cache/swift
 # recon_dump = true
 #

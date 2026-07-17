@@ -267,6 +267,9 @@ When ``sync_builder_files`` is enabled, it also downloads enabled-ring builder
 files through the admin-only endpoints using an administrator credential.
 It verifies byte count, SHA-256, and Swift builder loadability before writing
 local ring metadata or advancing the latest pointer.
+Synced builder files are committed together with mutable state JSON using
+rollback backups; if the local commit fails, the previous builder files and
+state JSON are restored and ``latest`` is not advanced.
 Disabled-ring builders are skipped by default.
 Its latest success or error is available from /recon/ring_manager when the
 recon middleware is configured.
@@ -601,7 +604,9 @@ For ``readonly`` and ``standby`` servers, the object summarizes the most
 recent successful ``swift-ring-manager-sync`` recorded in local state.
 Missing, malformed, stale, future-dated, or version-mismatched metadata fails
 closed for freshness and promotion reporting with ``fresh: false`` and
-``stale: true``.
+``stale: true``. A pending ``swift-ring-manager-sync`` transaction journal
+also fails closed with the ``sync_transaction_pending`` reason and promotion
+blocker until the next sync run recovers or cleans up the journal.
 
 Stale sync metadata does not disable the read API.
 A read-only or standby server continues serving its last successfully

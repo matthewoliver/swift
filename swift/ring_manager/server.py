@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import sys
 
 from swift import __version__ as swift_version
@@ -30,8 +31,9 @@ from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
     DEFAULT_RING_BUILD_EXECUTOR, DEFAULT_RING_BUILD_MANAGER_WORKERS, \
     DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
     DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD, \
-    DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, NormalTimestamp, RING_BUILD_EXECUTORS, \
-    stats_increment, stats_timing_since
+    DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, NormalTimestamp, \
+    RING_BUILD_EXECUTORS, RING_MANAGER_SYNC_JOURNAL, stats_increment, \
+    stats_timing_since
 from swift.ring_manager.controllers import ring as ring_controller
 from swift.ring_manager import http, routing
 from swift.ring_manager.builder_daemon import RingBuildWorker
@@ -278,6 +280,12 @@ class RingManagerApplication(object):
             'reasons': [],
         }
 
+    def _sync_transaction_pending(self):
+        if not self.store.state_dir:
+            return False
+        return os.path.exists(os.path.join(
+            self.store.state_dir, RING_MANAGER_SYNC_JOURNAL))
+
     def _ring_manager_sync_status(self, latest_version, index_error=None):
         status = self._base_sync_status()
         if not status['applicable']:
@@ -285,6 +293,11 @@ class RingManagerApplication(object):
             return status
 
         status['stale'] = True
+        if self._sync_transaction_pending():
+            status['reasons'].append('sync_transaction_pending')
+            status['promotion_blockers'].append('sync_transaction_pending')
+            return status
+
         if index_error is not None:
             status['reasons'].append('invalid_state_index')
             status['promotion_blockers'].append('invalid_state_index')

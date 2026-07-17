@@ -26,7 +26,8 @@ from swift.common.ring.builder import RingBuilder
 from swift.common.recon import RECON_RING_MANAGER_FILE
 from swift.common.swob import Request
 from swift.common.utils import md5
-from swift.ring_manager.common import NormalTimestamp
+from swift.ring_manager.common import NormalTimestamp, \
+    RING_MANAGER_SYNC_JOURNAL
 from swift.ring_manager.server import RingManagerApplication
 from swift.ring_manager import sync
 from swift.ring_manager.sync import RingManagerSync, RingManagerSyncError, \
@@ -558,7 +559,7 @@ class TestRingManagerSync(unittest.TestCase):
         opener = FakeOpener(routes)
 
         with mock.patch.object(
-                RingManagerSync, '_write_builder_file_atomic',
+                RingManagerSync, '_stage_builder_file',
                 side_effect=RingManagerSyncLocalError(
                     'local builder write failed')):
             with self.assertRaises(RingManagerSyncLocalError):
@@ -732,7 +733,7 @@ class TestRingManagerSync(unittest.TestCase):
         opener = FakeOpener(routes)
 
         with mock.patch.object(
-                RingManagerSync, '_write_json_atomic',
+                RingManagerSync, '_commit_path_body',
                 side_effect=RingManagerSyncLocalError('local write failed')):
             with self.assertRaises(RingManagerSyncLocalError):
                 self._syncer(
@@ -749,6 +750,156 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertFalse(recon_stats['success'])
         self.assertNotIn('source_errors', recon_stats)
         self.assertIn('local write failed', recon_stats['error'])
+
+    def test_sync_rolls_back_transaction_on_latest_write_failure(self):
+        os.makedirs(os.path.join(self.state_dir, 'rings'))
+        os.makedirs(os.path.join(self.state_dir, 'ring-versions', 'account'))
+        os.makedirs(os.path.join(self.state_dir, 'releases', 'old-release'))
+        old_ring = {
+            'id': 'account',
+            'name': 'Old Account',
+            'ring_type': 'account',
+            'builder_files': ['account.builder'],
+        }
+        with open(os.path.join(
+                self.state_dir, 'rings', 'account.json'), 'w') as fp:
+            json.dump(old_ring, fp)
+        with open(os.path.join(self.state_dir, 'index.json'), 'w') as fp:
+            json.dump({'latest_ring_version': 'old-release'}, fp)
+        builder_dir = os.path.join(self.testdir, 'builders')
+        os.makedirs(builder_dir)
+        local_builder = os.path.join(builder_dir, 'account.builder')
+        old_builder = RingBuilder(4, 3, 1)
+        old_builder.save(local_builder)
+        with open(local_builder, 'rb') as fp:
+            old_builder_body = fp.read()
+        hook_path, log_path = self._make_state_hook()
+
+        opener = FakeOpener(self._routes())
+        real_write = RingManagerSync._write_file_atomic
+
+        def fail_latest(syncer, path, body):
+            if path.endswith('index.json'):
+                raise RingManagerSyncLocalError('latest write failed')
+            return real_write(syncer, path, body)
+
+        with mock.patch.object(
+                RingManagerSync, '_write_file_atomic', fail_latest):
+            with self.assertRaises(RingManagerSyncLocalError):
+                self._syncer(
+                    opener, builder_dir=builder_dir,
+                    sync_builder_files=True,
+                    state_change_hook='%s %s' % (hook_path, log_path),
+                    state_change_hook_timeout=5).sync()
+
+        with open(os.path.join(
+                self.state_dir, 'rings', 'account.json')) as fp:
+            self.assertEqual(old_ring, json.load(fp))
+        with open(os.path.join(self.state_dir, 'index.json')) as fp:
+            self.assertEqual(
+                {'latest_ring_version': 'old-release'}, json.load(fp))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, 'ring-versions', 'account', '12.json')))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, 'releases', 'release-1', 'manifest.json')))
+        with open(local_builder, 'rb') as fp:
+            self.assertEqual(old_builder_body, fp.read())
+        self.assertFalse([
+            name for name in os.listdir(builder_dir)
+            if '.sync-' in name or '.sync-backup-' in name])
+        self.assertFalse(os.path.exists(log_path))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, RING_MANAGER_SYNC_JOURNAL)))
+
+    def test_sync_recovers_partial_transaction_before_fetching_source(self):
+        os.makedirs(os.path.join(self.state_dir, 'rings'))
+        old_ring = {
+            'id': 'account',
+            'name': 'Old Account',
+            'ring_type': 'account',
+            'builder_files': ['account.builder'],
+        }
+        new_ring = dict(old_ring)
+        new_ring['name'] = 'New Account'
+        ring_path = os.path.join(self.state_dir, 'rings', 'account.json')
+        ring_backup = '%s.sync-backup-test' % ring_path
+        with open(ring_path, 'w') as fp:
+            json.dump(new_ring, fp)
+        with open(ring_backup, 'w') as fp:
+            json.dump(old_ring, fp)
+
+        builder_dir = os.path.join(self.testdir, 'builders')
+        os.makedirs(builder_dir)
+        builder_path = os.path.join(builder_dir, 'account.builder')
+        old_builder = RingBuilder(4, 3, 1)
+        old_builder.save('%s.sync-backup-test' % builder_path)
+        with open('%s.sync-backup-test' % builder_path, 'rb') as fp:
+            old_builder_body = fp.read()
+        with open(builder_path, 'wb') as fp:
+            fp.write(self.builder_body)
+        staged_builder = '%s.sync-staged' % builder_path
+        with open(staged_builder, 'wb') as fp:
+            fp.write(self.builder_body)
+
+        journal_path = os.path.join(
+            self.state_dir, RING_MANAGER_SYNC_JOURNAL)
+        with open(journal_path, 'w') as fp:
+            json.dump({
+                'committed': False,
+                'entries': [
+                    {
+                        'kind': 'state',
+                        'path': ring_path,
+                        'backup_path': ring_backup,
+                    },
+                    {
+                        'kind': 'builder',
+                        'path': builder_path,
+                        'backup_path': '%s.sync-backup-test' % builder_path,
+                    },
+                ],
+                'staged_builders': [staged_builder],
+            }, fp)
+
+        opener = FakeOpener({
+            ('GET', '/api/v1/ring_manager/status/'): json_response({}),
+        })
+        with self.assertRaises(RingManagerSyncError):
+            self._syncer(
+                opener, builder_dir=builder_dir,
+                sync_builder_files=True).sync()
+
+        self.assertEqual(
+            ['/api/v1/ring_manager/status/'],
+            [request['path'] for request in opener.requests])
+        with open(ring_path) as fp:
+            self.assertEqual(old_ring, json.load(fp))
+        self.assertFalse(os.path.exists(ring_backup))
+        with open(builder_path, 'rb') as fp:
+            self.assertEqual(old_builder_body, fp.read())
+        self.assertFalse(os.path.exists('%s.sync-backup-test' % builder_path))
+        self.assertFalse(os.path.exists(staged_builder))
+        self.assertFalse(os.path.exists(journal_path))
+
+    def test_sync_records_recon_when_journal_recovery_fails(self):
+        os.makedirs(self.state_dir)
+        with open(os.path.join(self.state_dir, RING_MANAGER_SYNC_JOURNAL),
+                  'w') as fp:
+            json.dump([], fp)
+        opener = FakeOpener(self._routes())
+        logger = debug_logger()
+
+        with self.assertRaises(RingManagerSyncLocalError) as cm:
+            self._syncer(opener, logger=logger).sync()
+
+        self.assertIn('sync journal must be an object', str(cm.exception))
+        self.assertEqual([], opener.requests)
+        recon_stats = self._read_recon()['ring_manager_sync']
+        self.assertFalse(recon_stats['success'])
+        self.assertIn('sync journal must be an object',
+                      recon_stats['error'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync.failures'])
 
     def test_sync_aborts_on_invalid_local_index_without_fallback(self):
         os.makedirs(self.state_dir)
@@ -1256,6 +1407,27 @@ log_statsd_port = not-an-int
             'https://primary.example.com:6205',
             'https://ring-ro.example.com:6205',
         ], syncer.call_args[0][0])
+
+    def test_sync_main_cli_overrides_sync_lock_timeout(self):
+        conf_path = self._write_config('''
+[ring-manager-sync]
+source_urls = https://primary.example.com:6205
+ring_manager_state_dir = %s
+ring_artifact_dir = %s
+sync_lock_timeout = 9
+''' % (self.state_dir, self.artifact_dir))
+        with mock.patch.object(sync, 'RingManagerSync') as syncer:
+            syncer.return_value.sync.return_value = {
+                'latest_ring_version': 'release-1',
+            }
+            status = sync.main([
+                '--config', conf_path,
+                '--sync-lock-timeout', '3',
+                '--quiet',
+            ])
+
+        self.assertEqual(0, status)
+        self.assertEqual(3.0, syncer.call_args[1]['sync_lock_timeout'])
 
     def test_sync_main_passes_read_credentials(self):
         with mock.patch.object(sync, 'RingManagerSync') as syncer:

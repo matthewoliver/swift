@@ -31,6 +31,12 @@ artefacts from a primary or fresh replica into another replica.
 It validates source status before any download, preserves an upstream
 replica's sync timestamp, and falls through only after a source failure.
 Local write failures abort the sync rather than attempting another source.
+Mutable state JSON and synced builder files are committed with rollback
+backups; failed local commits restore the previous mutable state and do not
+advance ``latest``. Immutable artifact files may be left on disk after a
+failed attempt, but they are not served through ``latest`` until the state
+commit succeeds. Overlapping sync processes are serialized by a local
+``ring-manager-sync`` lock.
 The sync command accepts either explicit source URLs or a config file with a
 dedicated ``[ring-manager-sync]`` section for source and local-sync settings.
 By default it synchronizes published state and immutable artefacts only.
@@ -38,6 +44,8 @@ For a promotable standby, ``sync_builder_files`` can additionally copy
 enabled-ring builder files with an administrator credential.
 It verifies byte count, SHA-256, and Swift builder loadability before the
 local latest pointer advances, while disabled-ring builders remain skipped.
+The transaction journal makes status and promotion readiness fail closed until
+the next sync run either restores the previous local state or finishes cleanup.
 The utility records its result through /recon/ring_manager when the recon
 middleware is in the pipeline.
 Its state and recon timestamp fields use Swift ``NormalTimestamp.internal``
