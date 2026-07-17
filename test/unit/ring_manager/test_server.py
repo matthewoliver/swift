@@ -33,6 +33,7 @@ from swift.ring_manager.builder_daemon import RingBuildWorker, \
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
     DEFAULT_RING_ARTIFACT_DIR, DEFAULT_RING_BUILD_EXECUTOR, \
     DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
+    DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD, \
     NormalTimestamp
 from swift.ring_manager.server import app_factory, \
     DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS, RingManagerApplication
@@ -331,6 +332,209 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(self.latest_version, body['latest_ring_version'])
         self.assertEqual('external', body['ring_build_executor'])
         self.assertEqual(0, body['ring_builds']['total'])
+        self.assertEqual({
+            'applicable': False,
+            'source': None,
+            'latest_ring_version': None,
+            'last_synced_at': None,
+            'age_seconds': None,
+            'freshness_threshold':
+                DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD,
+            'latest_matches_local': None,
+            'synced': False,
+            'fresh': False,
+            'stale': False,
+            'can_serve_published_reads': False,
+            'published_state_promote_ready': False,
+            'promotion_blockers': [],
+            'reasons': ['mode_not_replicated'],
+        }, body['ring_manager_sync'])
+
+    def _timestamp_seconds_ago(self, seconds):
+        return NormalTimestamp(
+            float(NormalTimestamp.now()) - seconds).internal
+
+    def _status_app(self, mode='standby', threshold=300):
+        return RingManagerApplication(
+            {
+                'ring_manager_state_dir': self.state_dir,
+                'ring_artifact_dir': self.artifact_dir,
+                'ring_builder_dir': self.testdir,
+                'ring_manager_mode': mode,
+                'ring_manager_sync_freshness_threshold': threshold,
+            }, logger=debug_logger())
+
+    def _write_sync_index(self, synced_at, latest_version=None,
+                          source='https://primary.example.com:6205'):
+        sync_info = {
+            'source': source,
+            'latest_ring_version': latest_version or self.latest_version,
+            'synced_at': synced_at,
+        }
+        if source is None:
+            sync_info.pop('source')
+        self._write_json('index.json', {
+            'latest_ring_version': self.latest_version,
+            'ring_manager_sync': sync_info,
+        })
+
+    def test_readonly_status_reports_fresh_sync_for_reads(self):
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/',
+            app=self._status_app(mode='readonly', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertTrue(sync['applicable'])
+        self.assertTrue(sync['synced'])
+        self.assertTrue(sync['fresh'])
+        self.assertFalse(sync['stale'])
+        self.assertTrue(sync['can_serve_published_reads'])
+        self.assertFalse(sync['published_state_promote_ready'])
+        self.assertEqual(['mode_not_standby'],
+                         sync['promotion_blockers'])
+        self.assertEqual([], sync['reasons'])
+        self.assertEqual('https://primary.example.com:6205',
+                         sync['source'])
+        self.assertEqual(self.latest_version, sync['latest_ring_version'])
+        self.assertEqual(True, sync['latest_matches_local'])
+        self.assertLess(sync['age_seconds'], 300)
+
+    def test_standby_status_reports_published_state_promote_ready(self):
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=self._status_app())
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertTrue(sync['fresh'])
+        self.assertTrue(sync['can_serve_published_reads'])
+        self.assertTrue(sync['published_state_promote_ready'])
+        self.assertEqual([], sync['promotion_blockers'])
+        self.assertEqual([], sync['reasons'])
+
+    def test_standby_status_blocks_promotion_without_sync_source(self):
+        self._write_sync_index(self._timestamp_seconds_ago(10), source=None)
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=self._status_app())
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertTrue(sync['fresh'])
+        self.assertTrue(sync['can_serve_published_reads'])
+        self.assertFalse(sync['published_state_promote_ready'])
+        self.assertEqual(['no_sync_source'], sync['promotion_blockers'])
+        self.assertEqual([], sync['reasons'])
+
+    def test_standby_status_reports_stale_sync(self):
+        self._write_sync_index(self._timestamp_seconds_ago(301))
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=self._status_app())
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertTrue(sync['synced'])
+        self.assertFalse(sync['fresh'])
+        self.assertTrue(sync['stale'])
+        self.assertFalse(sync['can_serve_published_reads'])
+        self.assertFalse(sync['published_state_promote_ready'])
+        self.assertIn('freshness_threshold_exceeded', sync['reasons'])
+        self.assertIn('freshness_threshold_exceeded',
+                      sync['promotion_blockers'])
+
+    def test_standby_status_fails_closed_with_latest_version_mismatch(self):
+        self._write_sync_index(
+            self._timestamp_seconds_ago(10),
+            latest_version='release-from-different-index')
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=self._status_app())
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertFalse(sync['fresh'])
+        self.assertTrue(sync['stale'])
+        self.assertFalse(sync['can_serve_published_reads'])
+        self.assertFalse(sync['published_state_promote_ready'])
+        self.assertEqual(False, sync['latest_matches_local'])
+        self.assertIn('latest_version_mismatch', sync['reasons'])
+        self.assertIn('latest_version_mismatch',
+                      sync['promotion_blockers'])
+
+    def test_standby_status_fails_closed_without_sync_latest_version(self):
+        self._write_json('index.json', {
+            'latest_ring_version': self.latest_version,
+            'ring_manager_sync': {
+                'source': 'https://primary.example.com:6205',
+                'synced_at': self._timestamp_seconds_ago(10),
+            },
+        })
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=self._status_app())
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertFalse(sync['fresh'])
+        self.assertTrue(sync['stale'])
+        self.assertFalse(sync['can_serve_published_reads'])
+        self.assertFalse(sync['published_state_promote_ready'])
+        self.assertIn('missing_sync_latest_ring_version', sync['reasons'])
+        self.assertIn('missing_sync_latest_ring_version',
+                      sync['promotion_blockers'])
+
+    def test_standby_status_fails_closed_without_sync_record(self):
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=self._status_app())
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertTrue(sync['applicable'])
+        self.assertFalse(sync['synced'])
+        self.assertFalse(sync['fresh'])
+        self.assertTrue(sync['stale'])
+        self.assertIn('no_sync_record', sync['reasons'])
+        self.assertIn('no_sync_record', sync['promotion_blockers'])
+
+    def test_standby_status_fails_closed_with_invalid_sync_record(self):
+        self._write_json('index.json', {
+            'latest_ring_version': self.latest_version,
+            'ring_manager_sync': 'not-an-object',
+        })
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=self._status_app())
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertFalse(sync['fresh'])
+        self.assertTrue(sync['stale'])
+        self.assertIn('invalid_sync_record', sync['reasons'])
+        self.assertIn('error', sync)
+
+    def test_standby_status_fails_closed_with_future_sync_timestamp(self):
+        self._write_sync_index(NormalTimestamp(
+            float(NormalTimestamp.now()) + 60).internal)
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=self._status_app())
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertFalse(sync['fresh'])
+        self.assertTrue(sync['stale'])
+        self.assertTrue(sync['clock_skew'])
+        self.assertIn('clock_skew', sync['reasons'])
+
+    def test_status_fails_closed_with_malformed_state_index(self):
+        self._write_json('index.json', 'not-an-object')
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/', app=self._status_app())
+
+        self.assertEqual(200, resp.status_int)
+        self.assertIsNone(body['latest_ring_version'])
+        sync = body['ring_manager_sync']
+        self.assertFalse(sync['fresh'])
+        self.assertTrue(sync['stale'])
+        self.assertIn('invalid_state_index', sync['reasons'])
+        self.assertIn('error', sync)
 
     def test_request_statsd_metrics(self):
         resp, body = self.get_json('/api/v1/rings/')

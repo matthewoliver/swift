@@ -227,6 +227,8 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertEqual('release-1', index['latest_ring_version'])
         self.assertEqual('http://primary.example.com:6205',
                          index['ring_manager_sync']['source'])
+        self.assertEqual('release-1',
+                         index['ring_manager_sync']['latest_ring_version'])
         self.assertEqual('1700000000.00000',
                          index['ring_manager_sync']['synced_at'])
 

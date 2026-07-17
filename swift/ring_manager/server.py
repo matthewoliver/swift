@@ -29,6 +29,7 @@ from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
     DEFAULT_BUILD_JOB_LEASE_TIMEOUT, DEFAULT_RING_ARTIFACT_DIR, \
     DEFAULT_RING_BUILD_EXECUTOR, DEFAULT_RING_BUILD_MANAGER_WORKERS, \
     DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
+    DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD, \
     DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, NormalTimestamp, RING_BUILD_EXECUTORS, \
     stats_increment, stats_timing_since
 from swift.ring_manager.controllers import ring as ring_controller
@@ -111,6 +112,9 @@ class RingManagerApplication(object):
                 ', '.join(RING_BUILD_EXECUTORS))
         self.build_job_lease_timeout = config_positive_float_value(conf.get(
             'build_job_lease_timeout', DEFAULT_BUILD_JOB_LEASE_TIMEOUT))
+        self.sync_freshness_threshold = non_negative_float(conf.get(
+            'ring_manager_sync_freshness_threshold',
+            DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD))
         self.build_pool = None
         self.build_worker = None
         if self.ring_build_executor == 'manager':
@@ -256,18 +260,143 @@ class RingManagerApplication(object):
         return http.json_response(
             req, self._service_document(api_version=RING_MANAGER_API_VERSION))
 
+    def _base_sync_status(self):
+        return {
+            'applicable': self.mode in READONLY_RING_MANAGER_MODES,
+            'source': None,
+            'latest_ring_version': None,
+            'last_synced_at': None,
+            'age_seconds': None,
+            'freshness_threshold': self.sync_freshness_threshold,
+            'latest_matches_local': None,
+            'synced': False,
+            'fresh': False,
+            'stale': False,
+            'can_serve_published_reads': False,
+            'published_state_promote_ready': False,
+            'promotion_blockers': [],
+            'reasons': [],
+        }
+
+    def _ring_manager_sync_status(self, latest_version, index_error=None):
+        status = self._base_sync_status()
+        if not status['applicable']:
+            status['reasons'].append('mode_not_replicated')
+            return status
+
+        status['stale'] = True
+        if index_error is not None:
+            status['reasons'].append('invalid_state_index')
+            status['promotion_blockers'].append('invalid_state_index')
+            status['error'] = index_error
+            return status
+
+        try:
+            index = self.store.get_state_index()
+        except (IOError, ValueError) as err:
+            status['reasons'].append('invalid_state_index')
+            status['promotion_blockers'].append('invalid_state_index')
+            status['error'] = str(err)
+            return status
+
+        sync_info = index.get('ring_manager_sync')
+        if sync_info is None:
+            status['reasons'].append('no_sync_record')
+            status['promotion_blockers'].append('no_sync_record')
+            return status
+        if not isinstance(sync_info, dict):
+            status['reasons'].append('invalid_sync_record')
+            status['promotion_blockers'].append('invalid_sync_record')
+            status['error'] = 'ring_manager_sync must be an object'
+            return status
+
+        status['source'] = sync_info.get('source')
+        sync_latest = sync_info.get('latest_ring_version')
+        if sync_latest in (None, ''):
+            status['reasons'].append('missing_sync_latest_ring_version')
+            status['promotion_blockers'].append(
+                'missing_sync_latest_ring_version')
+            return status
+        sync_latest = str(sync_latest)
+        status['latest_ring_version'] = sync_latest
+
+        synced_at = sync_info.get('synced_at') or \
+            sync_info.get('last_synced_at')
+        if synced_at in (None, ''):
+            status['reasons'].append('never_synced')
+            status['promotion_blockers'].append('never_synced')
+            return status
+        try:
+            last_synced = NormalTimestamp(synced_at)
+        except (TypeError, ValueError, AssertionError) as err:
+            status['last_synced_at'] = str(synced_at)
+            status['reasons'].append('invalid_synced_at')
+            status['promotion_blockers'].append('invalid_synced_at')
+            status['error'] = str(err)
+            return status
+
+        now = NormalTimestamp.now()
+        status['last_synced_at'] = last_synced.internal
+        status['synced'] = True
+        if float(last_synced) > float(now):
+            status['age_seconds'] = 0.0
+            status['clock_skew'] = True
+            status['reasons'].append('clock_skew')
+            status['promotion_blockers'].append('clock_skew')
+            return status
+
+        age = float(now) - float(last_synced)
+        status['age_seconds'] = age
+        if age > self.sync_freshness_threshold:
+            status['reasons'].append('freshness_threshold_exceeded')
+            status['promotion_blockers'].append(
+                'freshness_threshold_exceeded')
+            return status
+
+        if latest_version is None:
+            status['reasons'].append('no_latest_ring_version')
+            status['promotion_blockers'].append('no_latest_ring_version')
+            return status
+
+        if sync_latest != latest_version:
+            status['latest_matches_local'] = False
+            status['reasons'].append('latest_version_mismatch')
+            status['promotion_blockers'].append('latest_version_mismatch')
+            return status
+        status['latest_matches_local'] = True
+
+        status['fresh'] = True
+        status['stale'] = False
+        status['can_serve_published_reads'] = True
+        if self.mode == 'standby':
+            if status['source']:
+                status['published_state_promote_ready'] = True
+            else:
+                status['promotion_blockers'].append('no_sync_source')
+        else:
+            status['promotion_blockers'].append('mode_not_standby')
+        return status
+
     def ring_manager_status(self, req):
+        index_error = None
+        try:
+            latest_version = self.store.get_latest_ring_version_id()
+        except (IOError, ValueError) as err:
+            latest_version = None
+            index_error = str(err)
         return http.json_response(req, {
             'service': self.server_type,
             'version': swift_version,
             'status': 'ok',
             'mode': self.mode,
             'writable': self.writable,
-            'latest_ring_version': self.store.get_latest_ring_version_id(),
+            'latest_ring_version': latest_version,
             'ring_build_executor': self.ring_build_executor,
             'build_job_lease_timeout': self.build_job_lease_timeout,
             'ring_builds': self.store.ring_build_queue_stats(
                 lease_timeout=self.build_job_lease_timeout),
+            'ring_manager_sync': self._ring_manager_sync_status(
+                latest_version, index_error=index_error),
         })
 
 

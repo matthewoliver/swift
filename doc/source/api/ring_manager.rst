@@ -556,19 +556,56 @@ Service status
 ``GET /api/v1/ring_manager/status/``
 ------------------------------------
 
-Returns the service mode, the latest published release, executor mode, and
-build queue summary including stale leases observed by the server.
+Returns the service mode, latest published release, executor mode, build queue
+summary, and replica synchronization freshness information.
 
 Example response::
 
     {
       "service": "ring-manager-server",
-      "mode": "primary",
+      "mode": "readonly",
       "status": "ok",
       "version": "<swift version>",
-      "writable": true,
-      "latest_ring_version": "release-42"
+      "writable": false,
+      "latest_ring_version": "release-42",
+      "ring_manager_sync": {
+        "applicable": true,
+        "source": "https://primary.example.com:6205",
+        "latest_ring_version": "release-42",
+        "last_synced_at": "1700000000.00000",
+        "age_seconds": 12.4,
+        "freshness_threshold": 300.0,
+        "latest_matches_local": true,
+        "synced": true,
+        "fresh": true,
+        "stale": false,
+        "can_serve_published_reads": true,
+        "published_state_promote_ready": false,
+        "promotion_blockers": ["mode_not_standby"],
+        "reasons": []
+      }
     }
+
+For ``primary`` servers, ``ring_manager_sync.applicable`` is ``false`` because
+replica freshness does not apply.
+For ``readonly`` and ``standby`` servers, the object summarizes the most
+recent successful ``swift-ring-manager-sync`` recorded in local state.
+Missing, malformed, stale, future-dated, or version-mismatched metadata fails
+closed for freshness and promotion reporting with ``fresh: false`` and
+``stale: true``.
+
+Stale sync metadata does not disable the read API.
+A read-only or standby server continues serving its last successfully
+synchronized release and immutable artifacts from local state.
+Staleness only means that replica is no longer current enough for the status
+endpoint to recommend it for published-state reads or promotion consideration.
+
+``can_serve_published_reads`` indicates fresh published-state metadata only.
+It does not re-open every artifact on each status request and it is not an
+availability gate for artifact ``GET`` requests.
+``published_state_promote_ready`` is only a narrow standby precheck.
+It does not fence the old primary, verify builder files, redirect writers, or
+perform automatic failover.
 
 Method negotiation
 ==================

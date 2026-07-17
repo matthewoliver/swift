@@ -368,6 +368,7 @@ class RingManagerSync(object):
         index['latest_ring_version'] = version
         index['ring_manager_sync'] = {
             'source': self.source_url,
+            'latest_ring_version': version,
             'synced_at': synced_at,
         }
         self._write_json_atomic(index_path, index)

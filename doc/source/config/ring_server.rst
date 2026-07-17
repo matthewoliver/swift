@@ -53,6 +53,14 @@ Server options
     The default ``primary`` accepts reads and writes.
     ``readonly`` and ``standby`` accept read-only routes and reject mutations.
 
+``ring_manager_sync_freshness_threshold``
+    Seconds after the last successful ``swift-ring-manager-sync`` before a
+    ``readonly`` or ``standby`` server reports synchronized published state as
+    stale in ``GET /api/v1/ring_manager/status/``.
+    The default is ``300``.
+    This is an observability and failover-precheck value, not an automatic
+    promotion mechanism or a read-path availability gate.
+
 ``ring_manager_state_dir``
     Root of the directory-backed JSON state.
     The default is ``/etc/swift/ring-manager-state``.
