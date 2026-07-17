@@ -27,7 +27,8 @@ from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
 from swift.common.utils import NullLogger, dump_recon_cache, get_logger, mkdirs
 from swift.common.utils import md5
 from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
-    NormalTimestamp, StateChangeHook, normal_timestamp
+    NormalTimestamp, StateChangeHook, normal_timestamp, stats_increment, \
+    stats_timing
 
 
 USER_AGENT = 'swift-ring-manager-sync'
@@ -223,6 +224,7 @@ class RingManagerSync(object):
         if status == 304:
             return 'unchanged'
         self._verify_download(body, file_info, url)
+        stats_increment(self.logger, 'sync.bytes_downloaded', len(body))
         self._write_file_atomic(local_path, body)
         return 'downloaded'
 
@@ -392,6 +394,7 @@ class RingManagerSync(object):
 
     def sync(self):
         started_at = self._timestamp()
+        stats_increment(self.logger, 'sync.attempts')
         try:
             manifest = self._json_request(
                 '/api/v1/rings/releases/latest/manifest/')
@@ -418,10 +421,31 @@ class RingManagerSync(object):
                 'ring_version_files_downloaded': per_ring_downloaded,
                 'ring_version_files_unchanged': per_ring_unchanged,
             }
+            stats_increment(self.logger, 'sync.successes')
+            stats_timing(
+                self.logger, 'sync.timing',
+                float(ended_at) - float(started_at))
+            stats_increment(
+                self.logger, 'sync.manifest_files.downloaded', downloaded)
+            stats_increment(
+                self.logger, 'sync.manifest_files.unchanged', unchanged)
+            stats_increment(self.logger, 'sync.rings_synced', rings)
+            stats_increment(self.logger, 'sync.ring_versions_synced', per_ring)
+            stats_increment(
+                self.logger, 'sync.ring_version_files.downloaded',
+                per_ring_downloaded)
+            stats_increment(
+                self.logger, 'sync.ring_version_files.unchanged',
+                per_ring_unchanged)
             self._dump_recon(
                 self._sync_stats(started_at, ended_at, synced_at, result))
             return result
         except Exception as err:
+            ended_at = self._timestamp()
+            stats_increment(self.logger, 'sync.failures')
+            stats_timing(
+                self.logger, 'sync.timing',
+                float(ended_at) - float(started_at))
             self._dump_recon(self._failure_stats(started_at, err))
             raise
 
@@ -463,6 +487,24 @@ def _make_parser():
         help='Seconds to wait for --state-change-hook. Use 0 for no timeout. '
              'Default: %default')
     parser.add_option(
+        '--log-statsd-host', dest='log_statsd_host',
+        help='StatsD host for sync metrics.')
+    parser.add_option(
+        '--log-statsd-port', dest='log_statsd_port', type='int',
+        default=8125,
+        help='StatsD port for sync metrics. Default: %default')
+    parser.add_option(
+        '--log-statsd-default-sample-rate',
+        dest='log_statsd_default_sample_rate', type='float', default=1.0,
+        help='Default StatsD sample rate. Default: %default')
+    parser.add_option(
+        '--log-statsd-sample-rate-factor',
+        dest='log_statsd_sample_rate_factor', type='float', default=1.0,
+        help='StatsD sample rate multiplier. Default: %default')
+    parser.add_option(
+        '--log-statsd-metric-prefix', dest='log_statsd_metric_prefix',
+        help='Prefix to prepend to sync metric names.')
+    parser.add_option(
         '-q', '--quiet', action='store_true', default=False,
         help='Do not print a successful sync summary.')
     return parser
@@ -475,6 +517,19 @@ def main(argv=None):
         parser.print_usage()
         print('Error: SOURCE_URL is required')
         return 1
+    logger_conf = {}
+    if options.log_statsd_host:
+        logger_conf.update({
+            'log_statsd_host': options.log_statsd_host,
+            'log_statsd_port': options.log_statsd_port,
+            'log_statsd_default_sample_rate':
+                options.log_statsd_default_sample_rate,
+            'log_statsd_sample_rate_factor':
+                options.log_statsd_sample_rate_factor,
+        })
+    if options.log_statsd_metric_prefix:
+        logger_conf['log_statsd_metric_prefix'] = \
+            options.log_statsd_metric_prefix
     try:
         syncer = RingManagerSync(
             args[0],
@@ -487,7 +542,9 @@ def main(argv=None):
             recon_dump=options.recon_dump,
             state_change_hook=options.state_change_hook,
             state_change_hook_timeout=options.state_change_hook_timeout,
-            logger=get_logger({}, log_route=USER_AGENT))
+            logger=get_logger(
+                logger_conf, log_route=USER_AGENT,
+                statsd_tail_prefix=USER_AGENT))
         result = syncer.sync()
     except RingManagerSyncError as err:
         print('ERROR: %s' % err, file=sys.stderr)

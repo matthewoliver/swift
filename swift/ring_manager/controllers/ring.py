@@ -31,7 +31,7 @@ from swift.ring_manager.analysis import RingBuilderAnalysisError, \
 from swift.ring_manager.builder import RingBuilderManagerConflict, \
     RingBuilderManagerError
 from swift.ring_manager.publisher import RingBuilderPublisherError
-from swift.ring_manager.common import NormalTimestamp
+from swift.ring_manager.common import NormalTimestamp, stats_increment
 from swift.ring_manager.routing import Route
 from swift.ring_manager.store import RingAlreadyExists, RingBuildNotFound, \
     RingBuildPublishedVersionConflict, RingBuildStateConflict, \
@@ -90,7 +90,8 @@ class RingController(object):
                  ring_build_executor, build_pool, build_worker,
                  max_json_request_body_size,
                  max_partitions_at_risk_selectors,
-                 file_iterable_factory=http.RingManagerFileIterable):
+                 file_iterable_factory=http.RingManagerFileIterable,
+                 logger=None):
         self._store = store
         self._builder_manager = builder_manager
         self._ring_builder_dir = ring_builder_dir
@@ -102,6 +103,7 @@ class RingController(object):
         self._max_partitions_at_risk_selectors = \
             max_partitions_at_risk_selectors
         self._file_iterable_factory = file_iterable_factory
+        self._logger = logger
 
     def routes(self):
         return [
@@ -820,6 +822,11 @@ class RingController(object):
             if timestamp is None else timestamp
         build = self._store.create_ring_build(
             payload, timestamp, extra=extra)
+        stats_increment(self._logger, 'ring_builds.queued')
+        if config_true_value(str(payload.get('artifact_only', 'false'))):
+            stats_increment(self._logger, 'ring_builds.artifact_only.queued')
+        else:
+            stats_increment(self._logger, 'ring_builds.manifest.queued')
         if self._ring_build_executor == 'manager':
             self._build_pool.spawn_n(self._build_worker.process_jobs)
         return build

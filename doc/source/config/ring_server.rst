@@ -122,6 +122,70 @@ the scoped FIFO queue keep overlapping work safe.
     The request is rejected before a builder is loaded when this limit is
     exceeded.
 
+StatsD metrics
+==============
+
+When ``log_statsd_host`` is configured, the ring-manager server, auth
+middleware, and builder daemon emit low-cardinality metrics through the normal
+Swift logger StatsD client.
+
+Useful server and auth metrics include::
+
+    requests
+    requests.timing
+    return_codes.2
+    return_codes.4
+    return_codes.5
+    errors
+    readonly.rejected_mutations
+    auth.unauthorized
+    auth.unavailable
+
+Build and publication metrics include::
+
+    ring_builds.queued
+    ring_builds.manifest.queued
+    ring_builds.artifact_only.queued
+    ring_builds.claimed
+    ring_builds.completed
+    ring_builds.failed
+    ring_builds.deferred
+    ring_builds.queue.timing
+    ring_builds.build.timing
+    ring_builds.total.timing
+    builders.lock.timeouts
+    builders.rebalance.timing
+    builders.parts_changed
+    artifacts.written
+    artifacts.bytes
+
+State-change hook metrics include::
+
+    state_change_hook.successes
+    state_change_hook.failures
+    state_change_hook.timeouts
+    state_change_hook.timing
+
+``swift-ring-manager-sync`` also emits metrics when invoked with
+``--log-statsd-host``::
+
+    sync.attempts
+    sync.successes
+    sync.failures
+    sync.timing
+    sync.manifest_files.downloaded
+    sync.manifest_files.unchanged
+    sync.rings_synced
+    sync.ring_versions_synced
+    sync.ring_version_files.downloaded
+    sync.ring_version_files.unchanged
+    sync.bytes_downloaded
+
+Metrics intentionally avoid build IDs, ring versions, URLs, device names, and
+artefact file names.
+Use recon and logs for high-cardinality detail.
+Agent and sync-transaction metrics arrive with their respective components.
+
 State change hooks
 ==================
 
@@ -184,6 +248,7 @@ For example::
     swift-ring-manager-sync https://primary.example.com:6205 \
         --ring-manager-state-dir /etc/swift/ring-manager-state \
         --ring-artifact-dir /etc/swift/ring-manager-artifacts \
+        --log-statsd-host 127.0.0.1 \
         --admin-key changeme \
         --state-change-hook /usr/local/bin/ring-manager-state-history
 

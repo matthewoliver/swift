@@ -160,7 +160,7 @@ class TestRingManagerSync(unittest.TestCase):
              'account.ring.gz'): artifact,
         }
 
-    def _syncer(self, opener, time_func=NormalTimestamp.now):
+    def _syncer(self, opener, time_func=NormalTimestamp.now, logger=None):
         return RingManagerSync(
             'http://primary.example.com:6205',
             self.state_dir,
@@ -169,7 +169,7 @@ class TestRingManagerSync(unittest.TestCase):
             timeout=12,
             opener=opener,
             recon_cache_path=self.recon_cache_path,
-            logger=debug_logger(),
+            logger=logger or debug_logger(),
             time_func=time_func)
 
     def _make_state_hook(self):
@@ -189,8 +189,10 @@ class TestRingManagerSync(unittest.TestCase):
 
     def test_sync_latest_manifest_artifacts_and_ring_metadata(self):
         opener = FakeOpener(self._routes())
+        logger = debug_logger()
         result = self._syncer(
-            opener, time_func=lambda: NormalTimestamp(1700000000)).sync()
+            opener, time_func=lambda: NormalTimestamp(1700000000),
+            logger=logger).sync()
         self.assertEqual({
             'latest_ring_version': 'release-1',
             'manifest_files_downloaded': 1,
@@ -277,6 +279,21 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertEqual(200, resp.status_int)
         self.assertEqual(self.artifact_body, resp.body)
 
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync.attempts'])
+        self.assertEqual(1, counts['sync.successes'])
+        self.assertEqual(1, counts['sync.manifest_files.downloaded'])
+        self.assertEqual(0, counts['sync.manifest_files.unchanged'])
+        self.assertEqual(1, counts['sync.rings_synced'])
+        self.assertEqual(1, counts['sync.ring_versions_synced'])
+        self.assertEqual(0, counts['sync.ring_version_files.downloaded'])
+        self.assertEqual(1, counts['sync.ring_version_files.unchanged'])
+        self.assertEqual(len(self.artifact_body),
+                         counts['sync.bytes_downloaded'])
+        self.assertIn(
+            'sync.timing',
+            [call[0][0] for call in logger.statsd_client.calls['timing']])
+
     def test_sync_uses_conditional_request_for_existing_artifact(self):
         local_path = os.path.join(
             self.artifact_dir, 'release-1', 'account.ring.gz')
@@ -334,10 +351,12 @@ class TestRingManagerSync(unittest.TestCase):
                 'account.ring.gz')] = FakeResponse(
                     b'x' * len(self.artifact_body))
         opener = FakeOpener(routes)
+        logger = debug_logger()
 
         with self.assertRaises(RingManagerSyncError) as cm:
             self._syncer(
-                opener, time_func=lambda: NormalTimestamp(1700000123)).sync()
+                opener, time_func=lambda: NormalTimestamp(1700000123),
+                logger=logger).sync()
         self.assertIn('sha256 mismatch', str(cm.exception))
         with open(os.path.join(self.state_dir, 'index.json')) as fp:
             self.assertEqual(
@@ -353,6 +372,9 @@ class TestRingManagerSync(unittest.TestCase):
                          recon_stats['last_attempt'])
         self.assertEqual('1700000123.00000',
                          recon_stats['last_attempted_at'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync.attempts'])
+        self.assertEqual(1, counts['sync.failures'])
 
 
 if __name__ == '__main__':

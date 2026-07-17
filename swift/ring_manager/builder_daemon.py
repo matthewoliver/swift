@@ -23,7 +23,8 @@ from swift.ring_manager.builder import RingBuilderManagerError
 from swift.ring_manager.common import DEFAULT_BUILD_JOB_LEASE_TIMEOUT, \
     DEFAULT_BUILDER_LOCK_TIMEOUT, DEFAULT_RING_ARTIFACT_DIR, \
     DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
-    DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, NormalTimestamp, normal_timestamp
+    DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, NormalTimestamp, normal_timestamp, \
+    stats_increment, stats_timing
 from swift.ring_manager.publisher import RingBuilderPublisher, \
     RingBuilderPublisherDeferred, RingBuilderPublisherError
 from swift.ring_manager.store import RingManagerStore, RingNotFound
@@ -45,7 +46,8 @@ class RingBuildWorker(object):
         self.publisher = publisher
         self.builder_id = builder_id or '%s:%s' % (
             socket.gethostname(), os.getpid())
-        self.logger = logger or get_logger({}, log_route=USER_AGENT)
+        self.logger = logger or get_logger(
+            {}, log_route=USER_AGENT, statsd_tail_prefix=USER_AGENT)
         self.time_func = time_func
         self.lease_timeout = float(lease_timeout)
         if self.lease_timeout <= 0:
@@ -61,6 +63,33 @@ class RingBuildWorker(object):
     def _timestamp(self, timestamp=None):
         timestamp = self.time_func() if timestamp is None else timestamp
         return normal_timestamp(timestamp)
+
+    def _emit_queue_timing(self, job, claimed_at):
+        created_at = job.get('created_at')
+        if created_at is None:
+            return
+        try:
+            elapsed = float(claimed_at) - float(normal_timestamp(created_at))
+        except (TypeError, ValueError):
+            return
+        if elapsed >= 0:
+            stats_timing(self.logger, 'ring_builds.queue.timing', elapsed)
+
+    def _emit_build_attempt_timing(self, started_at, ended_at):
+        elapsed = float(ended_at) - float(started_at)
+        if elapsed >= 0:
+            stats_timing(self.logger, 'ring_builds.build.timing', elapsed)
+
+    def _emit_build_total_timing(self, job, ended_at):
+        created_at = job.get('created_at')
+        if created_at is None:
+            return
+        try:
+            elapsed = float(ended_at) - float(normal_timestamp(created_at))
+        except (TypeError, ValueError):
+            return
+        if elapsed >= 0:
+            stats_timing(self.logger, 'ring_builds.total.timing', elapsed)
 
     def _refresh_lease(self, job):
         now = self._timestamp()
@@ -105,6 +134,8 @@ class RingBuildWorker(object):
             lease_timeout=self.lease_timeout)
         if job is None:
             return None
+        stats_increment(self.logger, 'ring_builds.claimed')
+        self._emit_queue_timing(job, claimed_at)
         stopped, renewer = self._start_lease_renewer(job)
         try:
             try:
@@ -112,6 +143,8 @@ class RingBuildWorker(object):
             except RingBuilderPublisherDeferred as err:
                 now = self._timestamp()
                 retry_after = max(0, int(err.retry_after or 0))
+                stats_increment(self.logger, 'ring_builds.deferred')
+                self._emit_build_attempt_timing(claimed_at, now)
                 self.logger.info(
                     'Ring build %(build_id)s deferred: %(error)s',
                     {'build_id': job['id'], 'error': err})
@@ -127,6 +160,9 @@ class RingBuildWorker(object):
             except (RingNotFound, RingBuilderPublisherError,
                     RingBuilderManagerError, ValueError) as err:
                 completed_at = self._timestamp()
+                stats_increment(self.logger, 'ring_builds.failed')
+                self._emit_build_attempt_timing(claimed_at, completed_at)
+                self._emit_build_total_timing(job, completed_at)
                 self.logger.error(
                     'Ring build %(build_id)s failed: %(error)s',
                     {'build_id': job['id'], 'error': err})
@@ -137,6 +173,9 @@ class RingBuildWorker(object):
                 }, completed_at)
             except Exception as err:
                 completed_at = self._timestamp()
+                stats_increment(self.logger, 'ring_builds.failed')
+                self._emit_build_attempt_timing(claimed_at, completed_at)
+                self._emit_build_total_timing(job, completed_at)
                 self.logger.exception(
                     'Unexpected error while processing ring build %s',
                     job['id'])
@@ -147,6 +186,9 @@ class RingBuildWorker(object):
                 }, completed_at)
 
             completed_at = self._timestamp()
+            stats_increment(self.logger, 'ring_builds.completed')
+            self._emit_build_attempt_timing(claimed_at, completed_at)
+            self._emit_build_total_timing(job, completed_at)
             updates = {
                 'state': 'completed',
                 'completed_at': completed_at.internal,
@@ -174,7 +216,8 @@ class RingManagerBuilder(Daemon):
     def __init__(self, conf):
         conf = conf or {}
         self.conf = conf
-        self.logger = get_logger(conf, log_route=USER_AGENT)
+        self.logger = get_logger(
+            conf, log_route=USER_AGENT, statsd_tail_prefix=USER_AGENT)
         self.state_dir = conf.get(
             'ring_manager_state_dir', DEFAULT_RING_MANAGER_STATE_DIR)
         self.ring_artifact_dir = conf.get(

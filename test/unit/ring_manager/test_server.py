@@ -242,10 +242,19 @@ class TestRingManagerApplication(unittest.TestCase):
             body = None
         return resp, body
 
-    def process_next_build(self):
+    def process_next_build(self, logger=None):
+        publisher = self.app.publisher
+        if logger is not None:
+            publisher = RingBuilderPublisher(
+                self.app.store, ring_artifact_dir=self.artifact_dir,
+                builder_manager=self.app.builder_manager,
+                builder_lock_timeout=self.app.builder_lock_timeout,
+                logger=logger)
+        else:
+            logger = debug_logger()
         worker = RingBuildWorker(
-            self.app.store, self.app.publisher, builder_id='test-builder',
-            logger=debug_logger(), lease_refresh_interval=3600)
+            self.app.store, publisher, builder_id='test-builder',
+            logger=logger, lease_refresh_interval=3600)
         return worker.process_job()
 
     def test_app_factory(self):
@@ -322,6 +331,60 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(self.latest_version, body['latest_ring_version'])
         self.assertEqual('external', body['ring_build_executor'])
         self.assertEqual(0, body['ring_builds']['total'])
+
+    def test_request_statsd_metrics(self):
+        resp, body = self.get_json('/api/v1/rings/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(2, body['meta']['total_count'])
+
+        counts = self.logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['requests'])
+        self.assertEqual(1, counts['return_codes.2'])
+        self.assertIn(
+            'requests.timing',
+            [call[0][0] for call in
+             self.logger.statsd_client.calls['timing']])
+        self.assertIn(
+            'get.timing',
+            [call[0][0] for call in
+             self.logger.statsd_client.calls['timing_since']])
+
+    def test_readonly_mutation_statsd_metric(self):
+        logger = debug_logger()
+        app = RingManagerApplication(
+            {
+                'ring_manager_state_dir': self.state_dir,
+                'ring_artifact_dir': self.artifact_dir,
+                'ring_builder_dir': self.testdir,
+                'ring_manager_mode': 'readonly',
+            }, logger=logger)
+
+        resp, body = self.json_request('/api/v1/rings/1/', 'PATCH', {
+            'name': 'Blocked',
+        }, app=app)
+        self.assertEqual(403, resp.status_int)
+        self.assertIn('mutating requests are disabled', body['error'])
+        self.assertEqual(
+            1, logger.statsd_client.get_stats_counts()[
+                'readonly.rejected_mutations'])
+
+    def test_ring_build_queue_statsd_metrics(self):
+        resp, body = self.json_request('/api/v1/rings/releases/', 'POST', {
+            'version': 'release-stats',
+            'rings': ['1'],
+        })
+        self.assertEqual(202, resp.status_int)
+        self.assertEqual('queued', body['state'])
+
+        resp, body = self.json_request(
+            '/api/v1/rings/1/versions/', 'POST', {'seed': '1'})
+        self.assertEqual(202, resp.status_int)
+        self.assertEqual('queued', body['state'])
+
+        counts = self.logger.statsd_client.get_stats_counts()
+        self.assertEqual(2, counts['ring_builds.queued'])
+        self.assertEqual(1, counts['ring_builds.manifest.queued'])
+        self.assertEqual(1, counts['ring_builds.artifact_only.queued'])
 
     def test_readonly_modes_reject_mutations(self):
         for mode in ('readonly', 'standby'):
@@ -527,7 +590,8 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual('queued', body['state'])
         self.assertTrue(resp.headers['Location'].endswith(
             body['resource_uri']))
-        build = self.process_next_build()
+        logger = debug_logger()
+        build = self.process_next_build(logger=logger)
         self.assertEqual('completed', build['state'])
         body = build['result']
         self.assertEqual('release-demo', body['version'])
@@ -546,6 +610,18 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(
             md5(artifact_body, usedforsecurity=False).hexdigest(),
             body['files'][0]['md5'])
+
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['ring_builds.claimed'])
+        self.assertEqual(1, counts['ring_builds.completed'])
+        self.assertEqual(1, counts['artifacts.written'])
+        self.assertGreater(counts['artifacts.bytes'], 0)
+        timing_metrics = [
+            call[0][0] for call in logger.statsd_client.calls['timing']]
+        self.assertIn('ring_builds.queue.timing', timing_metrics)
+        self.assertIn('ring_builds.build.timing', timing_metrics)
+        self.assertIn('ring_builds.total.timing', timing_metrics)
+        self.assertIn('builders.rebalance.timing', timing_metrics)
 
         resp, artifact = self.get_json(
             '/api/v1/rings/object-0/versions/latest/')
@@ -1068,9 +1144,11 @@ class TestRingManagerApplication(unittest.TestCase):
         publisher.publish.side_effect = RingBuilderPublisherDeferred(
             'wait for min_part_hours', reason='min_part_hours',
             retry_after=60, ring_id='object-0')
+        logger = debug_logger()
         worker = RingBuildWorker(
             self.app.store, publisher, builder_id='test-builder',
             time_func=lambda: NormalTimestamp(1000),
+            logger=logger,
             lease_refresh_interval=3600)
 
         deferred = worker.process_job()
@@ -1080,6 +1158,13 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertIsNone(self.app.store.claim_ring_build(
             'other-builder', NormalTimestamp(1001).internal))
         self.assertEqual(job['id'], deferred['id'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['ring_builds.claimed'])
+        self.assertEqual(1, counts['ring_builds.deferred'])
+        timing_metrics = [
+            call[0][0] for call in logger.statsd_client.calls['timing']]
+        self.assertIn('ring_builds.queue.timing', timing_metrics)
+        self.assertIn('ring_builds.build.timing', timing_metrics)
 
     def test_builder_daemon_marks_bad_job_failed(self):
         job = self.app.store.create_ring_build({
@@ -2834,11 +2919,12 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
 
     def test_store_runs_state_change_hook_after_write_and_delete(self):
         hook_path, log_path = self._make_state_hook()
+        logger = debug_logger()
         store = RingManagerStore(
             self.state_dir,
             state_change_hook='%s %s' % (hook_path, log_path),
             state_change_hook_timeout=5,
-            logger=debug_logger())
+            logger=logger)
         path = os.path.join(self.state_dir, 'rings', 'account.json')
 
         store._write_json_file(path, {'id': 'account'})
@@ -2850,6 +2936,13 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
             ['write', 'rings/account.json', path, self.state_dir],
             ['delete', 'rings/account.json', path, self.state_dir],
         ], lines)
+        self.assertEqual(
+            2, logger.statsd_client.get_stats_counts()[
+                'state_change_hook.successes'])
+        self.assertEqual(
+            ['state_change_hook.timing', 'state_change_hook.timing'],
+            [call[0][0] for call in logger.statsd_client.calls['timing']
+             if call[0][0] == 'state_change_hook.timing'])
 
     def test_store_keeps_write_when_state_hook_fails(self):
         hook_path, log_path = self._make_state_hook(fail=True)
@@ -2867,6 +2960,9 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
             self.assertEqual({'version': 1}, json.load(fp))
         self.assertIn('state change hook exited 3',
                       logger.get_lines_for_level('warning')[-1])
+        self.assertEqual(
+            1, logger.statsd_client.get_stats_counts()[
+                'state_change_hook.failures'])
 
     def test_server_and_builder_configure_state_change_hook(self):
         hook_path, log_path = self._make_state_hook()
@@ -2912,19 +3008,25 @@ class TestRingManagerAuthMiddleware(unittest.TestCase):
         self.assertEqual(200, req.get_response(app).status_int)
 
     def test_missing_keys_fail_closed(self):
+        logger = debug_logger()
         app = RingManagerAuthMiddleware(
-            self.app, {}, logger=debug_logger())
+            self.app, {}, logger=logger)
         self.assertEqual(
             503, Request.blank('/api/v1/rings/').get_response(app).status_int)
         self.assertEqual(
             503, Request.blank(
                 '/api/v1/rings/', method='POST').get_response(app).status_int)
+        self.assertEqual(
+            2, logger.statsd_client.get_stats_counts()['auth.unavailable'])
 
     def test_admin_key_allows_reads_and_writes(self):
+        logger = debug_logger()
         app = RingManagerAuthMiddleware(
-            self.app, {'admin_key': 'secret'}, logger=debug_logger())
+            self.app, {'admin_key': 'secret'}, logger=logger)
         self.assertEqual(
             401, Request.blank('/api/v1/rings/').get_response(app).status_int)
+        self.assertEqual(
+            1, logger.statsd_client.get_stats_counts()['auth.unauthorized'])
 
         headers = {'X-Ring-Manager-Admin-Key': 'secret'}
         self.assertEqual(200, Request.blank(

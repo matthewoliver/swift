@@ -35,6 +35,31 @@ DEFAULT_STATE_CHANGE_HOOK_TIMEOUT = 30
 RESERVED_ARTIFACT_VERSION_IDS = frozenset(('desired', 'latest'))
 
 
+def stats_increment(logger, metric, step=1):
+    if not logger:
+        return
+    try:
+        if step == 1 and hasattr(logger, 'increment'):
+            logger.increment(metric)
+        elif hasattr(logger, 'update_stats'):
+            logger.update_stats(metric, step)
+    except Exception:
+        pass
+
+
+def stats_timing(logger, metric, elapsed):
+    if not logger or not hasattr(logger, 'timing'):
+        return
+    try:
+        logger.timing(metric, float(elapsed) * 1000)
+    except Exception:
+        pass
+
+
+def stats_timing_since(logger, metric, started_at):
+    stats_timing(logger, metric, float(NormalTimestamp.now()) - started_at)
+
+
 class StateChangeHook(object):
     """Best-effort hook for external state history or audit integrations."""
 
@@ -83,6 +108,7 @@ class StateChangeHook(object):
             'RING_MANAGER_STATE_PATH': path,
             'RING_MANAGER_STATE_RELPATH': relpath,
         })
+        started_at = float(NormalTimestamp.now())
         try:
             proc = subprocess.Popen(
                 argv, cwd=self.state_dir, env=env,
@@ -91,20 +117,34 @@ class StateChangeHook(object):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
+            stats_increment(self.logger, 'state_change_hook.timeouts')
+            stats_increment(self.logger, 'state_change_hook.failures')
+            stats_timing_since(
+                self.logger, 'state_change_hook.timing', started_at)
             self._log_warning(
                 'Ring-manager state change hook timed out after %s seconds '
                 'for %s %s', self.timeout, action, relpath)
             return
         except (OSError, ValueError) as err:
+            stats_increment(self.logger, 'state_change_hook.failures')
+            stats_timing_since(
+                self.logger, 'state_change_hook.timing', started_at)
             self._log_warning(
                 'Unable to run ring-manager state change hook %r for %s %s: '
                 '%s', self.command, action, relpath, err)
             return
         if proc.returncode:
+            stats_increment(self.logger, 'state_change_hook.failures')
+            stats_timing_since(
+                self.logger, 'state_change_hook.timing', started_at)
             output = (stderr or stdout or b'').decode('utf-8', 'replace')
             self._log_warning(
                 'Ring-manager state change hook exited %s for %s %s: %s',
                 proc.returncode, action, relpath, output.strip())
+            return
+        stats_increment(self.logger, 'state_change_hook.successes')
+        stats_timing_since(self.logger, 'state_change_hook.timing',
+                           started_at)
 
 
 def validate_path_component(value, field_name):

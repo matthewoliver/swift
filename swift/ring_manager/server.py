@@ -29,7 +29,8 @@ from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
     DEFAULT_BUILD_JOB_LEASE_TIMEOUT, DEFAULT_RING_ARTIFACT_DIR, \
     DEFAULT_RING_BUILD_EXECUTOR, DEFAULT_RING_BUILD_MANAGER_WORKERS, \
     DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
-    DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, NormalTimestamp, RING_BUILD_EXECUTORS
+    DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, NormalTimestamp, RING_BUILD_EXECUTORS, \
+    stats_increment, stats_timing_since
 from swift.ring_manager.controllers import ring as ring_controller
 from swift.ring_manager import http, routing
 from swift.ring_manager.builder_daemon import RingBuildWorker
@@ -129,7 +130,8 @@ class RingManagerApplication(object):
             build_worker=self.build_worker,
             max_json_request_body_size=self.max_json_request_body_size,
             max_partitions_at_risk_selectors=(
-                self.max_partitions_at_risk_selectors))
+                self.max_partitions_at_risk_selectors),
+            logger=self.logger)
         self.routes = self._make_routes()
 
     @property
@@ -162,6 +164,7 @@ class RingManagerApplication(object):
             })
 
     def _readonly_response(self, req):
+        stats_increment(self.logger, 'readonly.rejected_mutations')
         return http.json_error(
             req, HTTPForbidden,
             'ring-manager is running in %s mode; mutating requests are '
@@ -198,6 +201,7 @@ class RingManagerApplication(object):
         start_time = float(NormalTimestamp.now())
         req = Request(env)
         self.logger.txn_id = req.headers.get('x-trans-id', None)
+        stats_increment(self.logger, 'requests')
         try:
             res = self._dispatch(req)
         except HTTPException as error_response:
@@ -211,7 +215,12 @@ class RingManagerApplication(object):
             res = http.json_error(
                 req, HTTPInternalServerError, 'Internal server error')
         trans_time = float(NormalTimestamp.now()) - start_time
+        status_int = getattr(res, 'status_int', 500)
+        stats_increment(self.logger, 'return_codes.%d' % (status_int // 100))
+        if status_int >= 500:
+            stats_increment(self.logger, 'errors')
         self.logger.timing_since('%s.timing' % req.method.lower(), start_time)
+        stats_timing_since(self.logger, 'requests.timing', start_time)
         self._log_request(req, res, trans_time)
         return res(env, start_response)
 

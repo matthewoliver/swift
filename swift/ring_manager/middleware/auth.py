@@ -13,7 +13,7 @@
 
 from swift.common.swob import HTTPServiceUnavailable, HTTPUnauthorized, Request
 from swift.common.utils import config_true_value, get_logger, streq_const_time
-from swift.ring_manager.common import load_secret_from_conf
+from swift.ring_manager.common import load_secret_from_conf, stats_increment
 
 
 READ_METHODS = ('GET', 'HEAD')
@@ -25,7 +25,8 @@ class RingManagerAuthMiddleware(object):
     def __init__(self, app, conf, logger=None):
         self.app = app
         self.logger = logger or get_logger(
-            conf, log_route='ring-manager-auth')
+            conf, log_route='ring-manager-auth',
+            statsd_tail_prefix='ring-manager-auth')
         self.admin_key = load_secret_from_conf(
             conf, ('admin_key', 'ring_manager_admin_key'),
             ('admin_key_file', 'ring_manager_admin_key_file')) or ''
@@ -95,11 +96,13 @@ class RingManagerAuthMiddleware(object):
         if self.allow_unauthenticated:
             return self.app(env, start_response)
         if not self._has_key_for_request(req):
+            stats_increment(self.logger, 'auth.unavailable')
             return HTTPServiceUnavailable(
                 request=req, body=self._missing_key_message(req))(
                     env, start_response)
         if self._authorized(req):
             return self.app(env, start_response)
+        stats_increment(self.logger, 'auth.unauthorized')
         return HTTPUnauthorized(request=req)(env, start_response)
 
 

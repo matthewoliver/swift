@@ -23,7 +23,8 @@ from swift.common.utils import config_true_value, lock_file, md5, mkdirs
 from swift.ring_manager.builder import RingBuilderManager, \
     RingBuilderManagerError, save_builder_durable
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
-    NormalTimestamp, normal_timestamp, validate_artifact_version_id
+    NormalTimestamp, normal_timestamp, stats_increment, stats_timing, \
+    validate_artifact_version_id
 from swift.ring_manager.store import RingVersionNotFound
 
 
@@ -54,9 +55,12 @@ class RingBuilderPublisher(object):
         self.builder_manager = builder_manager or RingBuilderManager(
             ring_builder_dir, builder_lock_timeout=builder_lock_timeout)
 
-    def _timestamp_internal(self, timestamp=None):
+    def _timestamp(self, timestamp=None):
         timestamp = self.time_func() if timestamp is None else timestamp
-        return normal_timestamp(timestamp).internal
+        return normal_timestamp(timestamp)
+
+    def _timestamp_internal(self, timestamp=None):
+        return self._timestamp(timestamp).internal
 
     def _artifact_name(self, ring):
         ring_id = ring.get('id')
@@ -209,6 +213,7 @@ class RingBuilderPublisher(object):
                         lock_path, timeout=self.builder_lock_timeout,
                         unlink=False))
                 except swift_exceptions.LockTimeout:
+                    stats_increment(self.logger, 'builders.lock.timeouts')
                     raise RingBuilderPublisherError(
                         'timed out waiting for builder lock for ring %s' %
                         ring_id)
@@ -303,6 +308,7 @@ class RingBuilderPublisher(object):
                 'ring %s has no builder devices to build' % ring.get('id'))
         needs_rebalance = self._builder_needs_rebalance(builder)
         min_part_seconds_left = builder.min_part_seconds_left
+        rebalance_started_at = self._timestamp()
         try:
             changed_parts, balance, removed_devs = builder.rebalance(
                 seed=seed)
@@ -314,6 +320,10 @@ class RingBuilderPublisher(object):
         except swift_exceptions.RingBuilderError as err:
             raise RingBuilderPublisherError(
                 'ring %s build failed: %s' % (ring.get('id'), err))
+        finally:
+            stats_timing(
+                self.logger, 'builders.rebalance.timing',
+                float(self._timestamp()) - float(rebalance_started_at))
 
         artifact_name = self._artifact_name(ring)
         artifact_path = self._artifact_path(publish_version, artifact_name)
@@ -323,6 +333,11 @@ class RingBuilderPublisher(object):
         save_builder_durable(builder, builder_path)
         file_info = self._artifact_info(
             publish_version, artifact_name, artifact_path)
+        stats_increment(self.logger, 'artifacts.written')
+        stats_increment(self.logger, 'artifacts.bytes', file_info['bytes'])
+        if changed_parts:
+            stats_increment(
+                self.logger, 'builders.parts_changed', changed_parts)
         ring_id = ring['id']
         swift_ring_version = builder.version
         ring_version = {
@@ -373,6 +388,7 @@ class RingBuilderPublisher(object):
                     ring, publish_version, created_at, seed=seed,
                     format_version=format_version)
         except swift_exceptions.LockTimeout:
+            stats_increment(self.logger, 'builders.lock.timeouts')
             raise RingBuilderPublisherError(
                 'timed out waiting for builder lock for ring %s' %
                 ring.get('id'))
