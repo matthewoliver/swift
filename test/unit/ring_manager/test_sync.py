@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from swift.common.recon import RECON_RING_MANAGER_FILE
 from swift.common.swob import Request
 from swift.common.utils import md5
+from swift.ring_manager.common import NormalTimestamp
 from swift.ring_manager.server import RingManagerApplication
 from swift.ring_manager.sync import RingManagerSync, RingManagerSyncError
 from test.debug_logger import debug_logger
@@ -159,7 +160,7 @@ class TestRingManagerSync(unittest.TestCase):
              'account.ring.gz'): artifact,
         }
 
-    def _syncer(self, opener):
+    def _syncer(self, opener, time_func=NormalTimestamp.now):
         return RingManagerSync(
             'http://primary.example.com:6205',
             self.state_dir,
@@ -168,7 +169,8 @@ class TestRingManagerSync(unittest.TestCase):
             timeout=12,
             opener=opener,
             recon_cache_path=self.recon_cache_path,
-            logger=debug_logger())
+            logger=debug_logger(),
+            time_func=time_func)
 
     def _read_recon(self):
         with open(os.path.join(
@@ -177,7 +179,8 @@ class TestRingManagerSync(unittest.TestCase):
 
     def test_sync_latest_manifest_artifacts_and_ring_metadata(self):
         opener = FakeOpener(self._routes())
-        result = self._syncer(opener).sync()
+        result = self._syncer(
+            opener, time_func=lambda: NormalTimestamp(1700000000)).sync()
         self.assertEqual({
             'latest_ring_version': 'release-1',
             'manifest_files_downloaded': 1,
@@ -198,7 +201,8 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertEqual('release-1', index['latest_ring_version'])
         self.assertEqual('http://primary.example.com:6205',
                          index['ring_manager_sync']['source'])
-        self.assertIn('synced_at', index['ring_manager_sync'])
+        self.assertEqual('1700000000.00000',
+                         index['ring_manager_sync']['synced_at'])
 
         recon_stats = self._read_recon()['ring_manager_sync']
         self.assertTrue(recon_stats['success'])
@@ -208,9 +212,15 @@ class TestRingManagerSync(unittest.TestCase):
                          recon_stats['latest_ring_version'])
         self.assertEqual(1, recon_stats['manifest_files_downloaded'])
         self.assertEqual(1, recon_stats['rings_synced'])
-        self.assertIn('sync_time', recon_stats)
-        self.assertIn('last_success', recon_stats)
-        self.assertIn('last_synced_at', recon_stats)
+        self.assertEqual(0.0, recon_stats['sync_time'])
+        self.assertEqual('1700000000.00000',
+                         recon_stats['last_attempt'])
+        self.assertEqual('1700000000.00000',
+                         recon_stats['last_attempted_at'])
+        self.assertEqual('1700000000.00000',
+                         recon_stats['last_success'])
+        self.assertEqual('1700000000.00000',
+                         recon_stats['last_synced_at'])
         self.assertNotIn('error', recon_stats)
 
         with open(os.path.join(
@@ -291,7 +301,8 @@ class TestRingManagerSync(unittest.TestCase):
         opener = FakeOpener(routes)
 
         with self.assertRaises(RingManagerSyncError) as cm:
-            self._syncer(opener).sync()
+            self._syncer(
+                opener, time_func=lambda: NormalTimestamp(1700000123)).sync()
         self.assertIn('sha256 mismatch', str(cm.exception))
         with open(os.path.join(self.state_dir, 'index.json')) as fp:
             self.assertEqual(
@@ -302,7 +313,11 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertEqual('http://primary.example.com:6205',
                          recon_stats['source'])
         self.assertIn('sha256 mismatch', recon_stats['error'])
-        self.assertIn('sync_time', recon_stats)
+        self.assertEqual(0.0, recon_stats['sync_time'])
+        self.assertEqual('1700000123.00000',
+                         recon_stats['last_attempt'])
+        self.assertEqual('1700000123.00000',
+                         recon_stats['last_attempted_at'])
 
 
 if __name__ == '__main__':

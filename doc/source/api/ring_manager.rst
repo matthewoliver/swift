@@ -261,6 +261,9 @@ It does not make source-fallback, freshness, promotion, or transaction
 guarantees beyond advancing the local latest pointer last.
 Its latest success or error is available from /recon/ring_manager when the
 recon middleware is configured.
+State and recon timestamp fields use Swift ``NormalTimestamp.internal``
+strings, such as ``1700000000.00000``; elapsed sync time remains numeric
+seconds.
 
 Per-ring artifact builds
 ========================

@@ -17,7 +17,6 @@ import json
 import optparse
 import os
 import sys
-import time
 import uuid
 
 from urllib.parse import quote, urljoin
@@ -27,6 +26,7 @@ from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
     RECON_RING_MANAGER_FILE
 from swift.common.utils import NullLogger, dump_recon_cache, get_logger, mkdirs
 from swift.common.utils import md5
+from swift.ring_manager.common import NormalTimestamp, normal_timestamp
 
 
 USER_AGENT = 'swift-ring-manager-sync'
@@ -48,7 +48,7 @@ class RingManagerSync(object):
     def __init__(self, source_url, state_dir, artifact_dir, admin_key=None,
                  auth_token=None, timeout=30, opener=None,
                  recon_cache_path=DEFAULT_RECON_CACHE_PATH, recon_dump=True,
-                 logger=None):
+                 logger=None, time_func=NormalTimestamp.now):
         if not source_url:
             raise RingManagerSyncError('source_url is required')
         if not state_dir:
@@ -67,10 +67,11 @@ class RingManagerSync(object):
             self.recon_cache_path, RECON_RING_MANAGER_FILE)
         self.recon_dump = recon_dump
         self.logger = logger or NullLogger()
+        self.time_func = time_func
 
-    def _utc_timestamp(self, timestamp=None):
-        timestamp = time.time() if timestamp is None else timestamp
-        return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(timestamp))
+    def _timestamp(self, timestamp=None):
+        timestamp = self.time_func() if timestamp is None else timestamp
+        return normal_timestamp(timestamp)
 
     def _safe_id(self, value):
         return quote(str(value), safe='')
@@ -362,29 +363,29 @@ class RingManagerSync(object):
         stats.update({
             'source': self.source_url,
             'success': True,
-            'sync_time': ended_at - started_at,
-            'last_attempt': ended_at,
+            'sync_time': float(ended_at) - float(started_at),
+            'last_attempt': ended_at.internal,
             'last_attempted_at': synced_at,
-            'last_success': ended_at,
+            'last_success': ended_at.internal,
             'last_synced_at': synced_at,
             'error': {},
         })
         return stats
 
     def _failure_stats(self, started_at, err):
-        ended_at = time.time()
-        attempted_at = self._utc_timestamp(ended_at)
+        ended_at = self._timestamp()
+        attempted_at = ended_at.internal
         return {
             'source': self.source_url,
             'success': False,
-            'sync_time': ended_at - started_at,
-            'last_attempt': ended_at,
+            'sync_time': float(ended_at) - float(started_at),
+            'last_attempt': ended_at.internal,
             'last_attempted_at': attempted_at,
             'error': str(err),
         }
 
     def sync(self):
-        started_at = time.time()
+        started_at = self._timestamp()
         try:
             manifest = self._json_request(
                 '/api/v1/rings/releases/latest/manifest/')
@@ -398,8 +399,8 @@ class RingManagerSync(object):
                 self._state_path(
                     'releases', self._safe_id(version), 'manifest.json'),
                 local_manifest)
-            ended_at = time.time()
-            synced_at = self._utc_timestamp(ended_at)
+            ended_at = self._timestamp()
+            synced_at = ended_at.internal
             self._write_latest(version, synced_at)
 
             result = {
