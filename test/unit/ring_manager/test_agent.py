@@ -20,7 +20,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import swift.ring_manager.agent as agent_mod
 from swift.common.concurrency import urllib_request
@@ -352,6 +352,332 @@ class TestRingManagerAgent(unittest.TestCase):
         self.assertEqual(1, counts['agent.observe.files_invalid'])
         self.assertEqual(1, counts['agent.operator_attention'])
 
+    def test_validate_only_reads_selected_manifest_without_writes(self):
+        ring_path = self._write_ring()
+        with open(ring_path, 'rb') as fp:
+            ring_body = fp.read()
+        os.makedirs(os.path.dirname(self.state_file))
+        with open(self.state_file, 'wb') as fp:
+            fp.write(b'previous state\n')
+        journal_path = os.path.join(self.swift_dir, INSTALL_JOURNAL)
+        with open(journal_path, 'wb') as fp:
+            fp.write(b'previous journal\n')
+        release = 'baseline / 1'
+        manifest = self._manifest_for_version(release, ring_body)
+        manifest_path = '/api/v1/rings/releases/%s/manifest/' % quote(
+            release, safe='')
+        opener = FakeOpener({
+            ('GET', 'ring.example.com:6205', manifest_path):
+                json_response(manifest),
+        })
+        before = dict((name, open(
+            os.path.join(self.swift_dir, name), 'rb').read())
+            for name in os.listdir(self.swift_dir))
+
+        result = self._agent(
+            opener, mode='validate-only', release=release).run_once()
+
+        self.assertTrue(result['converged'])
+        self.assertEqual(release, result['release_selector'])
+        self.assertEqual(1, result['files_matching'])
+        self.assertEqual('matching', result['files'][0]['status'])
+        self.assertEqual('valid', result['files'][0]['ring_status'])
+        self.assertEqual(manifest_path, opener.requests[0]['path'])
+        self.assertEqual(1, len(opener.requests))
+        after = dict((name, open(
+            os.path.join(self.swift_dir, name), 'rb').read())
+            for name in os.listdir(self.swift_dir))
+        self.assertEqual(before, after)
+        with open(self.state_file, 'rb') as fp:
+            self.assertEqual(b'previous state\n', fp.read())
+        with open(journal_path, 'rb') as fp:
+            self.assertEqual(b'previous journal\n', fp.read())
+
+        stats = self._recon_stats()
+        self.assertEqual('validate-only', stats['mode'])
+        self.assertEqual(release, stats['release_selector'])
+        self.assertEqual(release, stats['release'])
+        self.assertEqual(
+            'https://ring.example.com:6205', stats['validation_source'])
+        self.assertEqual('matching',
+                         stats['validation_files'][0]['status'])
+        self.assertIn('install_journal_present',
+                      stats['operator_attention']['reasons'])
+
+    def test_validate_only_reports_all_comparison_states(self):
+        local_bodies = {}
+        for name in ('account.ring.gz', 'container.ring.gz',
+                     'object.ring.gz', 'object-2.ring.gz'):
+            path = self._write_ring(name)
+            with open(path, 'rb') as fp:
+                local_bodies[name] = fp.read()
+        error_name = 'object-1.ring.gz'
+        error_body = b'not a swift ring'
+        error_path = os.path.join(self.swift_dir, error_name)
+        with open(error_path, 'wb') as fp:
+            fp.write(error_body)
+        local_bodies[error_name] = error_body
+
+        def file_info(name, body, sha256=True):
+            info = {
+                'name': name,
+                'bytes': len(body),
+            }
+            if sha256:
+                info['sha256'] = hashlib.sha256(body).hexdigest()
+            return info
+
+        manifest = self._manifest_for_version('baseline-1')
+        manifest['files'] = [
+            file_info('account.ring.gz', local_bodies['account.ring.gz']),
+            dict(file_info(
+                'container.ring.gz', local_bodies['container.ring.gz']),
+                sha256='0' * 64),
+            file_info(
+                'object.ring.gz', local_bodies['object.ring.gz'],
+                sha256=False),
+            file_info(error_name, error_body),
+            file_info('object-3.ring.gz', b'missing ring'),
+        ]
+        manifest_path = \
+            '/api/v1/rings/releases/baseline-1/manifest/'
+        opener = FakeOpener({
+            ('GET', 'ring.example.com:6205', manifest_path):
+                json_response(manifest),
+        })
+        logger = debug_logger()
+
+        result = self._agent(
+            opener, logger=logger, mode='validate-only',
+            release='baseline-1').validate_once()
+
+        self.assertFalse(result['converged'])
+        self.assertEqual(5, result['files_expected'])
+        self.assertEqual(5, result['files_local'])
+        self.assertEqual({
+            'account.ring.gz': 'matching',
+            'container.ring.gz': 'stale',
+            'object.ring.gz': 'unknown',
+            'object-1.ring.gz': 'error',
+            'object-2.ring.gz': 'extra',
+            'object-3.ring.gz': 'missing',
+        }, dict((item['name'], item['status'])
+                for item in result['files']))
+        self.assertEqual(1, result['files_matching'])
+        self.assertEqual(1, result['files_stale'])
+        self.assertEqual(1, result['files_missing'])
+        self.assertEqual(1, result['files_unknown'])
+        self.assertEqual(1, result['files_extra'])
+        self.assertEqual(1, result['files_error'])
+        error = next(item for item in result['files']
+                     if item['status'] == 'error')
+        self.assertEqual(hashlib.sha256(error_body).hexdigest(),
+                         error['sha256'])
+        self.assertEqual('error', error['ring_status'])
+
+        stats = self._recon_stats()
+        self.assertTrue(stats['success'])
+        self.assertFalse(stats['converged'])
+        self.assertEqual(
+            ['ring_validation_not_converged'],
+            stats['operator_attention']['reasons'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['agent.validate.attempts'])
+        self.assertEqual(1, counts['agent.validate.successes'])
+        self.assertEqual(1, counts['agent.validate.not_converged'])
+        for status in ('matching', 'stale', 'missing', 'unknown', 'extra',
+                       'error'):
+            self.assertEqual(
+                1, counts['agent.validate.files_%s' % status])
+
+    def test_validate_only_requires_size_and_usable_sha256(self):
+        paths = [
+            self._write_ring('account.ring.gz'),
+            self._write_ring('container.ring.gz'),
+        ]
+        bodies = []
+        for path in paths:
+            with open(path, 'rb') as fp:
+                bodies.append(fp.read())
+        manifest = self._manifest_for_version('baseline-1')
+        manifest['files'] = [
+            {
+                'name': 'account.ring.gz',
+                'bytes': len(bodies[0]) + 1,
+                'sha256': hashlib.sha256(bodies[0]).hexdigest(),
+            },
+            {
+                'name': 'container.ring.gz',
+                'bytes': len(bodies[1]),
+                'sha256': '+' + '0' * 63,
+            },
+        ]
+        manifest_path = \
+            '/api/v1/rings/releases/baseline-1/manifest/'
+        opener = FakeOpener({
+            ('GET', 'ring.example.com:6205', manifest_path):
+                json_response(manifest),
+        })
+
+        result = self._agent(
+            opener, mode='validate-only',
+            release='baseline-1').validate_once()
+
+        self.assertEqual({
+            'account.ring.gz': 'stale',
+            'container.ring.gz': 'unknown',
+        }, dict((item['name'], item['status'])
+                for item in result['files']))
+        self.assertEqual(1, result['files_stale'])
+        self.assertEqual(1, result['files_unknown'])
+
+    def test_validate_only_falls_back_after_source_failure(self):
+        ring_path = self._write_ring()
+        with open(ring_path, 'rb') as fp:
+            ring_body = fp.read()
+        manifest = self._manifest_for_version('baseline-1', ring_body)
+        manifest_path = \
+            '/api/v1/rings/releases/baseline-1/manifest/'
+
+        def fail_primary(_request):
+            raise urllib_request.URLError('down')
+
+        opener = FakeOpener({
+            ('GET', 'primary.example.com:6205', manifest_path): fail_primary,
+            ('GET', 'secondary.example.com:6205', manifest_path):
+                json_response(manifest),
+        })
+        agent = self._agent(
+            opener, mode='validate-only', release='baseline-1',
+            urls='https://primary.example.com:6205, '
+                 'https://secondary.example.com:6205')
+
+        result = agent.validate_once()
+
+        self.assertTrue(result['converged'])
+        self.assertEqual(2, len(opener.requests))
+        stats = self._recon_stats()
+        self.assertEqual(
+            'https://secondary.example.com:6205',
+            stats['validation_source'])
+        self.assertEqual(1, len(stats['source_errors']))
+        self.assertIn('down', stats['source_errors'][0]['error'])
+
+    def test_validate_only_can_explicitly_select_latest(self):
+        ring_path = self._write_ring()
+        with open(ring_path, 'rb') as fp:
+            ring_body = fp.read()
+        manifest = self._manifest_for_version('release-7', ring_body)
+        manifest_path = '/api/v1/rings/releases/latest/manifest/'
+        opener = FakeOpener({
+            ('GET', 'ring.example.com:6205', manifest_path):
+                json_response(manifest),
+        })
+
+        result = self._agent(
+            opener, mode='validate-only', release='latest').validate_once()
+
+        self.assertTrue(result['converged'])
+        self.assertEqual('latest', result['release_selector'])
+        self.assertEqual('release-7', result['release'])
+        self.assertEqual(manifest_path, opener.requests[0]['path'])
+
+    def test_validate_only_local_failure_does_not_fall_back_or_write(self):
+        manifest = self._manifest_for_version('baseline-1')
+        manifest_path = \
+            '/api/v1/rings/releases/baseline-1/manifest/'
+        opener = FakeOpener({
+            ('GET', 'primary.example.com:6205', manifest_path):
+                json_response(manifest),
+            ('GET', 'secondary.example.com:6205', manifest_path):
+                json_response(manifest),
+        })
+        logger = debug_logger()
+        agent = self._agent(
+            opener, logger=logger, mode='validate-only',
+            release='baseline-1',
+            urls='https://primary.example.com:6205, '
+                 'https://secondary.example.com:6205')
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            agent.validate_once()
+
+        self.assertIn('unable to inventory local rings', str(cm.exception))
+        self.assertEqual(1, len(opener.requests))
+        self.assertFalse(os.path.exists(self.swift_dir))
+        self.assertFalse(os.path.exists(self.state_file))
+        stats = self._recon_stats()
+        self.assertFalse(stats['success'])
+        self.assertEqual('validate-only', stats['mode'])
+        self.assertIn('validation_time', stats)
+        self.assertNotIn('sync_time', stats)
+        self.assertEqual(1, len(stats['source_errors']))
+        self.assertIn('local_failure',
+                      stats['operator_attention']['reasons'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['agent.validate.attempts'])
+        self.assertEqual(1, counts['agent.validate.failures'])
+
+    def test_validate_only_rejects_wrong_manifest_version(self):
+        os.makedirs(self.swift_dir)
+        manifest = self._manifest_for_version('another-release')
+        manifest_path = \
+            '/api/v1/rings/releases/baseline-1/manifest/'
+        opener = FakeOpener({
+            ('GET', 'ring.example.com:6205', manifest_path):
+                json_response(manifest),
+        })
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(
+                opener, mode='validate-only',
+                release='baseline-1').validate_once()
+
+        self.assertIn(
+            'selected release baseline-1 returned manifest version '
+            'another-release', str(cm.exception))
+        self.assertEqual(1, len(opener.requests))
+        stats = self._recon_stats()
+        self.assertEqual(1, len(stats['source_errors']))
+
+    def test_validate_only_rejects_empty_or_non_ring_manifest(self):
+        os.makedirs(self.swift_dir)
+        manifest_path = \
+            '/api/v1/rings/releases/baseline-1/manifest/'
+        cases = (
+            ([], 'selected manifest contains no ring files'),
+            ([{
+                'name': 'notes.txt',
+                'bytes': 0,
+                'sha256': hashlib.sha256(b'').hexdigest(),
+            }], 'selected manifest file notes.txt is not a ring file'),
+        )
+        for files, expected_error in cases:
+            manifest = self._manifest_for_version('baseline-1')
+            manifest['files'] = files
+            opener = FakeOpener({
+                ('GET', 'ring.example.com:6205', manifest_path):
+                    json_response(manifest),
+            })
+            with self.subTest(files=files):
+                with self.assertRaises(RingManagerAgentError) as cm:
+                    self._agent(
+                        opener, mode='validate-only',
+                        release='baseline-1').validate_once()
+                self.assertIn(expected_error, str(cm.exception))
+                self.assertEqual(1, len(opener.requests))
+
+    def test_validate_only_rejects_release_dot_segments(self):
+        opener = FakeOpener({})
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(
+                opener, mode='validate-only', release='..')
+
+        self.assertIn('release manifest URL must not contain dot segments',
+                      str(cm.exception))
+        self.assertEqual([], opener.requests)
+
     def test_observe_mode_does_not_create_missing_swift_dir(self):
         logger = debug_logger()
 
@@ -366,6 +692,10 @@ class TestRingManagerAgent(unittest.TestCase):
         stats = self._recon_stats()
         self.assertFalse(stats['success'])
         self.assertEqual('observe', stats['mode'])
+        self.assertIn('observe_time', stats)
+        self.assertNotIn('sync_time', stats)
+        self.assertNotIn('sources', stats)
+        self.assertNotIn('source_errors', stats)
         self.assertIn('local_failure',
                       stats['operator_attention']['reasons'])
         counts = logger.statsd_client.get_stats_counts()
@@ -373,15 +703,72 @@ class TestRingManagerAgent(unittest.TestCase):
         self.assertEqual(1, counts['agent.observe.failures'])
         self.assertNotIn('agent.observe.successes', counts)
 
+    def test_recon_clears_fields_when_mode_changes(self):
+        self._write_ring()
+        self._agent(
+            FakeOpener({}), urls='', mode='observe').run_once()
+        stats = self._recon_stats()
+        self.assertIn('files_observed', stats)
+        self.assertIn('files', stats)
+        self.assertIn('observe_time', stats)
+
+        self._agent(FakeOpener(self._routes())).run_once()
+        stats = self._recon_stats()
+        self.assertEqual('enforce', stats['mode'])
+        for field in agent_mod.OBSERVE_RECON_FIELDS:
+            self.assertNotIn(field, stats)
+        self.assertIn('latest_ring_version', stats)
+        self.assertIn('source', stats)
+
+        ring_path = self._write_ring(version=8)
+        with open(ring_path, 'rb') as fp:
+            ring_body = fp.read()
+        manifest = self._manifest_for_version('baseline-1', ring_body)
+        manifest_path = \
+            '/api/v1/rings/releases/baseline-1/manifest/'
+        self._agent(FakeOpener({
+            ('GET', 'ring.example.com:6205', manifest_path):
+                json_response(manifest),
+        }), mode='validate-only', release='baseline-1').run_once()
+        stats = self._recon_stats()
+        self.assertEqual('validate-only', stats['mode'])
+        for field in (set(agent_mod.ENFORCE_RECON_FIELDS) |
+                      set(agent_mod.OBSERVE_RECON_FIELDS)):
+            self.assertNotIn(field, stats)
+        self.assertIn('validation_files', stats)
+        self.assertIn('last_validated_at', stats)
+
+        self._agent(
+            FakeOpener({}), urls='', mode='observe').run_once()
+        stats = self._recon_stats()
+        self.assertEqual('observe', stats['mode'])
+        for field in agent_mod.ENFORCE_RECON_FIELDS:
+            self.assertNotIn(field, stats)
+        for field in agent_mod.VALIDATE_RECON_FIELDS:
+            self.assertNotIn(field, stats)
+        self.assertIn('files_observed', stats)
+        self.assertIn('files', stats)
+
     def test_agent_mode_validation_and_url_requirement(self):
         with self.assertRaises(RingManagerAgentError) as cm:
             self._agent(FakeOpener({}), mode='invalid')
-        self.assertIn('mode must be one of enforce, observe',
+        self.assertIn('mode must be one of enforce, observe, validate-only',
                       str(cm.exception))
 
         with self.assertRaises(RingManagerAgentError) as cm:
             self._agent(FakeOpener({}), urls='', mode='enforce')
         self.assertIn('ring_manager_urls is required', str(cm.exception))
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(FakeOpener({}), mode='validate-only')
+        self.assertIn('release is required in validate-only mode',
+                      str(cm.exception))
+
+        with self.assertRaises(RingManagerAgentError) as cm:
+            self._agent(
+                FakeOpener({}), mode='enforce', release='baseline-1')
+        self.assertIn('release is only valid in validate-only mode',
+                      str(cm.exception))
 
     def test_sync_once_rejects_older_manifest_than_state(self):
         os.makedirs(self.swift_dir)

@@ -12,10 +12,10 @@
 .\" See the License for the specific language governing permissions and
 .\" limitations under the License.
 .\"
-.TH SWIFT-RING-MANAGER-AGENT "1" "May 2026" "OpenStack Swift"
+.TH SWIFT-RING-MANAGER-AGENT "1" "July 2026" "OpenStack Swift"
 
 .SH NAME
-swift\-ring\-manager\-agent \- observe or install Swift ring files
+swift\-ring\-manager\-agent \- observe, validate, or install Swift ring files
 
 .SH SYNOPSIS
 .B swift\-ring\-manager\-agent
@@ -24,10 +24,16 @@ swift\-ring\-manager\-agent \- observe or install Swift ring files
 .SH DESCRIPTION
 .PP
 .B swift-ring-manager-agent
-is a storage-node daemon with enforce and observe modes. Enforce mode polls
-ring-manager for the latest published manifest and installs verified files.
-Observe mode inventories and validates local ring files without contacting
-ring-manager or writing under the Swift configuration directory.
+is a storage-node daemon with enforce, observe, and validate-only modes.
+Enforce mode polls one
+or more ring-manager servers for the latest published ring manifest, downloads
+changed ring artifacts, verifies their byte counts and SHA-256 checksums, and
+installs them into the local Swift configuration directory. Installs are
+performed under a local agent lock with staged files, an install journal, and
+rollback backups. Observe mode inventories and validates local ring files
+without contacting ring-manager or writing under the Swift configuration
+directory. Validate-only mode fetches one selected release manifest and
+compares it with local ring files without downloading or installing artifacts.
 .PP
 The daemon is intended to be managed with
 .B swift-init
@@ -51,11 +57,31 @@ The service reads the
 .B [ring-manager-agent]
 section from the supplied config file.
 .TP
+\fBmode\fR
+Agent operating mode. The default is
+.B enforce.
+.B observe
+only reads local
+.B *.ring.gz
+files and reports their metadata and validation status.
+.B validate-only
+compares local files with the release selected by
+.B release
+without changing them.
+.TP
 \fBring_manager_urls\fR
 Comma-separated list of ring-manager base URLs. The agent tries each URL in
 order until one sync succeeds. Source fallback is only used for source,
 manifest, or download failures; a local install, journal, backup cleanup, or
-state write failure aborts the whole sync attempt.
+state write failure aborts the whole sync attempt. This option is required in
+enforce and validate-only modes and unused in observe mode.
+.TP
+\fBrelease\fR
+Release selector required in validate-only mode. Use an immutable release id
+for a stable known baseline. The special value
+.B latest
+explicitly follows the moving latest pointer.
+This option is rejected in enforce and observe modes.
 .TP
 \fBread_key\fR
 Optional value sent as
@@ -94,9 +120,14 @@ Additional random delay in seconds. The default is 30.
 \fBrequest_timeout\fR
 HTTP request timeout in seconds. The default is 30.
 .TP
+\fBallow_ring_version_rollback\fR
+In enforce mode, allow installation of a latest manifest older than the last
+installed manifest. The default is false. This option does not affect
+validate-only comparisons.
+.TP
 \fBlock_timeout\fR
 Maximum time in seconds to wait for the local agent install lock. The default
-is 10.
+is 10. Observe and validate-only do not take this lock.
 .TP
 \fBswift_dir\fR
 Directory where ring files are installed. The default is
@@ -109,6 +140,8 @@ Directory for recon cache data. The default is
 \fBstate_file\fR
 Path for the local JSON state file. The default is
 .B /var/cache/swift/ring-manager-agent-state.json.
+It records the last installed manifest in enforce mode.
+Validate-only does not read or write this file.
 .PP
 Secret files are read once at startup and must be regular files owned by the
 service user. Use restrictive permissions such as
@@ -156,6 +189,20 @@ under
 .B recon_cache_path.
 With the recon middleware enabled, status is available at
 .B /recon/ring_manager_agent.
+Recon includes the current mode. Observe mode reports local ring file size,
+modification time, SHA-256 checksum, Swift ring version, part power, replica
+count, and validation status. Invalid ring files set operator attention while
+the inventory pass remains successful.
+.PP
+Validate-only recon reports the configured selector, resolved release, source,
+convergence result, comparison counts, and per-file expected and local
+metadata. Comparison states
+are matching, stale, missing, unknown, extra, and error. Unknown means the
+manifest lacks a usable SHA-256 checksum. A completed but non-converged
+comparison remains a successful pass and sets operator attention. The selected
+manifest must contain at least one
+.B *.ring.gz
+file.
 
 .SH EXAMPLES
 .PP

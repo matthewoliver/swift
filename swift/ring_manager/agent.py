@@ -36,7 +36,7 @@ from swift.ring_manager.common import load_secret_from_conf, NormalTimestamp, \
 
 USER_AGENT = 'swift-ring-manager-agent'
 DEFAULT_MODE = 'enforce'
-AGENT_MODES = ('enforce', 'observe')
+AGENT_MODES = ('enforce', 'observe', 'validate-only')
 DEFAULT_INTERVAL = 300.0
 DEFAULT_JITTER = 30.0
 DEFAULT_REQUEST_TIMEOUT = 30.0
@@ -47,6 +47,22 @@ LOCK_NAME = 'ring-manager-agent'
 INSTALL_JOURNAL = '.ring-manager-agent-install.json'
 BACKUP_MARKER = '.ring-manager-backup-'
 OPERATOR_ATTENTION_FILE_LIMIT = 20
+ENFORCE_RECON_FIELDS = (
+    'source', 'latest_ring_version', 'files_installed', 'files_downloaded',
+    'files_unchanged', 'sync_time', 'last_synced_at')
+OBSERVE_RECON_FIELDS = (
+    'files_observed', 'files_valid', 'files_invalid', 'files',
+    'observe_time', 'last_observed_at')
+VALIDATE_RECON_FIELDS = (
+    'validation_source', 'release_selector', 'release', 'converged',
+    'files_expected', 'files_local', 'files_matching', 'files_stale',
+    'files_missing', 'files_unknown', 'files_extra', 'files_error',
+    'validation_files', 'validation_time', 'last_validated_at')
+MODE_RECON_FIELDS = {
+    'enforce': frozenset(ENFORCE_RECON_FIELDS),
+    'observe': frozenset(OBSERVE_RECON_FIELDS),
+    'validate-only': frozenset(VALIDATE_RECON_FIELDS),
+}
 
 
 class RingManagerAgentError(Exception):
@@ -63,12 +79,13 @@ class RingManagerAgentInstallError(RingManagerAgentLocalError):
 
 class RingManagerAgent(Daemon):
     """
-    Observe or enforce published ring state on a storage node.
+    Observe, validate, or enforce published ring state on a storage node.
 
     Enforce mode consumes the ring-manager latest manifest API, verifies each
     artifact against the manifest metadata, and installs the ring files into
     ``swift_dir`` using same-directory atomic renames. Observe mode only
-    inventories and validates local ring files.
+    inventories local ring files. Validate-only mode compares them with one
+    selected release without downloading or installing artifacts.
     """
 
     def __init__(self, conf, logger=None, opener=None, sleep=time.sleep,
@@ -92,6 +109,22 @@ class RingManagerAgent(Daemon):
         self.ring_manager_urls = [url.rstrip('/') for url in urls if url]
         if self.mode != 'observe' and not self.ring_manager_urls:
             raise RingManagerAgentError('ring_manager_urls is required')
+        self.release = str(conf.get('release', '')).strip()
+        if self.mode == 'validate-only' and not self.release:
+            raise RingManagerAgentError(
+                'release is required in validate-only mode')
+        if self.mode != 'validate-only' and self.release:
+            raise RingManagerAgentError(
+                'release is only valid in validate-only mode')
+        self.release_manifest_path = None
+        if self.mode == 'validate-only':
+            path = '/api/v1/rings/releases/%s/manifest/' % self._safe_id(
+                self.release)
+            try:
+                self.release_manifest_path = validate_relative_api_url(
+                    path, 'release manifest URL')
+            except ValueError as err:
+                raise RingManagerAgentError(str(err))
         self.shuffle_ring_manager_urls = config_true_value(conf.get(
             'shuffle_ring_manager_urls', 'false'))
         self.allow_ring_version_rollback = config_true_value(conf.get(
@@ -220,6 +253,27 @@ class RingManagerAgent(Daemon):
 
     def _artifact_path(self, file_info):
         return os.path.join(self.swift_dir, self._artifact_name(file_info))
+
+    def _manifest_files(self, manifest, field_name='latest manifest'):
+        version = str(manifest.get('version', ''))
+        if not version:
+            raise RingManagerAgentError('%s has no version' % field_name)
+        files = manifest.get('files', [])
+        if not isinstance(files, list):
+            raise RingManagerAgentError(
+                '%s files must be a list' % field_name)
+        seen_names = set()
+        for file_info in files:
+            if not isinstance(file_info, dict):
+                raise RingManagerAgentError(
+                    '%s files must contain objects' % field_name)
+            name = self._artifact_name(file_info)
+            if name in seen_names:
+                raise RingManagerAgentError(
+                    '%s contains duplicate file name %s' % (
+                        field_name, name))
+            seen_names.add(name)
+        return version, files
 
     def _mkdirs(self, path):
         directory = os.path.dirname(path)
@@ -764,6 +818,7 @@ class RingManagerAgent(Daemon):
                     if not chunk:
                         break
                     digest.update(chunk)
+            info['sha256'] = digest.hexdigest()
             ring_data = RingData.load(path)
             after = os.stat(path)
             before_identity = (
@@ -777,7 +832,6 @@ class RingManagerAgent(Daemon):
                     'ring file changed during inventory')
             info.update({
                 'status': 'valid',
-                'sha256': digest.hexdigest(),
                 'swift_ring_version': ring_data.version,
                 'part_power': ring_data.part_power,
                 'replicas': ring_data.replica_count,
@@ -789,15 +843,18 @@ class RingManagerAgent(Daemon):
             })
         return info
 
-    def _observe_local_rings(self):
+    def _local_ring_names(self):
         try:
-            names = sorted(
+            return sorted(
                 name for name in os.listdir(self.swift_dir)
                 if name.endswith('.ring.gz'))
         except OSError as err:
             raise RingManagerAgentLocalError(
                 'unable to inventory local rings in %s: %s' % (
                     self.swift_dir, err))
+
+    def _observe_local_rings(self):
+        names = self._local_ring_names()
         files = [self._ring_file_inventory(name) for name in names]
         valid = sum(item['status'] == 'valid' for item in files)
         invalid = len(files) - valid
@@ -806,6 +863,90 @@ class RingManagerAgent(Daemon):
             'files_observed': len(files),
             'files_valid': valid,
             'files_invalid': invalid,
+            'files': files,
+        }
+
+    def _is_sha256(self, value):
+        if not isinstance(value, str) or len(value) != 64:
+            return False
+        return all(char in '0123456789abcdefABCDEF' for char in value)
+
+    def _comparison_file(self, local, file_info):
+        name = self._artifact_name(file_info)
+        expected = {
+            'name': name,
+            'path': os.path.join(self.swift_dir, name),
+            'expected_bytes': file_info.get('bytes'),
+            'expected_sha256': file_info.get('sha256'),
+        }
+        if local is None:
+            expected['status'] = 'missing'
+            return expected
+
+        result = dict(local)
+        result['ring_status'] = result.pop('status')
+        result.update(expected)
+        if result['ring_status'] != 'valid':
+            result['status'] = 'error'
+        elif (expected['expected_bytes'] is not None and
+              result['bytes'] != expected['expected_bytes']):
+            result['status'] = 'stale'
+        elif not self._is_sha256(expected['expected_sha256']):
+            result['status'] = 'unknown'
+        elif (result['sha256'].lower() ==
+              expected['expected_sha256'].lower()):
+            result['status'] = 'matching'
+        else:
+            result['status'] = 'stale'
+        return result
+
+    def _validate_local_rings(self, manifest):
+        version, manifest_files = self._manifest_files(
+            manifest, 'selected manifest')
+        if self.release != 'latest' and version != self.release:
+            raise RingManagerAgentError(
+                'selected release %s returned manifest version %s' % (
+                    self.release, version))
+        if not manifest_files:
+            raise RingManagerAgentError(
+                'selected manifest contains no ring files')
+        for file_info in manifest_files:
+            name = self._artifact_name(file_info)
+            if not name.endswith('.ring.gz'):
+                raise RingManagerAgentError(
+                    'selected manifest file %s is not a ring file' % name)
+
+        names = self._local_ring_names()
+        local_files = dict(
+            (name, self._ring_file_inventory(name)) for name in names)
+        files = []
+        for file_info in manifest_files:
+            name = self._artifact_name(file_info)
+            files.append(self._comparison_file(
+                local_files.pop(name, None), file_info))
+        for name in sorted(local_files):
+            local = dict(local_files[name])
+            local['ring_status'] = local.pop('status')
+            local['status'] = 'extra'
+            files.append(local)
+
+        counts = dict((status, sum(
+            item['status'] == status for item in files)) for status in (
+                'matching', 'stale', 'missing', 'unknown', 'extra',
+                'error'))
+        return {
+            'release_selector': self.release,
+            'release': version,
+            'converged': all(
+                item['status'] == 'matching' for item in files),
+            'files_expected': len(manifest_files),
+            'files_local': len(names),
+            'files_matching': counts['matching'],
+            'files_stale': counts['stale'],
+            'files_missing': counts['missing'],
+            'files_unknown': counts['unknown'],
+            'files_extra': counts['extra'],
+            'files_error': counts['error'],
             'files': files,
         }
 
@@ -821,6 +962,9 @@ class RingManagerAgent(Daemon):
                 self.logger, 'agent.observe.timing',
                 float(ended_at) - float(started_at))
             stats = self._failure_stats(started_at, err, [])
+            stats['observe_time'] = stats.pop('sync_time')
+            stats['sources'] = {}
+            stats['source_errors'] = {}
             self._dump_recon(stats)
             raise
 
@@ -878,23 +1022,7 @@ class RingManagerAgent(Daemon):
                 self.logger, 'agent.operator_attention.source_errors')
 
     def _sync_manifest_files(self, source_url, manifest):
-        version = str(manifest.get('version', ''))
-        if not version:
-            raise RingManagerAgentError('latest manifest has no version')
-        files = manifest.get('files', [])
-        if not isinstance(files, list):
-            raise RingManagerAgentError(
-                'latest manifest files must be a list')
-        seen_names = set()
-        for file_info in files:
-            if not isinstance(file_info, dict):
-                raise RingManagerAgentError(
-                    'latest manifest files must contain objects')
-            name = self._artifact_name(file_info)
-            if name in seen_names:
-                raise RingManagerAgentError(
-                    'latest manifest contains duplicate file name %s' % name)
-            seen_names.add(name)
+        version, files = self._manifest_files(manifest)
 
         downloaded = unchanged = 0
         installed_files = []
@@ -955,6 +1083,11 @@ class RingManagerAgent(Daemon):
             self.logger.exception('Exception creating recon cache path: %s' %
                                   err)
             return
+        current_fields = MODE_RECON_FIELDS.get(stats.get('mode'), frozenset())
+        all_fields = frozenset().union(*MODE_RECON_FIELDS.values())
+        stale_fields = all_fields - current_fields
+        for field in stale_fields:
+            stats.setdefault(field, {})
         if stats.get('success'):
             # Recon cache updates merge nested keys, so success must delete
             # stale failure fields instead of relying on omission.
@@ -1037,6 +1170,127 @@ class RingManagerAgent(Daemon):
         except AttributeError:
             pass
 
+    def _validation_success_stats(self, source_url, started_at, ended_at,
+                                  validated_at, result,
+                                  source_errors=None):
+        source_errors = list(source_errors or [])
+        stats = dict(result)
+        files = stats.pop('files')
+        attention_reasons = []
+        if not result['converged']:
+            attention_reasons.append('ring_validation_not_converged')
+        operator_attention = self._operator_attention_status(
+            source_errors=source_errors,
+            additional_reasons=attention_reasons)
+        self._emit_operator_attention_metrics(operator_attention)
+        stats.update({
+            'mode': self.mode,
+            'validation_source': source_url,
+            'success': True,
+            'swift_dir': self.swift_dir,
+            'validation_files': files,
+            'validation_time': float(ended_at) - float(started_at),
+            'last_attempt': ended_at.internal,
+            'last_attempted_at': validated_at,
+            'last_success': ended_at.internal,
+            'last_validated_at': validated_at,
+            'error': {},
+            'operator_attention': operator_attention,
+        })
+        if source_errors:
+            stats['source_errors'] = source_errors
+        return stats
+
+    def _validation_failure_stats(self, started_at, err, source_errors):
+        stats = self._failure_stats(started_at, err, source_errors)
+        stats['validation_time'] = stats.pop('sync_time')
+        return stats
+
+    def _record_validation_failure(self, started_at, err, source_errors):
+        ended_at = self._timestamp()
+        stats_increment(self.logger, 'agent.validate.failures')
+        stats_timing(
+            self.logger, 'agent.validate.timing',
+            float(ended_at) - float(started_at))
+        self._dump_recon(self._validation_failure_stats(
+            started_at, err, source_errors))
+        try:
+            err.ring_manager_failure_recorded = True
+        except AttributeError:
+            pass
+
+    def _validate_from_source(self, source_url):
+        manifest = self._json_request(
+            source_url, self.release_manifest_path)
+        result = self._validate_local_rings(manifest)
+        return result, self._timestamp_internal()
+
+    def _emit_validation_metrics(self, result):
+        stats_increment(self.logger, 'agent.validate.successes')
+        for status in ('matching', 'stale', 'missing', 'unknown', 'extra',
+                       'error'):
+            stats_increment(
+                self.logger, 'agent.validate.files_%s' % status,
+                result['files_%s' % status])
+        if result['converged']:
+            stats_increment(self.logger, 'agent.validate.converged')
+        else:
+            stats_increment(self.logger, 'agent.validate.not_converged')
+
+    def _validate_once_sources(self, started_at):
+        source_errors = []
+        for source_url in self._source_urls():
+            try:
+                result, validated_at = self._validate_from_source(source_url)
+            except RingManagerAgentLocalError as err:
+                self.logger.warning(
+                    'Aborting ring validation after local failure from %s: '
+                    '%s', source_url, err)
+                source_errors.append({
+                    'source': source_url,
+                    'error': str(err),
+                })
+                self._record_validation_failure(
+                    started_at, err, source_errors)
+                raise
+            except Exception as err:
+                stats_increment(self.logger, 'agent.source.failures')
+                self.logger.warning(
+                    'Unable to validate rings from %s: %s', source_url, err)
+                source_errors.append({
+                    'source': source_url,
+                    'error': str(err),
+                })
+                continue
+
+            ended_at = self._timestamp()
+            self._emit_validation_metrics(result)
+            stats_timing(
+                self.logger, 'agent.validate.timing',
+                float(ended_at) - float(started_at))
+            self._dump_recon(self._validation_success_stats(
+                source_url, started_at, ended_at, validated_at, result,
+                source_errors=source_errors))
+            return result
+
+        err = RingManagerAgentError(
+            'all ring-manager sources failed: %s' % '; '.join(
+                '%s: %s' % (item['source'], item['error'])
+                for item in source_errors))
+        self._record_validation_failure(started_at, err, source_errors)
+        raise err
+
+    def validate_once(self):
+        started_at = self._timestamp()
+        stats_increment(self.logger, 'agent.validate.attempts')
+        try:
+            return self._validate_once_sources(started_at)
+        except Exception as err:
+            if getattr(err, 'ring_manager_failure_recorded', False):
+                raise
+            self._record_validation_failure(started_at, err, [])
+            raise
+
     def _sync_once_locked(self, started_at):
         source_errors = []
         self._recover_install_journal()
@@ -1109,6 +1363,14 @@ class RingManagerAgent(Daemon):
             self.logger.info(
                 'Observed %(files_observed)d local ring files: '
                 '%(files_valid)d valid, %(files_invalid)d invalid' % result)
+            return result
+        if self.mode == 'validate-only':
+            result = self.validate_once()
+            self.logger.info(
+                'Validated ring-manager release %(release)s: '
+                '%(files_matching)d matching, %(files_stale)d stale, '
+                '%(files_missing)d missing, %(files_unknown)d unknown, '
+                '%(files_extra)d extra, %(files_error)d errors' % result)
             return result
         result = self.sync_once()
         self.logger.info(

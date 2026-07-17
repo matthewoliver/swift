@@ -24,23 +24,32 @@
 # ionice_priority =
 
 [ring-manager-agent]
-# Agent operating mode. Enforce mode installs the selected manifest. Observe
-# mode only inventories and validates local *.ring.gz files; it does not
-# contact ring-manager or write under swift_dir.
+# Agent operating mode. Enforce mode installs the latest manifest. Observe
+# mode only inventories local *.ring.gz files. Validate-only mode compares
+# local ring files with one selected release. Observe and validate-only do not
+# write under swift_dir.
 # mode = enforce
 #
-# Comma-separated list of ring-manager servers to poll in enforce mode. Prefer
-# read-only ring-manager servers here so large clusters do not all pull from
-# the primary. The agent tries each URL in order until one sync succeeds.
+# Comma-separated list of ring-manager servers to poll in enforce or
+# validate-only mode. Prefer read-only ring-manager servers here so large
+# clusters do not all pull from the primary. The agent tries each URL in order
+# until one pass succeeds.
 # ring_manager_urls = https://ring-ro-1.example.com:6205, https://ring-ro-2.example.com:6205
+#
+# Release selector required in validate-only mode. Use an immutable release id
+# to compare with a known baseline. The special value latest is accepted only
+# when following the moving latest pointer is intentional. Do not set release
+# in enforce or observe mode.
+# release =
 #
 # Randomize the configured URL order before each sync pass. This can spread
 # storage-node pull traffic across equivalent read-only ring-manager servers.
 # shuffle_ring_manager_urls = false
 #
-# Refuse to install a latest manifest older than the manifest recorded in the
-# local agent state file. Keep this disabled unless an operator is deliberately
-# rolling the fleet back to an older published ring version.
+# In enforce mode, refuse to install a latest manifest older than the manifest
+# recorded in the local agent state file. Keep this disabled unless an
+# operator is deliberately rolling the fleet back to an older published ring
+# version. Validate-only never applies this install rollback guard.
 # allow_ring_version_rollback = false
 
 # Optional read-only authentication values sent when fetching from
@@ -70,20 +79,26 @@
 # HTTP request timeout in seconds.
 # request_timeout = 30
 
-# Maximum time in seconds to wait for the local agent install lock. The lock
-# covers manifest download, ring file install, state write, and recon update so
-# a daemon pass and a manual --once pass cannot interleave.
+# Maximum time in seconds to wait for the local agent install lock in enforce
+# mode. The lock covers manifest download, ring file install, state write, and
+# recon update so a daemon pass and a manual --once pass cannot interleave.
 # lock_timeout = 10
 
 # Directory where account.ring.gz, container.ring.gz, and object ring files are
-# observed or installed. Usually this should be the same swift_dir used by the
-# local Swift storage services. Enforce mode stages, fsyncs, verifies, and
-# installs downloads with a durable journal and rollback backups.
+# observed, compared, or installed. Usually this should be the same swift_dir
+# used by the local Swift storage services. Validate-only reads local ring
+# files but does not download artifacts or write in this directory. In enforce
+# mode, downloaded replacements are staged here, fsynced, verified, and
+# installed with a durable install journal and rollback backups. A leftover
+# .ring-manager-agent-install.json is recovered before the next enforce pass;
+# leftover *.ring-manager-backup-* files require operator attention.
 # swift_dir = /etc/swift
 
 # Recon cache path and local state file. The agent writes
 # ring-manager-agent.recon for /recon/ring_manager_agent. Enforce mode stores
-# its last installed manifest in state_file. Recon includes mode and
-# operator_attention when invalid rings or local state need node-local follow-up.
+# its last installed manifest in state_file. Validate-only does not write this
+# state file. Recon includes mode and operator_attention when invalid rings,
+# validation differences, a local journal, backups, or filesystem state need
+# node-local follow-up.
 # recon_cache_path = /var/cache/swift
 # state_file = /var/cache/swift/ring-manager-agent-state.json

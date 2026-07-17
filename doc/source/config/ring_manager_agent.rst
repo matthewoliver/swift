@@ -6,8 +6,10 @@ Ring Manager Agent Configuration
 
 This document describes the configuration options available for the
 ring-manager agent. The agent runs on Swift storage nodes. In ``enforce``
-mode it installs the latest published ring files from ring-manager servers.
-In ``observe`` mode it inventories and validates local ring files only.
+mode it installs the latest published ring files from one or more ring-manager
+servers. In ``observe`` mode it inventories local ring files without using
+ring-manager. In ``validate-only`` mode it compares local ring files with one
+selected release without downloading or installing artifacts.
 
 An example configuration can be found at
 ``etc/ring-manager-agent.conf-sample`` in the source code repository.
@@ -53,27 +55,31 @@ The ring-manager agent uses the common Swift daemon options, including
      - Description
    * - ``mode``
      - ``enforce``
-     - ``enforce`` polls ring-manager and installs ring files. ``observe``
-       reads local ``*.ring.gz`` files, validates their Swift ring format, and
-       reports inventory without contacting ring-manager or writing under
-       ``swift_dir``.
+     - Agent operating mode. ``enforce`` polls ring-manager and installs ring
+       files. ``observe`` reads local ``*.ring.gz`` files, validates their
+       Swift ring format, and reports inventory without contacting
+       ring-manager or writing under ``swift_dir``. ``validate-only`` fetches
+       one selected release manifest and reports local file convergence
+       without downloading artifacts or writing under ``swift_dir``.
    * - ``ring_manager_urls``
      -
-     - Comma-separated list of URLs. Required in ``enforce`` mode and unused
-       in ``observe`` mode. The agent tries each
-       URL in order until one sync succeeds.
+     - Comma-separated list of ring-manager base URLs. Required in
+       ``enforce`` and ``validate-only`` modes and unused in ``observe`` mode.
+       The agent tries each URL in order until one pass succeeds.
    * - ``ring_manager_url``
      -
      - Single-URL form. This is accepted for small deployments or tests.
+   * - ``release``
+     -
+     - Release selector required in ``validate-only`` mode. Use an immutable
+       release id for a stable known baseline. The special value ``latest``
+       explicitly follows the moving latest pointer. This option is rejected
+       in ``enforce`` and ``observe`` modes.
    * - ``shuffle_ring_manager_urls``
      - ``false``
      - If true, randomize the configured URL order before each sync pass.
        This can spread storage-node pulls across equivalent read-only
        ring-manager servers.
-   * - ``allow_ring_version_rollback``
-     - ``false``
-     - Refuse an older latest manifest than the one in local agent state.
-       Enable only for a deliberate operator-managed fleet rollback.
    * - ``read_key``
      -
      - Optional value for ``X-Ring-Manager-Read-Key``. Prefer this for
@@ -118,13 +124,23 @@ The ring-manager agent uses the common Swift daemon options, including
    * - ``request_timeout``
      - ``30``
      - HTTP request timeout in seconds.
+   * - ``allow_ring_version_rollback``
+     - ``false``
+     - In ``enforce`` mode, allow installation of a latest manifest older than
+       the last installed manifest. This does not affect ``validate-only``;
+       selecting an older release for comparison never installs it.
+   * - ``lock_timeout``
+     - ``10``
+     - Maximum time to wait for the local install lock in ``enforce`` mode.
+       Observe and validate-only do not take the install lock.
    * - ``recon_cache_path``
      - ``/var/cache/swift``
      - Directory used for ``ring-manager-agent.recon`` and the default state
        file.
    * - ``state_file``
      - ``/var/cache/swift/ring-manager-agent-state.json``
-     - Local JSON record of the last installed manifest and files.
+     - Local JSON record of the last installed manifest and files in
+       ``enforce`` mode. Validate-only does not read or write this file.
 
 Secret files must be regular files owned by the service user and are read once
 when the agent starts. Operators should install them with restrictive
@@ -134,10 +150,21 @@ permissions, symlinks, directories, control characters, embedded newlines, and
 configured inline/file pairs fail closed at startup.
 
 The agent writes recon data under ``/recon/ring_manager_agent``. Every payload
-includes ``mode``. A successful ``observe`` payload includes each local ring
+includes ``mode``. A successful ``enforce`` payload includes the selected
+source URL, the latest ring version, installed file counts, timing information,
+and ``swift_dir``. A successful ``observe`` payload includes each local ring
 file's size, modification time, SHA-256 checksum, Swift ring version, part
-power, replica count, and validation status. Invalid local ring files set
-``operator_attention`` without turning inventory into a transport failure.
+power, replica count, and validation status. A successful ``validate-only``
+payload includes the configured selector, resolved release, source,
+convergence result, comparison counts, and per-file expected and local
+metadata. Per-file comparison states
+are ``matching``, ``stale``, ``missing``, ``unknown``, ``extra``, and
+``error``. ``unknown`` means the selected manifest did not provide a usable
+SHA-256 checksum, so matching bytes cannot be proved. A completed comparison
+is a successful pass even when it is not converged; differences set
+``operator_attention``. The selected manifest must contain at least one
+``*.ring.gz`` file. A failed payload includes the attempted sources and
+per-source error messages when a source was used.
 
 When ``log_statsd_host`` is configured, the agent also emits low-cardinality
 StatsD metrics:
@@ -162,12 +189,18 @@ StatsD metrics:
     agent.observe.files
     agent.observe.files_valid
     agent.observe.files_invalid
-    agent.operator_attention
-    agent.operator_attention.journal
-    agent.operator_attention.backup_files
-    agent.operator_attention.local_failures
+    agent.validate.attempts
+    agent.validate.successes
+    agent.validate.failures
+    agent.validate.timing
+    agent.validate.converged
+    agent.validate.not_converged
+    agent.validate.files_matching
+    agent.validate.files_stale
+    agent.validate.files_missing
+    agent.validate.files_unknown
+    agent.validate.files_extra
+    agent.validate.files_error
 
 Recon remains the best source for the current installed version and detailed
-per-source error text; ``operator_attention`` identifies leftover journals,
-rollback backups, or local failures needing node-local follow-up.
-StatsD is intended for rates, timings, and alerting.
+per-source error text; StatsD is intended for rates, timings, and alerting.
