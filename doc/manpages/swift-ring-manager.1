@@ -76,7 +76,10 @@ the request.
 .SH COMMANDS
 .TP
 \fBstatus\fR
-Show ring-manager service status.
+Show ring-manager service status. With \fB\-\-promotion\fR, request the standby
+promotion precheck, print its concise builder and published-state summary, and
+exit non-zero until it is ready. The check does not fence the old primary,
+redirect writers, or promote the standby.
 .TP
 \fBrings list\fR
 List logical Swift rings.
@@ -218,6 +221,12 @@ Show status:
 .IP
 .nf
 swift-ring-manager --url http://ring.example.com:6205 status
+.fi
+.TP
+Check standby promotion readiness:
+.IP
+.nf
+swift-ring-manager --url http://ring.example.com:6205 status --promotion
 .fi
 .TP
 Create an object ring:

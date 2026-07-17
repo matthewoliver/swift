@@ -642,8 +642,22 @@ endpoint to recommend it for published-state reads or promotion consideration.
 It does not re-open every artifact on each status request and it is not an
 availability gate for artifact ``GET`` requests.
 ``published_state_promote_ready`` is only a narrow standby precheck.
-The ``promotion_readiness`` response from ``?promotion=true`` also checks
-local builder files for enabled rings.
+``GET /api/v1/ring_manager/status/?promotion=true`` adds a
+``promotion_readiness`` object for a standby failover runbook.
+It combines the published-state precheck with local builder-file readiness for
+each enabled ring.
+The object reports the checked and missing builder counts, invalid or version
+mismatched builders, and the aggregate blocker codes without exposing local
+builder paths.
+Disabled rings are normally skipped, but a disabled ring still referenced by
+the latest release manifest is a fail-closed blocker.
+A builder newer than its published ring artifact is also a blocker until the
+operator publishes its changes or restores the builder to the published state.
+When the query is present, ``operator_attention.promotion.blockers`` reflects
+the complete promotion precheck rather than only the published-state result.
+``swift-ring-manager status --promotion`` requests this view, prints a concise
+summary unless ``--json`` is used, and exits non-zero unless the standby is
+ready.
 Neither response fences the old primary, redirects writers, or performs
 automatic failover.
 

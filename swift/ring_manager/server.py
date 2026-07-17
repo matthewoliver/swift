@@ -17,6 +17,7 @@ import re
 import sys
 
 from swift import __version__ as swift_version
+from swift.common import exceptions as swift_exceptions
 from swift.common.concurrency import GreenPool, Timeout
 from swift.common.swob import HTTPBadRequest, HTTPException, \
     HTTPForbidden, HTTPInternalServerError, HTTPMethodNotAllowed, \
@@ -26,7 +27,7 @@ from swift.common.utils import config_true_value, get_log_line, get_logger, \
     LOG_LINE_DEFAULT_FORMAT, non_negative_float, parse_options
 from swift.common.wsgi import run_wsgi
 from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID, \
-    RingBuilderManager
+    RingBuilderManager, RingBuilderManagerError
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
     DEFAULT_BUILD_JOB_LEASE_TIMEOUT, DEFAULT_RING_ARTIFACT_DIR, \
     DEFAULT_RING_BUILD_EXECUTOR, DEFAULT_RING_BUILD_MANAGER_WORKERS, \
@@ -39,7 +40,7 @@ from swift.ring_manager.controllers import ring as ring_controller
 from swift.ring_manager import http, routing
 from swift.ring_manager.builder_daemon import RingBuildWorker
 from swift.ring_manager.publisher import RingBuilderPublisher
-from swift.ring_manager.store import RingManagerStore
+from swift.ring_manager.store import RingManagerStore, RingVersionNotFound
 
 
 RING_MANAGER_API_VERSION = 'v1'
@@ -397,7 +398,176 @@ class RingManagerApplication(object):
             status['promotion_blockers'].append('mode_not_standby')
         return status
 
-    def _operator_attention_status(self, sync_status):
+    def _base_promotion_readiness(self, sync_status):
+        published_ready = bool(
+            sync_status.get('published_state_promote_ready'))
+        return {
+            'applicable': self.mode == 'standby',
+            'ready': False,
+            'published_state': {
+                'ready': published_ready,
+                'blockers': list(sync_status.get('promotion_blockers') or []),
+            },
+            'builders': {
+                'ready': False,
+                'required': 0,
+                'checked': 0,
+                'missing': [],
+                'invalid': [],
+                'version_mismatches': [],
+                'unpublished_builder_changes': [],
+                'skipped_disabled': [],
+                'disabled_in_latest_manifest': [],
+                'blockers': [],
+            },
+            'blockers': [],
+        }
+
+    def _latest_manifest_ring_state(self):
+        try:
+            manifest = self.store.get_ring_version_manifest('latest')
+        except RingVersionNotFound:
+            return set(), {}, None
+        except (IOError, ValueError) as err:
+            return set(), {}, str(err)
+        ring_ids = set()
+        ring_versions = {}
+        for ring in manifest.get('rings', []):
+            if isinstance(ring, dict) and ring.get('ring_id') is not None:
+                ring_id = str(ring['ring_id'])
+                ring_ids.add(ring_id)
+                version = ring.get('swift_ring_version', ring.get('version'))
+                if version not in (None, ''):
+                    ring_versions[ring_id] = version
+        return ring_ids, ring_versions, None
+
+    def _builder_file_promotion_status(self):
+        status = {
+            'ready': False,
+            'required': 0,
+            'checked': 0,
+            'missing': [],
+            'invalid': [],
+            'version_mismatches': [],
+            'unpublished_builder_changes': [],
+            'skipped_disabled': [],
+            'disabled_in_latest_manifest': [],
+            'blockers': [],
+        }
+        blockers = []
+
+        def invalid_builder(ring_id, reason):
+            status['invalid'].append({
+                'ring_id': str(ring_id),
+                'reason': reason,
+            })
+
+        try:
+            rings = self.store.list_rings()
+        except (IOError, ValueError) as err:
+            status['error'] = str(err)
+            return False, status, ['invalid_ring_state']
+        latest_manifest_ring_ids, latest_manifest_versions, \
+            latest_manifest_error = self._latest_manifest_ring_state()
+        if latest_manifest_error:
+            status['latest_manifest_error'] = latest_manifest_error
+            status['blockers'] = ['invalid_latest_manifest']
+            return False, status, ['invalid_latest_manifest']
+
+        for ring in rings:
+            ring_id = ring.get('id')
+            if self.store.ring_is_disabled(ring):
+                if str(ring_id) not in latest_manifest_ring_ids:
+                    status['skipped_disabled'].append(str(ring_id))
+                    continue
+                status['disabled_in_latest_manifest'].append(str(ring_id))
+            status['required'] += 1
+            try:
+                _builder_path, builder = self.builder_manager.load_builder(
+                    ring)
+            except swift_exceptions.FileNotFoundError:
+                status['missing'].append(str(ring_id))
+                continue
+            except RingBuilderManagerError as err:
+                if 'requires exactly one builder file' in str(err):
+                    invalid_builder(ring_id, 'invalid_builder_metadata')
+                else:
+                    invalid_builder(ring_id, 'builder_unloadable')
+                continue
+            except Exception:
+                invalid_builder(ring_id, 'builder_unloadable')
+                continue
+
+            status['checked'] += 1
+            expected_version = ring.get('builder_version')
+            if expected_version not in (None, '') and (
+                    str(expected_version) != str(builder.version)):
+                status['version_mismatches'].append({
+                    'ring_id': str(ring_id),
+                    'expected': expected_version,
+                    'actual': builder.version,
+                })
+                continue
+            published_version = ring.get('latest_swift_ring_version')
+            if published_version in (None, ''):
+                published_version = latest_manifest_versions.get(
+                    str(ring_id))
+            if published_version not in (None, ''):
+                try:
+                    actual_version = int(builder.version)
+                    published_version_int = int(published_version)
+                except (TypeError, ValueError):
+                    invalid_builder(ring_id, 'invalid_builder_version')
+                    continue
+                if actual_version < published_version_int:
+                    status['version_mismatches'].append({
+                        'ring_id': str(ring_id),
+                        'minimum': published_version,
+                        'actual': builder.version,
+                    })
+                elif actual_version > published_version_int:
+                    status['unpublished_builder_changes'].append({
+                        'ring_id': str(ring_id),
+                        'published': published_version,
+                        'actual': builder.version,
+                    })
+
+        if status['required'] == 0:
+            blockers.append('no_enabled_rings')
+        if status['missing']:
+            blockers.append('missing_builder_files')
+        if status['invalid']:
+            blockers.append('invalid_builder_files')
+        if status['version_mismatches']:
+            blockers.append('builder_version_mismatch')
+        if status['unpublished_builder_changes']:
+            blockers.append('unpublished_builder_changes')
+        if status['disabled_in_latest_manifest']:
+            blockers.append('disabled_ring_in_latest_manifest')
+        status['ready'] = not blockers
+        status['blockers'] = blockers
+        return not blockers, status, blockers
+
+    def _promotion_readiness(self, sync_status):
+        readiness = self._base_promotion_readiness(sync_status)
+        if not readiness['applicable']:
+            readiness['blockers'].append('mode_not_standby')
+            return readiness
+        if not readiness['published_state']['ready']:
+            readiness['blockers'].append('published_state_not_ready')
+
+        builder_ready, builder_status, builder_blockers = \
+            self._builder_file_promotion_status()
+        readiness['builders'] = builder_status
+        readiness['blockers'].extend(builder_blockers)
+        readiness['ready'] = (
+            readiness['published_state']['ready'] and
+            builder_ready and
+            not readiness['blockers'])
+        return readiness
+
+    def _operator_attention_status(self, sync_status,
+                                   promotion_readiness=None):
         attention = {
             'needed': False,
             'reasons': [],
@@ -426,10 +596,15 @@ class RingManagerApplication(object):
                 add_reason('sync_transaction_pending')
 
         if self.mode == 'standby':
-            promotion_blockers = list(
-                sync_status.get('promotion_blockers') or [])
-            promotion_ready = bool(
-                sync_status.get('published_state_promote_ready'))
+            if promotion_readiness is not None:
+                promotion_blockers = list(
+                    promotion_readiness.get('blockers') or [])
+                promotion_ready = bool(promotion_readiness.get('ready'))
+            else:
+                promotion_blockers = list(
+                    sync_status.get('promotion_blockers') or [])
+                promotion_ready = bool(
+                    sync_status.get('published_state_promote_ready'))
             if not promotion_ready:
                 attention['promotion']['needed'] = True
                 attention['promotion']['blockers'] = promotion_blockers
@@ -475,8 +650,11 @@ class RingManagerApplication(object):
             'ring_manager_sync': self._ring_manager_sync_status(
                 latest_version, index_error=index_error),
         }
+        if config_true_value(req.params.get('promotion', 'false')):
+            body['promotion_readiness'] = self._promotion_readiness(
+                body['ring_manager_sync'])
         body['operator_attention'] = self._operator_attention_status(
-            body['ring_manager_sync'])
+            body['ring_manager_sync'], body.get('promotion_readiness'))
         self._emit_operator_attention_metrics(body['operator_attention'])
         return http.json_response(req, body)
 

@@ -208,6 +208,204 @@ nodes:
         self.assertNotIn('x-ring-manager-admin-key',
                          opener.requests[0]['headers'])
 
+    def test_status_promotion_ready_prints_summary(self):
+        body = {
+            'mode': 'standby',
+            'writable': False,
+            'latest_ring_version': 'release-42',
+            'ring_manager_sync': {
+                'source': 'https://primary.example.com:6205',
+                'latest_ring_version': 'release-42',
+                'last_synced_at': '1700000000.00000',
+                'age_seconds': 12.5,
+                'freshness_threshold': 300,
+                'synced': True,
+                'fresh': True,
+                'stale': False,
+                'reasons': [],
+                'sync_transaction': {'pending': False},
+            },
+            'promotion_readiness': {
+                'applicable': True,
+                'ready': True,
+                'published_state': {
+                    'ready': True,
+                    'blockers': [],
+                },
+                'builders': {
+                    'ready': True,
+                    'required': 3,
+                    'checked': 3,
+                    'missing': [],
+                    'invalid': [],
+                    'version_mismatches': [],
+                    'skipped_disabled': ['object-2'],
+                    'blockers': [],
+                },
+                'blockers': [],
+            },
+            'operator_attention': {
+                'needed': False,
+                'reasons': [],
+            },
+        }
+        opener = FakeOpener({
+            ('GET', '/api/v1/ring_manager/status/'): json_response(body),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://standby.example.com:6205',
+            'status', '--promotion',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('promotion=true', opener.requests[0]['query'])
+        self.assertIn('Mode: standby', stdout)
+        self.assertIn('Promotion readiness: ready', stdout)
+        self.assertIn('Published state: ready blockers=none', stdout)
+        self.assertIn(
+            'Builders: ready required=3 checked=3 skipped_disabled=object-2',
+            stdout)
+        self.assertIn('Attention: no reasons=none', stdout)
+        self.assertIn('Blockers: none', stdout)
+        with self.assertRaises(ValueError):
+            json.loads(stdout)
+
+    def test_status_promotion_blocked_prints_blockers_and_exits_one(self):
+        body = {
+            'mode': 'standby',
+            'writable': False,
+            'latest_ring_version': 'release-42',
+            'ring_manager_sync': {
+                'source': 'https://primary.example.com:6205',
+                'latest_ring_version': 'release-42',
+                'age_seconds': 15,
+                'freshness_threshold': 300,
+                'synced': True,
+                'fresh': False,
+                'stale': True,
+                'reasons': ['sync_transaction_pending'],
+                'sync_transaction': {'pending': True},
+            },
+            'promotion_readiness': {
+                'applicable': True,
+                'ready': False,
+                'published_state': {
+                    'ready': False,
+                    'blockers': ['sync_transaction_pending'],
+                },
+                'builders': {
+                    'ready': False,
+                    'required': 2,
+                    'checked': 1,
+                    'missing': ['object-1'],
+                    'invalid': [{
+                        'ring_id': 'object-2',
+                        'reason': 'builder_unloadable',
+                    }],
+                    'error': 'unable to read rings: invalid JSON',
+                    'version_mismatches': [{
+                        'ring_id': 'object-0',
+                        'expected': 9,
+                        'actual': 8,
+                    }],
+                    'unpublished_builder_changes': [{
+                        'ring_id': 'object-3',
+                        'published': 4,
+                        'actual': 5,
+                    }],
+                    'skipped_disabled': [],
+                    'blockers': [
+                        'missing_builder_files',
+                        'invalid_builder_files',
+                        'builder_version_mismatch',
+                        'unpublished_builder_changes',
+                    ],
+                },
+                'blockers': [
+                    'published_state_not_ready',
+                    'missing_builder_files',
+                    'invalid_builder_files',
+                    'builder_version_mismatch',
+                    'unpublished_builder_changes',
+                ],
+            },
+            'operator_attention': {
+                'needed': True,
+                'reasons': ['sync_not_fresh', 'promotion_not_ready'],
+            },
+        }
+        opener = FakeOpener({
+            ('GET', '/api/v1/ring_manager/status/'): json_response(body),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://standby.example.com:6205',
+            'status', '--promotion',
+        ], opener)
+        self.assertEqual(1, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('promotion=true', opener.requests[0]['query'])
+        self.assertIn('Promotion readiness: blocked', stdout)
+        self.assertIn(
+            'Blockers: published_state_not_ready,missing_builder_files,'
+            'invalid_builder_files,builder_version_mismatch,'
+            'unpublished_builder_changes',
+            stdout)
+        self.assertIn('Missing builders: object-1', stdout)
+        self.assertIn(
+            'Builder error: unable to read rings: invalid JSON', stdout)
+        self.assertIn('object-2 reason=builder_unloadable', stdout)
+        self.assertIn('object-0 expected=9 actual=8', stdout)
+        self.assertIn('Unpublished builder changes:', stdout)
+        self.assertIn('object-3 published=4 actual=5', stdout)
+        self.assertIn('Sync reasons: sync_transaction_pending', stdout)
+        self.assertIn('Sync transaction: pending', stdout)
+        self.assertIn(
+            'Attention: yes reasons=sync_not_fresh,promotion_not_ready',
+            stdout)
+
+    def test_status_promotion_partial_response_prints_unknowns(self):
+        body = {
+            'mode': 'standby',
+        }
+        opener = FakeOpener({
+            ('GET', '/api/v1/ring_manager/status/'): json_response(body),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://standby.example.com:6205',
+            'status', '--promotion',
+        ], opener)
+        self.assertEqual(1, status)
+        self.assertEqual('', stderr)
+        self.assertIn('Writable: unknown', stdout)
+        self.assertIn(
+            'Sync: fresh=unknown synced=unknown stale=unknown', stdout)
+        self.assertIn('Promotion readiness: blocked', stdout)
+
+    def test_status_promotion_json_preserves_response_and_exit_code(self):
+        body = {
+            'mode': 'standby',
+            'writable': False,
+            'ring_manager_sync': {
+                'fresh': False,
+            },
+            'promotion_readiness': {
+                'ready': False,
+                'blockers': ['published_state_not_ready'],
+            },
+        }
+        opener = FakeOpener({
+            ('GET', '/api/v1/ring_manager/status/'): json_response(body),
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://standby.example.com:6205',
+            '--json',
+            'status', '--promotion',
+        ], opener)
+        self.assertEqual(1, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('promotion=true', opener.requests[0]['query'])
+        self.assertEqual(body, json.loads(stdout))
+
     def test_rings_create_posts_builder_settings(self):
         opener = FakeOpener({
             ('POST', '/api/v1/rings/'): json_response({'id': 'object-0'}),

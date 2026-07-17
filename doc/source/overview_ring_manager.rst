@@ -54,6 +54,11 @@ Recon also records ``operator_attention`` for failed sync attempts, source
 fallback errors, and failed transaction recovery.
 The status endpoint summarizes stale sync, pending transaction, and standby
 promotion-precheck conditions with the same low-cardinality attention signal.
+Its ``?promotion=true`` form also verifies the local builder files needed for
+a standby handover, including unpublished builder changes and disabled rings
+that remain referenced by the current release.
+``swift-ring-manager status --promotion`` prints this precheck and exits
+non-zero until the standby is ready.
 Its state and recon timestamp fields use Swift ``NormalTimestamp.internal``
 strings, while elapsed sync time remains numeric seconds.
 

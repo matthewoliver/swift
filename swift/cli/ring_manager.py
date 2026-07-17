@@ -601,6 +601,114 @@ def _print(value, stdout, json_output=False, formatter=None):
         stdout.write('%s\n' % value)
 
 
+def _format_bool(value):
+    if value is None:
+        return 'unknown'
+    return 'yes' if value else 'no'
+
+
+def _format_seconds(value):
+    if value is None:
+        return ''
+    try:
+        return '%.1f' % float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_promotion_status(value):
+    sync = {}
+    readiness = {}
+    builders = {}
+    published = {}
+    attention = {}
+    if isinstance(value, dict):
+        sync = value.get('ring_manager_sync') or {}
+        readiness = value.get('promotion_readiness') or {}
+        builders = readiness.get('builders') or {}
+        published = readiness.get('published_state') or {}
+        attention = value.get('operator_attention') or {}
+
+    lines = [
+        'Mode: %s' % value.get('mode', '') if isinstance(value, dict)
+        else 'Mode:',
+        'Writable: %s' % _format_bool(value.get('writable'))
+        if isinstance(value, dict) else 'Writable: no',
+        'Latest: %s' % (
+            value.get('latest_ring_version') or ''
+            if isinstance(value, dict) else ''),
+        'Sync: fresh=%s synced=%s stale=%s source=%s latest=%s '
+        'age=%ss threshold=%ss' % (
+            _format_bool(sync.get('fresh')),
+            _format_bool(sync.get('synced')),
+            _format_bool(sync.get('stale')),
+            sync.get('source') or '',
+            sync.get('latest_ring_version') or '',
+            _format_seconds(sync.get('age_seconds')),
+            _format_seconds(sync.get('freshness_threshold'))),
+        'Promotion readiness: %s' % (
+            'ready' if readiness.get('ready') else 'blocked'),
+        'Published state: %s blockers=%s' % (
+            'ready' if published.get('ready') else 'blocked',
+            _format_list(published.get('blockers'))),
+        'Builders: %s required=%s checked=%s skipped_disabled=%s' % (
+            'ready' if builders.get('ready') else 'blocked',
+            builders.get('required', 0),
+            builders.get('checked', 0),
+            _format_list(builders.get('skipped_disabled'))),
+        'Attention: %s reasons=%s' % (
+            'yes' if attention.get('needed') else 'no',
+            _format_list(attention.get('reasons'))),
+        'Blockers: %s' % _format_list(readiness.get('blockers')),
+    ]
+    if builders.get('missing'):
+        lines.append('Missing builders: %s' % _format_list(
+            builders.get('missing')))
+    if builders.get('error'):
+        lines.append('Builder error: %s' % builders.get('error'))
+    invalid = builders.get('invalid') or []
+    if invalid:
+        lines.append('Invalid builders:')
+        for item in invalid:
+            if isinstance(item, dict):
+                lines.append('  %s reason=%s' % (
+                    item.get('ring_id', ''),
+                    item.get('reason', '')))
+            else:
+                lines.append('  %s' % item)
+    mismatches = builders.get('version_mismatches') or []
+    if mismatches:
+        lines.append('Builder version mismatches:')
+        for item in mismatches:
+            if isinstance(item, dict):
+                parts = ['  %s' % item.get('ring_id', '')]
+                for key in ('expected', 'minimum', 'actual'):
+                    if key in item:
+                        parts.append('%s=%s' % (key, item.get(key)))
+                lines.append(' '.join(parts))
+            else:
+                lines.append('  %s' % item)
+    unpublished = builders.get('unpublished_builder_changes') or []
+    if unpublished:
+        lines.append('Unpublished builder changes:')
+        for item in unpublished:
+            if isinstance(item, dict):
+                parts = ['  %s' % item.get('ring_id', '')]
+                for key in ('published', 'actual'):
+                    if key in item:
+                        parts.append('%s=%s' % (key, item.get(key)))
+                lines.append(' '.join(parts))
+            else:
+                lines.append('  %s' % item)
+    reasons = sync.get('reasons') or []
+    if reasons:
+        lines.append('Sync reasons: %s' % _format_list(reasons))
+    transaction = sync.get('sync_transaction') or {}
+    if transaction.get('pending'):
+        lines.append('Sync transaction: pending')
+    return '\n'.join(lines) + '\n'
+
+
 def _rings_list(client, args):
     return client.request('GET', '/api/v1/rings/')
 
@@ -908,7 +1016,18 @@ def _analyze(client, args):
 
 
 def _status(client, args):
-    return client.request('GET', '/api/v1/ring_manager/status/')
+    path = '/api/v1/ring_manager/status/'
+    if args.promotion:
+        path = '%s?%s' % (path, urlencode({'promotion': 'true'}))
+        args.formatter = _format_promotion_status
+    result = client.request('GET', path)
+    if args.promotion:
+        readiness = {}
+        if isinstance(result, dict):
+            readiness = result.get('promotion_readiness') or {}
+        if not readiness.get('ready'):
+            args.exit_status = 1
+    return result
 
 
 def _add_ring_payload_args(parser):
@@ -1010,6 +1129,10 @@ def make_parser():
 
     status = subparsers.add_parser(
         'status', help='Show ring-manager service status.')
+    status.add_argument(
+        '--promotion', action='store_true',
+        help='Request promotion readiness checks and exit non-zero unless '
+             'the standby is ready to promote.')
     status.set_defaults(func=_status)
 
     rings = subparsers.add_parser(

@@ -431,6 +431,318 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual([], sync['reasons'])
         self.assertFalse(body['operator_attention']['needed'])
 
+    def test_standby_promotion_readiness_reports_ready(self):
+        self.app.store.update_ring('2', {'disabled': True})
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertTrue(readiness['applicable'])
+        self.assertTrue(readiness['ready'])
+        self.assertEqual([], readiness['blockers'])
+        self.assertEqual({
+            'ready': True,
+            'blockers': [],
+        }, readiness['published_state'])
+        self.assertTrue(readiness['builders']['ready'])
+        self.assertEqual(1, readiness['builders']['required'])
+        self.assertEqual(1, readiness['builders']['checked'])
+        self.assertEqual(['2'], readiness['builders']['skipped_disabled'])
+        self.assertEqual([], readiness['builders']['missing'])
+        self.assertEqual([], readiness['builders']['invalid'])
+        self.assertEqual([], readiness['builders']['version_mismatches'])
+        self.assertEqual(
+            [], readiness['builders']['unpublished_builder_changes'])
+        self.assertEqual([], readiness['builders']['blockers'])
+
+    def test_promotion_readiness_blocks_disabled_ring_in_latest_manifest(self):
+        self.app.store.update_ring('1', {'disabled': True})
+        self.app.store.update_ring('2', {'disabled': True})
+        builder = RingBuilder.load(self.builder_path)
+        self._write_json(
+            'releases/%s/manifest.json' % self.latest_version, {
+                'version': self.latest_version,
+                'state': 'approved',
+                'created_at': '2026-05-22T10:31:00Z',
+                'rings': [{
+                    'ring_id': '1',
+                    'swift_ring_version': builder.version,
+                }],
+                'files': [],
+            })
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['disabled_ring_in_latest_manifest'],
+                         readiness['blockers'])
+        self.assertEqual(['1'],
+                         readiness['builders']['disabled_in_latest_manifest'])
+        self.assertEqual(['disabled_ring_in_latest_manifest'],
+                         readiness['builders']['blockers'])
+        self.assertTrue(body['operator_attention']['needed'])
+        self.assertEqual(['promotion_not_ready'],
+                         body['operator_attention']['reasons'])
+
+    def test_promotion_readiness_blocks_invalid_latest_manifest(self):
+        self.app.store.update_ring('2', {'disabled': True})
+        manifest_path = os.path.join(
+            self.state_dir, 'releases', self.latest_version, 'manifest.json')
+        with open(manifest_path, 'w') as fp:
+            fp.write('{not-json')
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['invalid_latest_manifest'], readiness['blockers'])
+        self.assertEqual(['invalid_latest_manifest'],
+                         readiness['builders']['blockers'])
+        self.assertIn('latest_manifest_error', readiness['builders'])
+        self.assertTrue(body['operator_attention']['needed'])
+        self.assertEqual(['promotion_not_ready'],
+                         body['operator_attention']['reasons'])
+
+    def test_promotion_readiness_blocks_pending_sync_transaction(self):
+        self.app.store.update_ring('2', {'disabled': True})
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+        self._write_json(RING_MANAGER_SYNC_JOURNAL, {
+            'committed': False,
+            'entries': [],
+            'staged_builders': [],
+        })
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        sync = body['ring_manager_sync']
+        self.assertFalse(sync['published_state_promote_ready'])
+        self.assertTrue(sync['sync_transaction_pending'])
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['sync_transaction_pending'],
+                         readiness['published_state']['blockers'])
+        self.assertIn('published_state_not_ready', readiness['blockers'])
+
+    def test_promotion_readiness_blocks_missing_builder(self):
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertTrue(readiness['published_state']['ready'])
+        self.assertFalse(readiness['builders']['ready'])
+        self.assertEqual(2, readiness['builders']['required'])
+        self.assertEqual(1, readiness['builders']['checked'])
+        self.assertEqual(['2'], readiness['builders']['missing'])
+        self.assertEqual(['missing_builder_files'],
+                         readiness['builders']['blockers'])
+        self.assertEqual(['missing_builder_files'], readiness['blockers'])
+        self.assertNotIn(self.testdir, json.dumps(readiness))
+
+    def test_promotion_readiness_blocks_builder_version_mismatch(self):
+        self.app.store.update_ring('2', {'disabled': True})
+        builder = RingBuilder.load(self.builder_path)
+        self.app.store.update_ring('1', {
+            'builder_version': builder.version + 1,
+        })
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['builder_version_mismatch'],
+                         readiness['builders']['blockers'])
+        self.assertEqual([{
+            'ring_id': '1',
+            'expected': builder.version + 1,
+            'actual': builder.version,
+        }], readiness['builders']['version_mismatches'])
+        self.assertNotIn(self.testdir, json.dumps(readiness))
+
+    def test_promotion_readiness_reports_invalid_builder_metadata(self):
+        self.app.store.update_ring('2', {'disabled': True})
+        self.app.store.update_ring('1', {
+            'builder_files': ['one.builder', 'two.builder'],
+        })
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['invalid_builder_files'],
+                         readiness['builders']['blockers'])
+        self.assertEqual([{
+            'ring_id': '1',
+            'reason': 'invalid_builder_metadata',
+        }], readiness['builders']['invalid'])
+
+    def test_promotion_readiness_reports_unloadable_builder(self):
+        self.app.store.update_ring('2', {'disabled': True})
+        self.app.store.update_ring('1', {
+            'builder_files': [self.testdir],
+        })
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['invalid_builder_files'],
+                         readiness['builders']['blockers'])
+        self.assertEqual([{
+            'ring_id': '1',
+            'reason': 'builder_unloadable',
+        }], readiness['builders']['invalid'])
+        self.assertNotIn(self.testdir, json.dumps(readiness))
+
+    def test_promotion_readiness_blocks_builder_newer_than_published(self):
+        self.app.store.update_ring('2', {'disabled': True})
+        builder = RingBuilder.load(self.builder_path)
+        self.app.store.update_ring('1', {
+            'latest_swift_ring_version': builder.version - 1,
+        })
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['unpublished_builder_changes'],
+                         readiness['builders']['blockers'])
+        self.assertEqual(['unpublished_builder_changes'],
+                         readiness['blockers'])
+        self.assertEqual([], readiness['builders']['version_mismatches'])
+        self.assertEqual([{
+            'ring_id': '1',
+            'published': builder.version - 1,
+            'actual': builder.version,
+        }], readiness['builders']['unpublished_builder_changes'])
+
+    def test_promotion_readiness_blocks_expected_builder_newer_than_published(
+            self):
+        self.app.store.update_ring('2', {'disabled': True})
+        builder = RingBuilder.load(self.builder_path)
+        self.app.store.update_ring('1', {
+            'builder_version': builder.version,
+            'latest_swift_ring_version': builder.version - 1,
+        })
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['unpublished_builder_changes'],
+                         readiness['builders']['blockers'])
+        self.assertEqual([], readiness['builders']['version_mismatches'])
+        self.assertEqual([{
+            'ring_id': '1',
+            'published': builder.version - 1,
+            'actual': builder.version,
+        }], readiness['builders']['unpublished_builder_changes'])
+
+    def test_promotion_readiness_uses_latest_manifest_ring_version(self):
+        self.app.store.update_ring('2', {'disabled': True})
+        builder = RingBuilder.load(self.builder_path)
+        self._write_json(
+            'releases/%s/manifest.json' % self.latest_version, {
+                'version': self.latest_version,
+                'state': 'approved',
+                'created_at': '2026-05-22T10:31:00Z',
+                'rings': [{
+                    'ring_id': '1',
+                    'swift_ring_version': builder.version - 1,
+                }],
+                'files': [],
+            })
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['unpublished_builder_changes'],
+                         readiness['builders']['blockers'])
+        self.assertEqual([{
+            'ring_id': '1',
+            'published': builder.version - 1,
+            'actual': builder.version,
+        }], readiness['builders']['unpublished_builder_changes'])
+
+    def test_promotion_readiness_blocks_builder_older_than_published(self):
+        self.app.store.update_ring('2', {'disabled': True})
+        builder = RingBuilder.load(self.builder_path)
+        self.app.store.update_ring('1', {
+            'latest_swift_ring_version': builder.version + 1,
+        })
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='standby', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['builder_version_mismatch'],
+                         readiness['builders']['blockers'])
+        self.assertEqual([{
+            'ring_id': '1',
+            'minimum': builder.version + 1,
+            'actual': builder.version,
+        }], readiness['builders']['version_mismatches'])
+
+    def test_promotion_readiness_not_applicable_on_readonly(self):
+        self._write_sync_index(self._timestamp_seconds_ago(10))
+        resp, body = self.get_json(
+            '/api/v1/ring_manager/status/?promotion=true',
+            app=self._status_app(mode='readonly', threshold=300))
+
+        self.assertEqual(200, resp.status_int)
+        readiness = body['promotion_readiness']
+        self.assertFalse(readiness['applicable'])
+        self.assertFalse(readiness['ready'])
+        self.assertEqual(['mode_not_standby'], readiness['blockers'])
+        self.assertEqual(0, readiness['builders']['required'])
+
     def test_standby_status_blocks_pending_sync_transaction(self):
         self._write_sync_index(self._timestamp_seconds_ago(10))
         self._write_json(RING_MANAGER_SYNC_JOURNAL, {
