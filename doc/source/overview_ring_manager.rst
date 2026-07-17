@@ -31,6 +31,8 @@ artefacts from a primary or fresh replica into another replica.
 It validates source status before any download, preserves an upstream
 replica's sync timestamp, and falls through only after a source failure.
 Local write failures abort the sync rather than attempting another source.
+The sync command accepts either explicit source URLs or a config file with a
+dedicated ``[ring-manager-sync]`` section for source and local-sync settings.
 The utility records its result through /recon/ring_manager when the recon
 middleware is in the pipeline.
 Its state and recon timestamp fields use Swift ``NormalTimestamp.internal``

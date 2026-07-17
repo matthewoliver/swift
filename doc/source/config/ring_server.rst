@@ -235,6 +235,71 @@ record one history::
     ring_manager_state_change_hook = /usr/local/bin/ring-manager-state-history
     ring_manager_state_change_hook_timeout = 30
 
+.. _ring_manager_sync_options:
+
+===================
+[ring-manager-sync]
+===================
+
+``swift-ring-manager-sync`` can load options from a ``[ring-manager-sync]``
+section in ``ring-manager-server.conf``.
+This lets the tool share the service configuration file while keeping sync
+settings separate from the server's local authentication filter.
+Command-line options override values from this section.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 25 50
+
+   * - Option
+     - Default
+     - Description
+   * - ``source_urls``
+     - unset
+     - Comma-separated ring-manager source URLs. A ``primary`` source is
+       accepted directly. A ``readonly`` or ``standby`` source is accepted
+       only when its status reports fresh synchronized published state.
+   * - ``ring_manager_state_dir``
+     - unset
+     - Local state directory to populate. Usually the same value used by the
+       read-only or standby ``[app:ring-manager-server]`` section.
+   * - ``ring_artifact_dir``
+     - unset
+     - Local artefact directory to populate. Usually the same value used by
+       the read-only or standby ``[app:ring-manager-server]`` section.
+   * - ``request_timeout``
+     - ``30``
+     - HTTP request timeout in seconds.
+   * - ``recon_cache_path``
+     - ``/var/cache/swift``
+     - Recon cache directory for ``ring-manager.recon``.
+   * - ``recon_dump``
+     - ``true``
+     - Whether to dump the last sync attempt to recon. The command line can
+       override this with ``--recon-dump`` or ``--no-recon-dump``.
+   * - ``read_key_file`` / ``read_key``
+     - unset
+     - Read credential for upstream ring-manager sources. File-backed
+       credentials are preferred for production.
+   * - ``admin_key_file`` / ``admin_key``
+     - unset
+     - Admin credential for upstream ring-manager sources. Read-only syncers
+       should normally use read credentials instead.
+   * - ``read_auth_token`` / ``auth_token``
+     - unset
+     - Optional auth token headers for upstream ring-manager sources.
+   * - ``state_change_hook``
+     - unset
+     - Optional best-effort command to run after synchronized state JSON
+       writes.
+   * - ``state_change_hook_timeout``
+     - ``30``
+     - Seconds to wait for ``state_change_hook``. Use ``0`` for no timeout.
+
+Upstream credentials are explicit to ``[ring-manager-sync]``.
+The syncer never borrows credentials from ``[filter:ring-manager-auth]``,
+which protects local clients rather than authenticating to an upstream source.
+
 High availability modes
 =======================
 
@@ -284,7 +349,13 @@ than mixing a partially written local state with a later source.
 When the selected source is a replica, the local state preserves its upstream
 ``last_synced_at`` rather than stamping the downstream replica with the
 current time.
-Configuration-file support remains a separate follow-on slice.
+The command can instead receive a config file containing a
+``[ring-manager-sync]`` section::
+
+    swift-ring-manager-sync /etc/swift/ring-manager-server.conf
+
+See :ref:`ring_manager_sync_options` for the available settings and
+command-line precedence.
 The command records its latest attempt in ring-manager.recon below the
 recon cache directory.
 Place recon before ring-manager-auth to expose /recon/ring_manager without an

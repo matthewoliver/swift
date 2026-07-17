@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -218,6 +219,12 @@ class TestRingManagerSync(unittest.TestCase):
         with open(path, 'wb') as fp:
             fp.write(value)
         os.chmod(path, 0o600)
+        return path
+
+    def _write_config(self, body):
+        path = os.path.join(self.testdir, 'ring-manager-server.conf')
+        with open(path, 'w') as fp:
+            fp.write(body)
         return path
 
     def _make_state_hook(self):
@@ -619,6 +626,207 @@ class TestRingManagerSync(unittest.TestCase):
                              request['headers']['x-auth-token'])
             self.assertNotIn('x-ring-manager-admin-key',
                              request['headers'])
+
+    def test_sync_rejects_source_url_without_scheme(self):
+        with self.assertRaises(RingManagerSyncError) as caught:
+            RingManagerSync(
+                'primary.example.com:6205', self.state_dir,
+                self.artifact_dir)
+        self.assertIn('source_url must be an http(s) URL',
+                      str(caught.exception))
+
+    def test_main_reads_sync_config_section(self):
+        conf_path = self._write_config('''
+[DEFAULT]
+log_statsd_host = 127.0.0.1
+
+[ring-manager-sync]
+source_urls = http://primary.example.com:6205
+ring_manager_state_dir = %s
+ring_artifact_dir = %s
+recon_cache_path = %s
+request_timeout = 9
+read_key = reader
+''' % (self.state_dir, self.artifact_dir, self.recon_cache_path))
+        opener = FakeOpener(self._routes())
+        logger_confs = []
+
+        def fake_get_logger(conf, *args, **kwargs):
+            logger_confs.append(conf)
+            return debug_logger()
+
+        with mock.patch('swift.ring_manager.sync.urllib_request.urlopen',
+                        opener), \
+                mock.patch('swift.ring_manager.sync.get_logger',
+                           fake_get_logger), \
+                mock.patch('sys.stdout', io.StringIO()):
+            status = sync.main([conf_path])
+
+        self.assertEqual(0, status)
+        self.assertEqual('127.0.0.1', logger_confs[0]['log_statsd_host'])
+        self.assertEqual(9.0, opener.requests[0]['timeout'])
+        for request in opener.requests:
+            self.assertEqual(
+                'reader', request['headers']['x-ring-manager-read-key'])
+        with open(os.path.join(self.state_dir, 'index.json')) as fp:
+            index = json.load(fp)
+        self.assertEqual('release-1', index['latest_ring_version'])
+
+    def test_main_cli_options_override_sync_config_section(self):
+        conf_path = self._write_config('''
+[ring-manager-sync]
+source_urls = http://unused.example.com:6205
+ring_manager_state_dir = /does/not/matter
+ring_artifact_dir = /does/not/matter
+recon_cache_path = /does/not/matter
+request_timeout = 1
+read_key = from-config
+''')
+        opener = FakeOpener(self._routes())
+
+        with mock.patch('swift.ring_manager.sync.urllib_request.urlopen',
+                        opener), \
+                mock.patch('sys.stdout', io.StringIO()):
+            status = sync.main([
+                '--config', conf_path,
+                '--ring-manager-state-dir', self.state_dir,
+                '--ring-artifact-dir', self.artifact_dir,
+                '--recon-cache-path', self.recon_cache_path,
+                '--timeout', '12',
+                '--read-key', 'from-cli',
+                'http://primary.example.com:6205',
+            ])
+
+        self.assertEqual(0, status)
+        self.assertEqual(
+            ['primary.example.com:6205'],
+            sorted(set(request['host'] for request in opener.requests)))
+        self.assertEqual(12.0, opener.requests[0]['timeout'])
+        for request in opener.requests:
+            self.assertEqual(
+                'from-cli', request['headers']['x-ring-manager-read-key'])
+
+    def test_main_cli_key_options_override_config_key_files(self):
+        config_values = {
+            'state_dir': self.state_dir,
+            'artifact_dir': self.artifact_dir,
+            'recon_cache_path': self.recon_cache_path,
+            'read_key_file': self._write_secret(
+                'config-read.key', b'from-config\n'),
+        }
+        conf_path = self._write_config('''
+[ring-manager-sync]
+source_urls = http://primary.example.com:6205
+ring_manager_state_dir = %(state_dir)s
+ring_artifact_dir = %(artifact_dir)s
+recon_cache_path = %(recon_cache_path)s
+read_key_file = %(read_key_file)s
+''' % config_values)
+        opener = FakeOpener(self._routes())
+
+        with mock.patch('swift.ring_manager.sync.urllib_request.urlopen',
+                        opener), \
+                mock.patch('sys.stdout', io.StringIO()):
+            status = sync.main([
+                '--config', conf_path,
+                '--read-key', 'from-cli',
+            ])
+
+        self.assertEqual(0, status)
+        for request in opener.requests:
+            self.assertEqual(
+                'from-cli', request['headers']['x-ring-manager-read-key'])
+
+    def test_main_cli_auth_token_overrides_config_read_auth_token(self):
+        conf_path = self._write_config('''
+[ring-manager-sync]
+source_urls = http://primary.example.com:6205
+ring_manager_state_dir = %s
+ring_artifact_dir = %s
+recon_cache_path = %s
+read_auth_token = from-config-read
+''' % (self.state_dir, self.artifact_dir, self.recon_cache_path))
+        opener = FakeOpener(self._routes())
+
+        with mock.patch('swift.ring_manager.sync.urllib_request.urlopen',
+                        opener), \
+                mock.patch('sys.stdout', io.StringIO()):
+            status = sync.main([
+                '--config', conf_path,
+                '--auth-token', 'from-cli-admin',
+            ])
+
+        self.assertEqual(0, status)
+        for request in opener.requests:
+            self.assertEqual(
+                'from-cli-admin', request['headers']['x-auth-token'])
+
+    def test_main_recon_dump_cli_overrides_config_false(self):
+        conf_path = self._write_config('''
+[ring-manager-sync]
+source_urls = http://primary.example.com:6205
+ring_manager_state_dir = %s
+ring_artifact_dir = %s
+recon_cache_path = %s
+recon_dump = false
+read_key = reader
+''' % (self.state_dir, self.artifact_dir, self.recon_cache_path))
+        opener = FakeOpener(self._routes())
+
+        with mock.patch('swift.ring_manager.sync.urllib_request.urlopen',
+                        opener), \
+                mock.patch('sys.stdout', io.StringIO()):
+            status = sync.main(['--config', conf_path, '--recon-dump'])
+
+        self.assertEqual(0, status)
+        self.assertEqual('release-1',
+                         self._read_recon()[
+                             'ring_manager_sync']['latest_ring_version'])
+
+    def test_main_reports_missing_positional_config_path(self):
+        conf_path = os.path.join(self.testdir, 'missing.conf')
+
+        with mock.patch('sys.stderr', io.StringIO()) as stderr:
+            status = sync.main([conf_path])
+
+        self.assertEqual(1, status)
+        self.assertIn('config file not found', stderr.getvalue())
+
+    def test_main_reports_missing_sync_config_section(self):
+        conf_path = self._write_config('[DEFAULT]\n')
+
+        with mock.patch('sys.stderr', io.StringIO()) as stderr:
+            status = sync.main([conf_path])
+
+        self.assertEqual(1, status)
+        self.assertIn('ring-manager-sync', stderr.getvalue())
+
+    def test_main_reports_invalid_logger_config(self):
+        conf_path = self._write_config('''
+[ring-manager-sync]
+source_urls = http://primary.example.com:6205
+ring_manager_state_dir = %s
+ring_artifact_dir = %s
+log_statsd_port = not-an-int
+''' % (self.state_dir, self.artifact_dir))
+
+        with mock.patch('sys.stderr', io.StringIO()) as stderr:
+            status = sync.main([conf_path])
+
+        self.assertEqual(1, status)
+        self.assertIn('invalid logger config', stderr.getvalue())
+
+    def test_main_rejects_source_url_without_scheme(self):
+        with mock.patch('sys.stderr', io.StringIO()) as stderr:
+            status = sync.main([
+                'primary.example.com:6205',
+                '--ring-manager-state-dir', self.state_dir,
+                '--ring-artifact-dir', self.artifact_dir,
+            ])
+
+        self.assertEqual(1, status)
+        self.assertIn('source_url must be an http(s) URL',
+                      stderr.getvalue())
 
     def test_sync_rejects_cross_origin_artifact_url(self):
         manifest = dict(self.manifest)

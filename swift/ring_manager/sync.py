@@ -19,13 +19,14 @@ import os
 import sys
 import uuid
 
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 from swift.common.concurrency import socket, urllib_request
 from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
     RECON_RING_MANAGER_FILE
-from swift.common.utils import NullLogger, dump_recon_cache, get_logger, \
-    list_from_csv, mkdirs
+from swift.common.utils import NullLogger, config_true_value, \
+    dump_recon_cache, get_logger, list_from_csv, mkdirs, \
+    non_negative_float, readconf
 from swift.common.utils import md5
 from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
     load_secret, NormalTimestamp, StateChangeHook, normal_timestamp, \
@@ -33,6 +34,7 @@ from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
 
 
 USER_AGENT = 'swift-ring-manager-sync'
+SYNC_CONF_SECTION = 'ring-manager-sync'
 
 
 class RingManagerSyncError(Exception):
@@ -91,19 +93,7 @@ class RingManagerSync(object):
             timeout=state_change_hook_timeout, logger=self.logger)
 
     def _normalize_source_urls(self, source_url):
-        values = source_url
-        if isinstance(values, str):
-            values = list_from_csv(values)
-        urls = []
-        for value in values:
-            if isinstance(value, str):
-                urls.extend(list_from_csv(value))
-            else:
-                urls.append(value)
-        urls = [str(url).rstrip('/') for url in urls if url]
-        if not urls:
-            raise RingManagerSyncError('source_url is required')
-        return urls
+        return _validate_source_urls(source_url)
 
     def _source_urls(self):
         return list(self.source_urls)
@@ -648,9 +638,14 @@ class RingManagerSync(object):
 
 def _make_parser():
     parser = optparse.OptionParser(
-        usage='%prog SOURCE_URL [SOURCE_URL ...] [options]',
+        usage='%prog [SOURCE_URL ... | CONFIG] [options]',
         description='Sync published ring-manager state and artifacts from '
-                    'SOURCE_URL into a local ring-manager state directory.')
+                    'SOURCE_URL into a local ring-manager state directory. '
+                    'When CONFIG is provided, options are loaded from the '
+                    '[ring-manager-sync] section.')
+    parser.add_option(
+        '--config', dest='conf_file',
+        help='Config file with a [ring-manager-sync] section.')
     parser.add_option(
         '--ring-manager-state-dir', dest='state_dir',
         help='Local ring_manager_state_dir to write.')
@@ -676,39 +671,41 @@ def _make_parser():
         '--read-auth-token', dest='read_auth_token',
         help='Read-only value for X-Auth-Token when fetching from source.')
     parser.add_option(
-        '--timeout', dest='timeout', type='float', default=30,
+        '--timeout', dest='timeout', type='float',
         help='HTTP request timeout in seconds. Default: 30')
     parser.add_option(
         '--recon-cache-path', dest='recon_cache_path',
-        default=DEFAULT_RECON_CACHE_PATH,
-        help='Directory for ring-manager recon cache data. Default: %default')
+        help='Directory for ring-manager recon cache data. Default: %s' %
+             DEFAULT_RECON_CACHE_PATH)
     parser.add_option(
         '--no-recon-dump', action='store_false', dest='recon_dump',
-        default=True,
+        default=None,
         help='Do not write ring-manager sync stats to recon cache.')
+    parser.add_option(
+        '--recon-dump', action='store_true', dest='recon_dump',
+        help='Write ring-manager sync stats to recon cache.')
     parser.add_option(
         '--state-change-hook', dest='state_change_hook',
         help='Command to run after each ring-manager state JSON write.')
     parser.add_option(
         '--state-change-hook-timeout', dest='state_change_hook_timeout',
-        type='float', default=DEFAULT_STATE_CHANGE_HOOK_TIMEOUT,
+        type='float',
         help='Seconds to wait for --state-change-hook. Use 0 for no timeout. '
-             'Default: %default')
+             'Default: %s' % DEFAULT_STATE_CHANGE_HOOK_TIMEOUT)
     parser.add_option(
         '--log-statsd-host', dest='log_statsd_host',
         help='StatsD host for sync metrics.')
     parser.add_option(
         '--log-statsd-port', dest='log_statsd_port', type='int',
-        default=8125,
-        help='StatsD port for sync metrics. Default: %default')
+        help='StatsD port for sync metrics. Default: 8125')
     parser.add_option(
         '--log-statsd-default-sample-rate',
-        dest='log_statsd_default_sample_rate', type='float', default=1.0,
-        help='Default StatsD sample rate. Default: %default')
+        dest='log_statsd_default_sample_rate', type='float',
+        help='Default StatsD sample rate. Default: 1.0')
     parser.add_option(
         '--log-statsd-sample-rate-factor',
-        dest='log_statsd_sample_rate_factor', type='float', default=1.0,
-        help='StatsD sample rate multiplier. Default: %default')
+        dest='log_statsd_sample_rate_factor', type='float',
+        help='StatsD sample rate multiplier. Default: 1.0')
     parser.add_option(
         '--log-statsd-metric-prefix', dest='log_statsd_metric_prefix',
         help='Prefix to prepend to sync metric names.')
@@ -718,45 +715,186 @@ def _make_parser():
     return parser
 
 
+def _is_url(value):
+    parsed = urlparse(value)
+    return parsed.scheme in ('http', 'https') and bool(parsed.netloc)
+
+
+def _looks_like_path(value):
+    return (os.path.sep in value or value.startswith('.') or
+            value.endswith('.conf'))
+
+
+def _normalize_source_urls(source_url):
+    if source_url in (None, ''):
+        return []
+    values = source_url
+    if isinstance(values, str):
+        values = list_from_csv(values)
+    urls = []
+    for value in values:
+        if isinstance(value, str):
+            urls.extend(list_from_csv(value))
+        else:
+            urls.append(value)
+    return [str(url).rstrip('/') for url in urls if url]
+
+
+def _validate_source_urls(source_urls):
+    urls = _normalize_source_urls(source_urls)
+    if not urls:
+        raise RingManagerSyncError('SOURCE_URL is required')
+    for url in urls:
+        if not _is_url(url):
+            raise RingManagerSyncError(
+                'source_url must be an http(s) URL: %s' % url)
+    return urls
+
+
+def _option_or_conf(options, option_name, conf, conf_names, default=None):
+    value = getattr(options, option_name, None)
+    if value not in (None, ''):
+        return value
+    for name in conf_names:
+        value = conf.get(name)
+        if value not in (None, ''):
+            return value
+    return default
+
+
+def _option_pair_or_conf(options, option_names, conf, default=None):
+    cli_values = [getattr(options, name, None) for name in option_names]
+    if any(value not in (None, '') for value in cli_values):
+        return cli_values
+    return [
+        conf.get(name) if conf.get(name) not in (None, '') else default
+        for name in option_names
+    ]
+
+
+def _non_negative_float_option(value, name):
+    try:
+        return non_negative_float(value)
+    except ValueError as err:
+        raise RingManagerSyncError('%s: %s' % (name, err))
+
+
+def _load_sync_conf(conf_file):
+    try:
+        return readconf(conf_file, SYNC_CONF_SECTION, log_name=USER_AGENT)
+    except (IOError, ValueError) as err:
+        raise RingManagerSyncError(str(err))
+
+
+def _resolve_sync_conf(options, args):
+    conf_file = options.conf_file
+    source_args = list(args)
+    if conf_file is None and len(source_args) == 1:
+        arg = source_args[0]
+        if not _is_url(arg):
+            if os.path.exists(arg):
+                conf_file = arg
+                source_args = []
+            elif _looks_like_path(arg):
+                raise RingManagerSyncError('config file not found: %s' % arg)
+    conf = _load_sync_conf(conf_file) if conf_file else {}
+
+    source_urls = source_args
+    if not source_urls:
+        source_urls = _option_or_conf(
+            options, 'source_urls', conf,
+            ('source_urls', 'source_url', 'ring_manager_urls',
+             'ring_manager_url'))
+    source_urls = _validate_source_urls(source_urls)
+
+    recon_dump = options.recon_dump
+    if recon_dump is None:
+        recon_dump = config_true_value(conf.get('recon_dump', 'true'))
+
+    timeout = _option_or_conf(
+        options, 'timeout', conf, ('request_timeout', 'timeout'), default=30)
+    hook_timeout = _option_or_conf(
+        options, 'state_change_hook_timeout', conf,
+        ('state_change_hook_timeout',),
+        default=DEFAULT_STATE_CHANGE_HOOK_TIMEOUT)
+    admin_key, admin_key_file = _option_pair_or_conf(
+        options, ('admin_key', 'admin_key_file'), conf)
+    read_key, read_key_file = _option_pair_or_conf(
+        options, ('read_key', 'read_key_file'), conf)
+    auth_token, read_auth_token = _option_pair_or_conf(
+        options, ('auth_token', 'read_auth_token'), conf)
+
+    return {
+        'conf': conf,
+        'source_urls': source_urls,
+        'state_dir': _option_or_conf(
+            options, 'state_dir', conf,
+            ('ring_manager_state_dir', 'state_dir')),
+        'artifact_dir': _option_or_conf(
+            options, 'artifact_dir', conf,
+            ('ring_artifact_dir', 'artifact_dir')),
+        'admin_key': admin_key,
+        'admin_key_file': admin_key_file,
+        'auth_token': auth_token,
+        'read_key': read_key,
+        'read_key_file': read_key_file,
+        'read_auth_token': read_auth_token,
+        'timeout': _non_negative_float_option(timeout, 'timeout'),
+        'recon_cache_path': _option_or_conf(
+            options, 'recon_cache_path', conf, ('recon_cache_path',),
+            default=DEFAULT_RECON_CACHE_PATH),
+        'recon_dump': recon_dump,
+        'state_change_hook': _option_or_conf(
+            options, 'state_change_hook', conf, ('state_change_hook',)),
+        'state_change_hook_timeout': _non_negative_float_option(
+            hook_timeout, 'state_change_hook_timeout'),
+    }
+
+
+def _logger_conf(options, conf):
+    logger_conf = dict(
+        (key, value) for key, value in conf.items()
+        if value not in (None, ''))
+    for name in (
+            'log_statsd_host', 'log_statsd_port',
+            'log_statsd_default_sample_rate',
+            'log_statsd_sample_rate_factor',
+            'log_statsd_metric_prefix'):
+        value = getattr(options, name)
+        if value not in (None, ''):
+            logger_conf[name] = value
+    return logger_conf
+
+
 def main(argv=None):
     parser = _make_parser()
     options, args = parser.parse_args(argv)
-    if len(args) < 1:
-        parser.print_usage()
-        print('Error: SOURCE_URL is required')
-        return 1
-    logger_conf = {}
-    if options.log_statsd_host:
-        logger_conf.update({
-            'log_statsd_host': options.log_statsd_host,
-            'log_statsd_port': options.log_statsd_port,
-            'log_statsd_default_sample_rate':
-                options.log_statsd_default_sample_rate,
-            'log_statsd_sample_rate_factor':
-                options.log_statsd_sample_rate_factor,
-        })
-    if options.log_statsd_metric_prefix:
-        logger_conf['log_statsd_metric_prefix'] = \
-            options.log_statsd_metric_prefix
     try:
+        sync_conf = _resolve_sync_conf(options, args)
+        try:
+            logger = get_logger(
+                _logger_conf(options, sync_conf['conf']),
+                log_route=USER_AGENT,
+                statsd_tail_prefix=USER_AGENT)
+        except (TypeError, ValueError) as err:
+            raise RingManagerSyncError('invalid logger config: %s' % err)
         syncer = RingManagerSync(
-            args,
-            options.state_dir,
-            options.artifact_dir,
-            admin_key=options.admin_key,
-            admin_key_file=options.admin_key_file,
-            auth_token=options.auth_token,
-            read_key=options.read_key,
-            read_key_file=options.read_key_file,
-            read_auth_token=options.read_auth_token,
-            timeout=options.timeout,
-            recon_cache_path=options.recon_cache_path,
-            recon_dump=options.recon_dump,
-            state_change_hook=options.state_change_hook,
-            state_change_hook_timeout=options.state_change_hook_timeout,
-            logger=get_logger(
-                logger_conf, log_route=USER_AGENT,
-                statsd_tail_prefix=USER_AGENT))
+            sync_conf['source_urls'],
+            sync_conf['state_dir'],
+            sync_conf['artifact_dir'],
+            admin_key=sync_conf['admin_key'],
+            admin_key_file=sync_conf['admin_key_file'],
+            auth_token=sync_conf['auth_token'],
+            read_key=sync_conf['read_key'],
+            read_key_file=sync_conf['read_key_file'],
+            read_auth_token=sync_conf['read_auth_token'],
+            timeout=sync_conf['timeout'],
+            recon_cache_path=sync_conf['recon_cache_path'],
+            recon_dump=sync_conf['recon_dump'],
+            state_change_hook=sync_conf['state_change_hook'],
+            state_change_hook_timeout=sync_conf[
+                'state_change_hook_timeout'],
+            logger=logger)
         result = syncer.sync()
     except RingManagerSyncError as err:
         print('ERROR: %s' % err, file=sys.stderr)
