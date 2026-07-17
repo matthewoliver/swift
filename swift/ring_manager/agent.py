@@ -1,0 +1,856 @@
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import errno
+import hashlib
+import json
+import os
+import random
+import sys
+import time
+import uuid
+
+from urllib.parse import quote, urljoin
+
+from swift.common.concurrency import socket, urllib_request
+from swift.common.daemon import Daemon, run_daemon
+from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
+    RECON_RING_MANAGER_AGENT_FILE
+from swift.common.utils import config_true_value, dump_recon_cache, \
+    fsync, get_logger, list_from_csv, lock_path, md5, non_negative_float, \
+    parse_options
+from swift.ring_manager.common import load_secret_from_conf, NormalTimestamp, \
+    normal_timestamp, stats_increment, stats_timing, validate_relative_api_url
+
+
+USER_AGENT = 'swift-ring-manager-agent'
+DEFAULT_INTERVAL = 300.0
+DEFAULT_JITTER = 30.0
+DEFAULT_REQUEST_TIMEOUT = 30.0
+DEFAULT_SWIFT_DIR = '/etc/swift'
+DEFAULT_STATE_FILE = 'ring-manager-agent-state.json'
+DEFAULT_LOCK_TIMEOUT = 10.0
+LOCK_NAME = 'ring-manager-agent'
+INSTALL_JOURNAL = '.ring-manager-agent-install.json'
+
+
+class RingManagerAgentError(Exception):
+    pass
+
+
+class RingManagerAgentLocalError(RingManagerAgentError):
+    pass
+
+
+class RingManagerAgentInstallError(RingManagerAgentLocalError):
+    pass
+
+
+class RingManagerAgent(Daemon):
+    """
+    Pull the latest published ring artifacts onto a storage node.
+
+    The agent consumes the ring-manager latest manifest API, verifies each
+    artifact against the manifest metadata, and installs the ring files into
+    ``swift_dir`` using same-directory atomic renames.
+    """
+
+    def __init__(self, conf, logger=None, opener=None, sleep=time.sleep,
+                 random_func=random.random, time_func=NormalTimestamp.now):
+        super(RingManagerAgent, self).__init__(conf)
+        self.logger = logger or get_logger(
+            conf, log_route=USER_AGENT, statsd_tail_prefix=USER_AGENT)
+        self.opener = opener or urllib_request.urlopen
+        self.sleep = sleep
+        self.random_func = random_func
+        self.time_func = time_func
+
+        urls = []
+        urls.extend(list_from_csv(conf.get('ring_manager_urls')))
+        urls.extend(list_from_csv(conf.get('ring_manager_url')))
+        self.ring_manager_urls = [url.rstrip('/') for url in urls if url]
+        if not self.ring_manager_urls:
+            raise RingManagerAgentError('ring_manager_urls is required')
+        self.shuffle_ring_manager_urls = config_true_value(conf.get(
+            'shuffle_ring_manager_urls', 'false'))
+
+        self.swift_dir = conf.get('swift_dir', DEFAULT_SWIFT_DIR)
+        self.interval = non_negative_float(
+            conf.get('interval', DEFAULT_INTERVAL))
+        self.jitter = non_negative_float(conf.get('jitter', DEFAULT_JITTER))
+        self.request_timeout = non_negative_float(conf.get(
+            'request_timeout', DEFAULT_REQUEST_TIMEOUT))
+        self.lock_timeout = non_negative_float(
+            conf.get('lock_timeout', DEFAULT_LOCK_TIMEOUT))
+        try:
+            self.read_key = load_secret_from_conf(
+                conf, ('read_key', 'ring_manager_read_key'),
+                ('read_key_file', 'ring_manager_read_key_file'))
+            self.admin_key = load_secret_from_conf(
+                conf, ('admin_key', 'ring_manager_admin_key'),
+                ('admin_key_file', 'ring_manager_admin_key_file'))
+        except ValueError as err:
+            raise RingManagerAgentError(str(err))
+        self.read_auth_token = conf.get('read_auth_token') or conf.get(
+            'ring_manager_read_auth_token')
+        self.auth_token = conf.get('auth_token')
+        self.recon_cache_path = conf.get('recon_cache_path',
+                                         DEFAULT_RECON_CACHE_PATH)
+        self.recon_cache = os.path.join(
+            self.recon_cache_path, RECON_RING_MANAGER_AGENT_FILE)
+        self.state_file = conf.get('state_file') or os.path.join(
+            self.recon_cache_path, DEFAULT_STATE_FILE)
+        self.install_journal = os.path.join(self.swift_dir, INSTALL_JOURNAL)
+
+    def _timestamp(self, timestamp=None):
+        timestamp = self.time_func() if timestamp is None else timestamp
+        return normal_timestamp(timestamp)
+
+    def _timestamp_internal(self, timestamp=None):
+        return self._timestamp(timestamp).internal
+
+    def _safe_id(self, value):
+        return quote(str(value), safe='')
+
+    def _api_url(self, source_url, path_or_url):
+        return urljoin(source_url + '/', path_or_url)
+
+    def _headers(self, extra=None):
+        headers = {'User-Agent': USER_AGENT}
+        has_read_credentials = self.read_key or self.read_auth_token
+        if self.read_key:
+            headers['X-Ring-Manager-Read-Key'] = self.read_key
+        elif not has_read_credentials and self.admin_key:
+            headers['X-Ring-Manager-Admin-Key'] = self.admin_key
+        if self.read_auth_token:
+            headers['X-Auth-Token'] = self.read_auth_token
+        elif not has_read_credentials and self.auth_token:
+            headers['X-Auth-Token'] = self.auth_token
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _source_urls(self):
+        urls = list(self.ring_manager_urls)
+        if self.shuffle_ring_manager_urls:
+            urls.sort(key=lambda _url: self.random_func())
+        return urls
+
+    def _request(self, source_url, path_or_url, headers=None):
+        url = self._api_url(source_url, path_or_url)
+        req = urllib_request.Request(url, headers=self._headers(headers))
+        try:
+            resp = self.opener(req, timeout=self.request_timeout)
+        except urllib_request.HTTPError as err:
+            if err.code == 304:
+                return 304, b'', err.headers
+            body = err.read()
+            raise RingManagerAgentError(
+                'GET %s failed with HTTP %s: %s' % (
+                    url, err.code, body.decode('utf-8', 'replace')))
+        except (urllib_request.URLError, socket.timeout) as err:
+            raise RingManagerAgentError('GET %s failed: %s' % (url, err))
+
+        status = getattr(resp, 'status', None)
+        if status is None:
+            status = getattr(resp, 'code', None)
+        if status is None and hasattr(resp, 'getcode'):
+            status = resp.getcode()
+        if status is None:
+            status = 200
+        body = resp.read()
+        if status == 304:
+            return status, b'', resp.info()
+        if status < 200 or status >= 300:
+            raise RingManagerAgentError(
+                'GET %s failed with HTTP %s: %s' % (
+                    url, status, body.decode('utf-8', 'replace')))
+        return status, body, resp.info()
+
+    def _json_request(self, source_url, path):
+        _status, body, _headers = self._request(source_url, path)
+        try:
+            value = json.loads(body.decode('utf-8'))
+        except (TypeError, ValueError, UnicodeDecodeError) as err:
+            raise RingManagerAgentError(
+                'GET %s returned invalid JSON: %s' % (path, err))
+        if not isinstance(value, dict):
+            raise RingManagerAgentError(
+                'GET %s returned JSON %s, not an object' % (
+                    path, type(value).__name__))
+        return value
+
+    def _artifact_name(self, file_info):
+        name = file_info.get('name')
+        if not isinstance(name, str) or not name:
+            raise RingManagerAgentError(
+                'manifest files must contain objects with name')
+        if name in ('.', '..') or '/' in name or '\\' in name:
+            raise RingManagerAgentError(
+                'manifest file name %r is not safe for swift_dir' % name)
+        if (name.startswith('.') or name == INSTALL_JOURNAL or
+                '.tmp-' in name or '.ring-manager-backup-' in name):
+            raise RingManagerAgentError(
+                'manifest file name %r is reserved for ring-manager-agent' %
+                name)
+        return name
+
+    def _artifact_path(self, file_info):
+        return os.path.join(self.swift_dir, self._artifact_name(file_info))
+
+    def _mkdirs(self, path):
+        directory = os.path.dirname(path)
+        self._ensure_directory_durable(directory)
+
+    def _ensure_directory_durable(self, directory):
+        if not directory or os.path.isdir(directory):
+            return
+        missing = []
+        path = directory
+        while path and not os.path.isdir(path):
+            missing.append(path)
+            parent = os.path.dirname(path)
+            if parent == path:
+                break
+            path = parent
+        try:
+            os.makedirs(directory)
+        except OSError as err:
+            if err.errno != errno.EEXIST or not os.path.isdir(directory):
+                raise
+        for created in reversed(missing):
+            parent = os.path.dirname(created)
+            if parent:
+                self._fsync_dir_strict(parent)
+
+    def _fsync_dir_strict(self, directory):
+        dirfd = os.open(directory, os.O_DIRECTORY | os.O_RDONLY)
+        try:
+            fsync(dirfd)
+        finally:
+            os.close(dirfd)
+
+    def _fsync_parent(self, path):
+        directory = os.path.dirname(path)
+        if directory:
+            self._fsync_dir_strict(directory)
+
+    def _write_file_atomic(self, path, body):
+        self._mkdirs(path)
+        temp_path = '%s.tmp-%s' % (path, uuid.uuid4().hex)
+        try:
+            with open(temp_path, 'wb') as fp:
+                fp.write(body)
+                fp.flush()
+                fsync(fp.fileno())
+            os.rename(temp_path, path)
+            temp_path = None
+            self._fsync_parent(path)
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError as err:
+                    if err.errno != errno.ENOENT:
+                        raise
+
+    def _write_json_atomic(self, path, value):
+        body = json.dumps(value, sort_keys=True, indent=2).encode('ascii')
+        self._write_file_atomic(path, body + b'\n')
+
+    def _read_json(self, path, default=None):
+        try:
+            with open(path, 'r') as fp:
+                return json.load(fp)
+        except IOError as err:
+            if err.errno == errno.ENOENT:
+                return default
+            raise
+
+    def _delete_file_durable(self, path):
+        try:
+            os.unlink(path)
+        except OSError as err:
+            if err.errno == errno.ENOENT:
+                return
+            raise
+        self._fsync_parent(path)
+
+    def _read_file(self, path):
+        try:
+            with open(path, 'rb') as fp:
+                return fp.read()
+        except IOError as err:
+            if err.errno == errno.ENOENT:
+                return None
+            raise
+
+    def _verify_existing(self, path, file_info):
+        return self._verified_existing_etag(path, file_info) is not None
+
+    def _verified_existing_etag(self, path, file_info):
+        body = self._read_file(path)
+        if body is None:
+            return None
+        if not self._body_matches(body, file_info):
+            return None
+        return md5(body, usedforsecurity=False).hexdigest()
+
+    def _body_matches(self, body, file_info):
+        expected_bytes = file_info.get('bytes')
+        if expected_bytes is not None and len(body) != expected_bytes:
+            return False
+        expected_sha256 = file_info.get('sha256')
+        if expected_sha256 is not None:
+            actual = hashlib.sha256(body).hexdigest()
+            if actual != expected_sha256:
+                return False
+        return True
+
+    def _verify_download(self, body, file_info, url):
+        expected_bytes = file_info.get('bytes')
+        if expected_bytes is not None and len(body) != expected_bytes:
+            raise RingManagerAgentError(
+                '%s returned %d bytes, expected %d' % (
+                    url, len(body), expected_bytes))
+        expected_sha256 = file_info.get('sha256')
+        if expected_sha256 is not None:
+            actual = hashlib.sha256(body).hexdigest()
+            if actual != expected_sha256:
+                stats_increment(self.logger, 'agent.checksum_failures')
+                raise RingManagerAgentError(
+                    '%s sha256 mismatch: got %s, expected %s' % (
+                        url, actual, expected_sha256))
+
+    def _verify_staged_file(self, path, file_info):
+        body = self._read_file(path)
+        if body is None or not self._body_matches(body, file_info):
+            raise RingManagerAgentError(
+                'staged file %s failed manifest verification' % path)
+
+    def _file_url(self, version, file_info):
+        url = file_info.get('url') or \
+            '/api/v1/rings/releases/%s/files/%s' % (
+                self._safe_id(version), quote(self._artifact_name(file_info),
+                                              safe=''))
+        try:
+            return validate_relative_api_url(url, 'manifest artifact URL')
+        except ValueError as err:
+            raise RingManagerAgentError(str(err))
+
+    def _stage_file(self, source_url, version, file_info):
+        local_path = self._artifact_path(file_info)
+        headers = {}
+        if file_info.get('sha256'):
+            etag = self._verified_existing_etag(local_path, file_info)
+            if etag:
+                headers['If-None-Match'] = etag
+
+        file_url = self._file_url(version, file_info)
+        status, body, _headers = self._request(
+            source_url, file_url, headers=headers)
+        if status == 304:
+            if 'If-None-Match' not in headers:
+                raise RingManagerAgentError(
+                    '%s returned 304 Not Modified without a conditional '
+                    'request' % file_url)
+            if not self._verify_existing(local_path, file_info):
+                raise RingManagerAgentError(
+                    '%s returned 304 Not Modified but local file %s no '
+                    'longer matches the manifest' % (file_url, local_path))
+            return {
+                'result': 'unchanged',
+                'local_path': local_path,
+                'temp_path': None,
+                'file_info': file_info,
+            }
+
+        self._verify_download(body, file_info, file_url)
+        stats_increment(self.logger, 'agent.bytes_downloaded', len(body))
+
+        temp_path = None
+        try:
+            self._mkdirs(local_path)
+            temp_path = '%s.tmp-%s' % (local_path, uuid.uuid4().hex)
+            try:
+                with open(temp_path, 'wb') as fp:
+                    fp.write(body)
+                    fp.flush()
+                    fsync(fp.fileno())
+                self._verify_staged_file(temp_path, file_info)
+            except Exception as err:
+                try:
+                    os.unlink(temp_path)
+                    self._fsync_parent(temp_path)
+                except OSError as cleanup_err:
+                    if cleanup_err.errno != errno.ENOENT:
+                        raise RingManagerAgentLocalError(
+                            'local cleanup after staging failure failed for '
+                            '%s: %s (original error: %s)' % (
+                                temp_path, cleanup_err, err))
+                raise RingManagerAgentLocalError(
+                    'local staging failed for %s: %s' % (
+                        local_path, err))
+        except RingManagerAgentLocalError:
+            raise
+        except Exception as err:
+            raise RingManagerAgentLocalError(
+                'local staging failed for %s: %s' % (local_path, err))
+        return {
+            'result': 'downloaded',
+            'local_path': local_path,
+            'temp_path': temp_path,
+            'file_info': file_info,
+        }
+
+    def _write_install_journal(self, version, staged_files):
+        files = []
+        for staged in staged_files:
+            if not staged.get('temp_path'):
+                continue
+            files.append({
+                'name': self._artifact_name(staged['file_info']),
+                'local_path': staged['local_path'],
+                'temp_path': staged['temp_path'],
+                'backup_path': staged.get('backup_path'),
+                'had_existing': staged.get('had_existing', False),
+                'file_info': staged['file_info'],
+            })
+        if not files:
+            return False
+        journal = {
+            'version': version,
+            'swift_dir': self.swift_dir,
+            'created_at': self._timestamp_internal(),
+            'files': files,
+        }
+        self._write_json_atomic(self.install_journal, journal)
+        return True
+
+    def _clear_install_journal(self):
+        self._delete_file_durable(self.install_journal)
+
+    def _prepare_install_transaction(self, version, staged_files):
+        install_files = [
+            staged for staged in staged_files if staged.get('temp_path')]
+        for staged in install_files:
+            local_path = staged['local_path']
+            had_existing = os.path.exists(local_path)
+            staged['had_existing'] = had_existing
+            if had_existing:
+                staged['backup_path'] = '%s.ring-manager-backup-%s' % (
+                    local_path, uuid.uuid4().hex)
+        journal_written = self._write_install_journal(version, install_files)
+        for staged in install_files:
+            backup_path = staged.get('backup_path')
+            if not backup_path:
+                continue
+            os.link(staged['local_path'], backup_path)
+            self._fsync_parent(backup_path)
+        return journal_written
+
+    def _install_staged_files(self, version, staged_files):
+        installed = []
+        journal_written = False
+        try:
+            journal_written = self._prepare_install_transaction(
+                version, staged_files)
+            for staged in staged_files:
+                temp_path = staged.get('temp_path')
+                if not temp_path:
+                    continue
+                local_path = staged['local_path']
+                os.rename(temp_path, local_path)
+                staged['temp_path'] = None
+                staged['installed'] = True
+                self._fsync_parent(local_path)
+                self._verify_staged_file(local_path, staged['file_info'])
+                installed.append(staged)
+            if journal_written:
+                self._clear_install_journal()
+                journal_written = False
+        except Exception as err:
+            rollback_errors = self._rollback_installed_files(staged_files)
+            if not rollback_errors and journal_written:
+                self._clear_install_journal()
+            if rollback_errors:
+                raise RingManagerAgentError(
+                    'ring install failed and rollback was incomplete: %s; '
+                    'rollback errors: %s' % (
+                        err, '; '.join(rollback_errors)))
+            raise
+        self._cleanup_backup_files(installed)
+
+    def _rollback_installed_files(self, staged_files):
+        errors = []
+        for staged in reversed(staged_files):
+            local_path = staged.get('local_path')
+            backup_path = staged.get('backup_path')
+            try:
+                if staged.get('installed'):
+                    if backup_path:
+                        os.rename(backup_path, local_path)
+                        staged['backup_path'] = None
+                    else:
+                        try:
+                            os.unlink(local_path)
+                        except OSError as err:
+                            if err.errno != errno.ENOENT:
+                                raise
+                    self._fsync_parent(local_path)
+                elif backup_path:
+                    try:
+                        os.unlink(backup_path)
+                        staged['backup_path'] = None
+                        self._fsync_parent(backup_path)
+                    except OSError as err:
+                        if err.errno != errno.ENOENT:
+                            raise
+            except Exception as err:
+                errors.append('%s: %s' % (local_path, err))
+        return errors
+
+    def _cleanup_backup_files(self, staged_files):
+        synced_dirs = set()
+        errors = []
+        for staged in staged_files:
+            backup_path = staged.get('backup_path')
+            if not backup_path:
+                continue
+            try:
+                os.unlink(backup_path)
+                staged['backup_path'] = None
+                synced_dirs.add(os.path.dirname(backup_path))
+            except OSError as err:
+                if err.errno != errno.ENOENT:
+                    errors.append('%s: %s' % (backup_path, err))
+        for directory in synced_dirs:
+            self._fsync_dir_strict(directory)
+        if errors:
+            raise RingManagerAgentError(
+                'unable to remove ring-manager backup files: %s' %
+                '; '.join(errors))
+
+    def _cleanup_staged_files(self, staged_files):
+        synced_dirs = set()
+        for staged in staged_files:
+            temp_path = staged.get('temp_path')
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                    staged['temp_path'] = None
+                    synced_dirs.add(os.path.dirname(temp_path))
+                except OSError as err:
+                    if err.errno != errno.ENOENT:
+                        self.logger.warning(
+                            'Unable to remove staged ring file %s: %s',
+                            temp_path, err)
+            backup_path = staged.get('backup_path')
+            if not backup_path:
+                continue
+            if staged.get('installed'):
+                continue
+            try:
+                os.unlink(backup_path)
+                staged['backup_path'] = None
+                synced_dirs.add(os.path.dirname(backup_path))
+            except OSError as err:
+                if err.errno != errno.ENOENT:
+                    self.logger.warning(
+                        'Unable to remove ring-manager backup %s: %s',
+                        backup_path, err)
+        for directory in synced_dirs:
+            if directory:
+                self._fsync_dir_strict(directory)
+
+    def _recover_install_journal(self):
+        journal = self._read_json(self.install_journal)
+        if not journal:
+            return
+        files = journal.get('files')
+        if not isinstance(files, list):
+            raise RingManagerAgentError(
+                'ring install journal %s is malformed' % self.install_journal)
+        errors = []
+        synced_dirs = set()
+        for entry in reversed(files):
+            local_path = entry.get('local_path')
+            temp_path = entry.get('temp_path')
+            backup_path = entry.get('backup_path')
+            file_info = entry.get('file_info') or {}
+            try:
+                if backup_path and os.path.exists(backup_path):
+                    os.rename(backup_path, local_path)
+                    synced_dirs.add(os.path.dirname(local_path))
+                elif entry.get('had_existing') and self._verify_existing(
+                        local_path, file_info):
+                    raise RingManagerAgentError(
+                        'missing rollback backup %s for %s' % (
+                            backup_path, local_path))
+                elif not entry.get('had_existing') and self._verify_existing(
+                        local_path, file_info):
+                    os.unlink(local_path)
+                    synced_dirs.add(os.path.dirname(local_path))
+                if temp_path:
+                    try:
+                        os.unlink(temp_path)
+                        synced_dirs.add(os.path.dirname(temp_path))
+                    except OSError as err:
+                        if err.errno != errno.ENOENT:
+                            raise
+            except Exception as err:
+                errors.append('%s: %s' % (local_path, err))
+        for directory in synced_dirs:
+            if directory:
+                self._fsync_dir_strict(directory)
+        if errors:
+            raise RingManagerAgentError(
+                'ring install journal recovery failed: %s' %
+                '; '.join(errors))
+        self._clear_install_journal()
+        stats_increment(self.logger, 'agent.install_recoveries')
+
+    def _sync_manifest_files(self, source_url, manifest):
+        version = str(manifest.get('version', ''))
+        if not version:
+            raise RingManagerAgentError('latest manifest has no version')
+        files = manifest.get('files', [])
+        if not isinstance(files, list):
+            raise RingManagerAgentError(
+                'latest manifest files must be a list')
+        seen_names = set()
+        for file_info in files:
+            if not isinstance(file_info, dict):
+                raise RingManagerAgentError(
+                    'latest manifest files must contain objects')
+            name = self._artifact_name(file_info)
+            if name in seen_names:
+                raise RingManagerAgentError(
+                    'latest manifest contains duplicate file name %s' % name)
+            seen_names.add(name)
+
+        downloaded = unchanged = 0
+        installed_files = []
+        staged_files = []
+        try:
+            for file_info in files:
+                staged = self._stage_file(
+                    source_url, version, file_info)
+                result = staged['result']
+                local_path = staged['local_path']
+                if result == 'downloaded':
+                    downloaded += 1
+                else:
+                    unchanged += 1
+                staged_files.append(staged)
+                installed_files.append({
+                    'name': self._artifact_name(file_info),
+                    'path': local_path,
+                    'bytes': file_info.get('bytes'),
+                    'sha256': file_info.get('sha256'),
+                })
+            try:
+                self._install_staged_files(version, staged_files)
+            except Exception as err:
+                stats_increment(self.logger, 'agent.install_failures')
+                if isinstance(err, RingManagerAgentLocalError):
+                    raise
+                raise RingManagerAgentInstallError(str(err))
+        except Exception as err:
+            try:
+                self._cleanup_staged_files(staged_files)
+            except Exception as cleanup_err:
+                raise RingManagerAgentLocalError(
+                    'local cleanup after ring sync failure failed: %s '
+                    '(original error: %s)' % (cleanup_err, err))
+            raise
+
+        return version, installed_files, downloaded, unchanged
+
+    def _write_state(self, source_url, version, manifest, installed_files,
+                     synced_at):
+        state = {
+            'source': source_url,
+            'latest_ring_version': version,
+            'synced_at': synced_at,
+            'swift_dir': self.swift_dir,
+            'files': installed_files,
+            'manifest': manifest,
+        }
+        self._write_json_atomic(self.state_file, state)
+
+    def _dump_recon(self, stats):
+        try:
+            self._ensure_directory_durable(os.path.dirname(self.recon_cache))
+        except Exception as err:
+            self.logger.exception('Exception creating recon cache path: %s' %
+                                  err)
+            return
+        dump_recon_cache({'ring_manager_agent': stats},
+                         self.recon_cache, self.logger)
+
+    def _success_stats(self, source_url, started_at, ended_at, synced_at,
+                       result):
+        stats = dict(result)
+        stats.update({
+            'source': source_url,
+            'success': True,
+            'swift_dir': self.swift_dir,
+            'sync_time': float(ended_at) - float(started_at),
+            'last_attempt': ended_at.internal,
+            'last_attempted_at': synced_at,
+            'last_success': ended_at.internal,
+            'last_synced_at': synced_at,
+            'error': {},
+        })
+        return stats
+
+    def _failure_stats(self, started_at, err, source_errors):
+        ended_at = self._timestamp()
+        attempted_at = ended_at.internal
+        return {
+            'sources': list(self.ring_manager_urls),
+            'success': False,
+            'sync_time': float(ended_at) - float(started_at),
+            'last_attempt': ended_at.internal,
+            'last_attempted_at': attempted_at,
+            'error': str(err),
+            'source_errors': source_errors,
+        }
+
+    def _sync_from_source(self, source_url):
+        manifest = self._json_request(
+            source_url, '/api/v1/rings/releases/latest/manifest/')
+        version, installed_files, downloaded, unchanged = \
+            self._sync_manifest_files(source_url, manifest)
+        synced_at = self._timestamp_internal()
+        try:
+            self._write_state(source_url, version, manifest, installed_files,
+                              synced_at)
+        except Exception as err:
+            raise RingManagerAgentLocalError(
+                'local ring-manager agent state write failed: %s' % err)
+        return {
+            'latest_ring_version': version,
+            'files_installed': len(installed_files),
+            'files_downloaded': downloaded,
+            'files_unchanged': unchanged,
+        }, synced_at
+
+    def _record_sync_failure(self, started_at, err, source_errors):
+        ended_at = self._timestamp()
+        stats_increment(self.logger, 'agent.sync.failures')
+        stats_timing(
+            self.logger, 'agent.sync.timing',
+            float(ended_at) - float(started_at))
+        self._dump_recon(self._failure_stats(started_at, err, source_errors))
+        try:
+            err.ring_manager_failure_recorded = True
+        except AttributeError:
+            pass
+
+    def _sync_once_locked(self, started_at):
+        source_errors = []
+        self._recover_install_journal()
+        for source_url in self._source_urls():
+            try:
+                result, synced_at = self._sync_from_source(source_url)
+            except RingManagerAgentLocalError as err:
+                self.logger.warning(
+                    'Aborting ring sync after local failure from %s: %s',
+                    source_url, err)
+                source_errors.append({
+                    'source': source_url,
+                    'error': str(err),
+                })
+                self._record_sync_failure(started_at, err, source_errors)
+                raise
+            except Exception as err:
+                stats_increment(self.logger, 'agent.source.failures')
+                self.logger.warning(
+                    'Unable to sync rings from %s: %s', source_url, err)
+                source_errors.append({
+                    'source': source_url,
+                    'error': str(err),
+                })
+                continue
+
+            ended_at = self._timestamp()
+            stats_increment(self.logger, 'agent.sync.successes')
+            stats_timing(
+                self.logger, 'agent.sync.timing',
+                float(ended_at) - float(started_at))
+            stats_increment(
+                self.logger, 'agent.files.downloaded',
+                result.get('files_downloaded', 0))
+            stats_increment(
+                self.logger, 'agent.files.unchanged',
+                result.get('files_unchanged', 0))
+            stats_increment(
+                self.logger, 'agent.files.installed',
+                result.get('files_installed', 0))
+            self._dump_recon(self._success_stats(
+                source_url, started_at, ended_at, synced_at, result))
+            return result
+
+        err = RingManagerAgentError(
+            'all ring-manager sources failed: %s' % '; '.join(
+                '%s: %s' % (item['source'], item['error'])
+                for item in source_errors))
+        self._record_sync_failure(started_at, err, source_errors)
+        raise err
+
+    def sync_once(self):
+        started_at = self._timestamp()
+        stats_increment(self.logger, 'agent.sync.attempts')
+        try:
+            self._ensure_directory_durable(self.swift_dir)
+            with lock_path(self.swift_dir, timeout=self.lock_timeout,
+                           name=LOCK_NAME):
+                return self._sync_once_locked(started_at)
+        except Exception as err:
+            if getattr(err, 'ring_manager_failure_recorded', False):
+                raise
+            self._record_sync_failure(started_at, err, [])
+            raise
+
+    def run_once(self, *args, **kwargs):
+        result = self.sync_once()
+        self.logger.info(
+            'Synced ring-manager version %(latest_ring_version)s: '
+            '%(files_downloaded)d files downloaded, '
+            '%(files_unchanged)d unchanged' % result)
+
+    def run_forever(self, *args, **kwargs):
+        if self.jitter:
+            self.sleep(self.random_func() * self.jitter)
+        while True:
+            started_at = self._timestamp()
+            try:
+                self.run_once(*args, **kwargs)
+            except Exception:
+                self.logger.exception('Error syncing rings from ring-manager')
+            elapsed = float(self._timestamp()) - float(started_at)
+            delay = max(0.0, self.interval - elapsed)
+            if self.jitter:
+                delay += self.random_func() * self.jitter
+            self.sleep(delay)
+
+
+def main():
+    conf_file, options = parse_options(once=True)
+    run_daemon(RingManagerAgent, conf_file, 'ring-manager-agent', **options)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,166 @@
+.\"
+.\" Licensed under the Apache License, Version 2.0 (the "License");
+.\" you may not use this file except in compliance with the License.
+.\" You may obtain a copy of the License at
+.\"
+.\"    http://www.apache.org/licenses/LICENSE-2.0
+.\"
+.\" Unless required by applicable law or agreed to in writing, software
+.\" distributed under the License is distributed on an "AS IS" BASIS,
+.\" WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+.\" implied.
+.\" See the License for the specific language governing permissions and
+.\" limitations under the License.
+.\"
+.TH SWIFT-RING-MANAGER-AGENT "1" "May 2026" "OpenStack Swift"
+
+.SH NAME
+swift\-ring\-manager\-agent \- install Swift ring files from ring-manager
+
+.SH SYNOPSIS
+.B swift\-ring\-manager\-agent
+\fICONFIG\fR [\fIoptions\fR]
+
+.SH DESCRIPTION
+.PP
+.B swift-ring-manager-agent
+is a storage-node daemon that polls one or more ring-manager servers for the
+latest published ring manifest, downloads changed ring artifacts, verifies
+their byte counts and SHA-256 checksums, and installs them into the local
+Swift configuration directory. Installs are performed under a local agent lock
+with staged files, an install journal, and rollback backups.
+.PP
+The daemon is intended to be managed with
+.B swift-init
+as
+.B ring-manager-agent.
+It supports the standard Swift daemon options and
+.B --once
+for a single sync pass.
+
+.SH OPTIONS
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Log to the console.
+.TP
+\fB\-o\fR, \fB\-\-once\fR
+Run one sync pass and exit.
+
+.SH CONFIGURATION
+.PP
+The service reads the
+.B [ring-manager-agent]
+section from the supplied config file.
+.TP
+\fBring_manager_urls\fR
+Comma-separated list of ring-manager base URLs. The agent tries each URL in
+order until one sync succeeds. Source fallback is only used for source,
+manifest, or download failures; a local install, journal, backup cleanup, or
+state write failure aborts the whole sync attempt.
+.TP
+\fBread_key\fR
+Optional value sent as
+.B X-Ring-Manager-Read-Key.
+Prefer this for storage nodes.
+.TP
+\fBread_key_file\fR
+File containing the
+.B read_key
+value. Mutually exclusive with
+.B read_key.
+.TP
+\fBadmin_key\fR
+Optional value sent as
+.B X-Ring-Manager-Admin-Key.
+.TP
+\fBadmin_key_file\fR
+File containing the
+.B admin_key
+value. Mutually exclusive with
+.B admin_key.
+Prefer
+.B read_key_file
+for storage nodes.
+.TP
+\fBauth_token\fR
+Optional value sent as
+.B X-Auth-Token.
+.TP
+\fBinterval\fR
+Seconds between sync attempts. The default is 300.
+.TP
+\fBjitter\fR
+Additional random delay in seconds. The default is 30.
+.TP
+\fBrequest_timeout\fR
+HTTP request timeout in seconds. The default is 30.
+.TP
+\fBlock_timeout\fR
+Maximum time in seconds to wait for the local agent install lock. The default
+is 10.
+.TP
+\fBswift_dir\fR
+Directory where ring files are installed. The default is
+.B /etc/swift.
+.TP
+\fBrecon_cache_path\fR
+Directory for recon cache data. The default is
+.B /var/cache/swift.
+.TP
+\fBstate_file\fR
+Path for the local JSON state file. The default is
+.B /var/cache/swift/ring-manager-agent-state.json.
+.PP
+Secret files are read once at startup and must be regular files owned by the
+service user. Use restrictive permissions such as
+.B 0400
+or
+.B 0600.
+Root-owned files only work if the process reads them before dropping
+privileges.
+
+.SH INSTALL RECOVERY
+.PP
+Downloaded replacements are staged, fsynced, and verified in
+.B swift_dir
+before any active ring file is replaced. Before the first rename, the agent
+writes
+.B .ring-manager-agent-install.json
+in
+.B swift_dir.
+If a later replacement fails, files already replaced by that attempt are
+restored from rollback backups where possible. If the process or host dies
+mid-install, the next sync recovers the journal before contacting a
+ring-manager source. Leftover files matching
+.B *.ring-manager-backup-*
+mean rollback was incomplete and require operator attention. Success state and
+recon are written only after the whole manifest install completes.
+
+.SH RECON
+.PP
+The agent writes
+.B ring-manager-agent.recon
+under
+.B recon_cache_path.
+With the recon middleware enabled, status is available at
+.B /recon/ring_manager_agent.
+
+.SH EXAMPLES
+.PP
+Run one sync pass:
+.PP
+.nf
+swift-ring-manager-agent /etc/swift/ring-manager-agent.conf --once
+.fi
+.PP
+Manage the daemon with swift-init:
+.PP
+.nf
+swift-init ring-manager-agent start
+swift-init ring-manager-agent once
+.fi
+
+.SH DOCUMENTATION
+.LP
+More documentation about OpenStack Swift can be found at
+.BI https://docs.openstack.org/swift/latest/

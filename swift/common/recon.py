@@ -19,6 +19,7 @@ RECON_CONTAINER_FILE = 'container.recon'
 RECON_ACCOUNT_FILE = 'account.recon'
 RECON_DRIVE_FILE = 'drive.recon'
 RECON_RING_MANAGER_FILE = 'ring-manager.recon'
+RECON_RING_MANAGER_AGENT_FILE = 'ring-manager-agent.recon'
 DEFAULT_RECON_CACHE_PATH = '/var/cache/swift'
 
 

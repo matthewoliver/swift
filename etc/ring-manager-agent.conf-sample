@@ -1,0 +1,80 @@
+[DEFAULT]
+# swift_dir = /etc/swift
+# user = swift
+# You can specify default log routing here if you want:
+# log_name = swift
+# log_facility = LOG_LOCAL0
+# log_level = INFO
+# log_address = /dev/log
+#
+# log_statsd_host =
+# log_statsd_port = 8125
+# log_statsd_default_sample_rate = 1.0
+# log_statsd_sample_rate_factor = 1.0
+# log_statsd_metric_prefix =
+#
+# You can set scheduling priority of processes. Niceness values range from -20
+# (most favorable to the process) to 19 (least favorable to the process).
+# nice_priority =
+#
+# You can set I/O scheduling class and priority of processes. I/O niceness
+# class values are realtime, best-effort and idle. I/O niceness priority is a
+# number which goes from 0 to 7. Work only with ionice_class.
+# ionice_class =
+# ionice_priority =
+
+[ring-manager-agent]
+# Comma-separated list of ring-manager servers to poll. Prefer read-only
+# ring-manager servers here so large clusters do not all pull from the primary.
+# The agent tries each URL in order until one sync succeeds.
+# ring_manager_urls = https://ring-ro-1.example.com:6205, https://ring-ro-2.example.com:6205
+#
+# Randomize the configured URL order before each sync pass. This can spread
+# storage-node pull traffic across equivalent read-only ring-manager servers.
+# shuffle_ring_manager_urls = false
+
+# Optional read-only authentication values sent when fetching from
+# ring-manager. Prefer read_key for agents so storage nodes do not hold the
+# write-capable admin_key.
+# read_key =
+# read_key_file =
+# read_auth_token =
+#
+# Backward-compatible admin authentication values. Use these only when the
+# ring-manager server has not been configured with a read_key.
+# admin_key =
+# admin_key_file =
+# auth_token =
+#
+# The inline key and key_file options for the same credential are mutually
+# exclusive. Secret files are read once at startup and should be regular files
+# owned by the service user with restrictive permissions such as 0400 or 0600.
+# Root-owned files only work if this process reads them before dropping
+# privileges.
+
+# Poll interval and per-cycle jitter in seconds. Jitter reduces thundering herd
+# effects when many storage nodes start or wake up together.
+# interval = 300
+# jitter = 30
+
+# HTTP request timeout in seconds.
+# request_timeout = 30
+
+# Maximum time in seconds to wait for the local agent install lock. The lock
+# covers manifest download, ring file install, state write, and recon update so
+# a daemon pass and a manual --once pass cannot interleave.
+# lock_timeout = 10
+
+# Directory where account.ring.gz, container.ring.gz, and object ring files are
+# installed. Usually this should be the same swift_dir used by the local Swift
+# storage services. Downloaded replacements are staged in this directory,
+# fsynced, verified, and installed with a durable install journal and rollback
+# backups. A leftover .ring-manager-agent-install.json is recovered before the
+# next sync; leftover *.ring-manager-backup-* files require operator attention.
+# swift_dir = /etc/swift
+
+# Recon cache path and local state file. The agent writes
+# ring-manager-agent.recon for /recon/ring_manager_agent and stores its last
+# installed manifest in state_file.
+# recon_cache_path = /var/cache/swift
+# state_file = /var/cache/swift/ring-manager-agent-state.json

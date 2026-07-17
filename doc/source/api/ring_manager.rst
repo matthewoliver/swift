@@ -300,9 +300,30 @@ The selector is writable, so readonly and standby servers reject it.
 manifest with ``desired: true``.
 It also returns ``404 Not Found`` until a desired release exists.
 
-The storage-node agent continues using ``latest`` in this slice.
+The storage-node agent consumes the latest manifest in this slice.
 Replica sync preserves both pointers, while desired-aware agent consumption is
 separate work.
+
+Storage-node agent
+==================
+
+``swift-ring-manager-agent`` polls one or more ring-manager sources for the
+latest release manifest.
+It verifies every downloaded artefact's byte count and SHA-256 digest before
+installing the complete set under a local lock.
+Files are staged and fsynced first, then atomically replaced with an install
+journal and rollback backups so an interrupted install never reports success.
+Source fallback applies to manifest and artefact download errors only.
+Local staging, install, journal recovery, backup cleanup, and state-write
+failures abort the pass so a later source cannot hide an incomplete local
+transaction.
+
+The agent records its last completed or failed pass in
+``ring-manager-agent.recon``.
+With the standard recon middleware enabled, ``GET
+/recon/ring_manager_agent`` returns that record.
+It includes the selected source, latest release version, installed-file counts,
+timing, and per-source failures.
 
 ``GET /api/v1/rings/releases/<version>/files/<file_name>``
 -----------------------------------------------------------------

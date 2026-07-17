@@ -11,6 +11,7 @@ Configuration Documentation
     container_server_config.rst
     object_server_config.rst
     ring_server.rst
+    ring_manager_agent.rst
     global_memcache_config.rst
 
 Configuration options for middleware can be found at:

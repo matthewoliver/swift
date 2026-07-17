@@ -29,7 +29,8 @@ from unittest import TestCase
 from swift import __version__ as swiftver
 from swift.common import ring, utils
 from swift.common.recon import RECON_RELINKER_FILE, RECON_DRIVE_FILE, \
-    RECON_RING_MANAGER_FILE, DEFAULT_RECON_CACHE_PATH, \
+    RECON_RING_MANAGER_FILE, RECON_RING_MANAGER_AGENT_FILE, \
+    DEFAULT_RECON_CACHE_PATH, \
     server_type_to_recon_file
 from swift.common.swob import Request
 from swift.common.middleware import recon
@@ -169,6 +170,9 @@ class FakeRecon(object):
 
     def fake_ring_manager(self):
         return {"ringmanagertest": "1"}
+
+    def fake_ring_manager_agent(self):
+        return {"ringmanageragenttest": "1"}
 
     def fake_reconstruction(self):
         return {'reconstructiontest': "1"}
@@ -1355,6 +1359,26 @@ class TestReconSuccess(TestCase):
                            {'ignore_missing': True})])
         self.assertEqual(rv, from_cache_response)
 
+    def test_get_ring_manager_agent_info(self):
+        from_cache_response = {
+            "ring_manager_agent": {
+                "source": "https://ring-ro.example.com:6205",
+                "success": True,
+                "latest_ring_version": "release-1",
+                "last_success": 1700000000.0,
+                "sync_time": 1.2,
+            }}
+        self.fakecache.fakeout_calls = []
+        self.fakecache.fakeout = from_cache_response
+        rv = self.app.get_ring_manager_agent_info()
+        self.assertEqual(self.fakecache.fakeout_calls,
+                         [((['ring_manager_agent'],
+                            self._full_recon_path(
+                                None,
+                                recon_file=RECON_RING_MANAGER_AGENT_FILE)),
+                           {'ignore_missing': True})])
+        self.assertEqual(rv, from_cache_response)
+
 
 class TestReconMiddleware(unittest.TestCase):
 
@@ -1391,6 +1415,8 @@ class TestReconMiddleware(unittest.TestCase):
         self.app.get_sharding_info = self.frecon.fake_sharding
         self.app.get_relinker_info = self.frecon.fake_relinker
         self.app.get_ring_manager_info = self.frecon.fake_ring_manager
+        self.app.get_ring_manager_agent_info = \
+            self.frecon.fake_ring_manager_agent
 
     def test_recon_get_mem(self):
         get_mem_resp = [b'{"memtest": "1"}']
@@ -1685,6 +1711,14 @@ class TestReconMiddleware(unittest.TestCase):
         get_recon_resp = [
             b'{"ringmanagertest": "1"}']
         req = Request.blank('/recon/ring_manager',
+                            environ={'REQUEST_METHOD': 'GET'})
+        resp = self.app(req.environ, start_response)
+        self.assertEqual(resp, get_recon_resp)
+
+    def test_recon_get_ring_manager_agent(self):
+        get_recon_resp = [
+            b'{"ringmanageragenttest": "1"}']
+        req = Request.blank('/recon/ring_manager_agent',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_recon_resp)
