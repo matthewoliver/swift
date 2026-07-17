@@ -26,9 +26,13 @@ directories, while the primary remains the only service that can change
 builder state, queue builds, or publish releases.
 The bulk partition-risk POST is analysis rather than a mutation and is
 available on replicas too.
-swift-ring-manager-sync pulls the primary's latest complete release and its
-immutable artefacts into a replica, then records the result through
-/recon/ring_manager when the recon middleware is in the pipeline.
+swift-ring-manager-sync pulls the latest complete release and immutable
+artefacts from a primary or fresh replica into another replica.
+It validates source status before any download, preserves an upstream
+replica's sync timestamp, and falls through only after a source failure.
+Local write failures abort the sync rather than attempting another source.
+The utility records its result through /recon/ring_manager when the recon
+middleware is in the pipeline.
 Its state and recon timestamp fields use Swift ``NormalTimestamp.internal``
 strings, while elapsed sync time remains numeric seconds.
 

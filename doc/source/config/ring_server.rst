@@ -180,6 +180,7 @@ State-change hook metrics include::
     sync.attempts
     sync.successes
     sync.failures
+    sync.source.failures
     sync.timing
     sync.manifest_files.downloaded
     sync.manifest_files.unchanged
@@ -245,15 +246,22 @@ read-only, so it remains available to these replicas.
 This keeps ring authoring ordered while allowing clients to use replicas for
 discovery, status, manifests, and immutable artefact downloads.
 
-swift-ring-manager-sync pulls one primary's latest published release into
-a read-only or standby server.
-It verifies the declared byte count and SHA-256 digest before recording each
+swift-ring-manager-sync pulls a primary's latest published release, or a
+fresh replica's latest published release, into a read-only or standby server.
+It validates ``/api/v1/ring_manager/status/`` before downloading.
+A primary is accepted directly.
+A read-only or standby source must report fresh, synced, non-stale published
+state with a matching latest version and valid upstream sync timestamp.
+This prevents old last-known-good data from a stale replica being recorded as
+a fresh downstream sync.
+It verifies declared byte counts and SHA-256 digests before recording each
 immutable artefact, then writes the local release manifest and advances
 latest_ring_version only after the full pull succeeds.
 
 For example::
 
     swift-ring-manager-sync https://primary.example.com:6205 \
+        https://ring-ro-1.example.com:6205 \
         --ring-manager-state-dir /etc/swift/ring-manager-state \
         --ring-artifact-dir /etc/swift/ring-manager-artifacts \
         --log-statsd-host 127.0.0.1 \
@@ -267,8 +275,16 @@ not need a credential that can change primary state.
 The direct command also accepts ``--read-key-file`` and ``--admin-key-file``;
 each file option is mutually exclusive with its inline equivalent.
 
-The source URL is supplied explicitly in this initial utility.
-Source failover and configuration-file support are separate follow-on work.
+One or more source URLs may be supplied as positional values or comma-separated
+values.
+The syncer tries sources in order.
+Remote source failures are recorded and fall through to the next source.
+Local state, index, artifact, or cleanup failures abort the attempt rather
+than mixing a partially written local state with a later source.
+When the selected source is a replica, the local state preserves its upstream
+``last_synced_at`` rather than stamping the downstream replica with the
+current time.
+Configuration-file support remains a separate follow-on slice.
 The command records its latest attempt in ring-manager.recon below the
 recon cache directory.
 Place recon before ring-manager-auth to expose /recon/ring_manager without an

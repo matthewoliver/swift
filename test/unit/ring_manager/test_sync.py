@@ -27,7 +27,8 @@ from swift.common.utils import md5
 from swift.ring_manager.common import NormalTimestamp
 from swift.ring_manager.server import RingManagerApplication
 from swift.ring_manager import sync
-from swift.ring_manager.sync import RingManagerSync, RingManagerSyncError
+from swift.ring_manager.sync import RingManagerSync, RingManagerSyncError, \
+    RingManagerSyncLocalError
 from test.debug_logger import debug_logger
 
 
@@ -59,12 +60,16 @@ class FakeOpener(object):
                        for key, value in req.header_items())
         request = {
             'method': req.get_method(),
+            'host': parsed.netloc,
             'path': parsed.path,
             'headers': headers,
             'timeout': timeout,
         }
         self.requests.append(request)
-        route = self.routes[(request['method'], request['path'])]
+        route = self.routes.get((
+            request['method'], parsed.netloc, request['path']))
+        if route is None:
+            route = self.routes[(request['method'], request['path'])]
         if callable(route):
             return route(request)
         return route
@@ -139,6 +144,13 @@ class TestRingManagerSync(unittest.TestCase):
                 },
             ],
         }
+        self.primary_status = {
+            'mode': 'primary',
+            'latest_ring_version': 'release-1',
+            'ring_manager_sync': {
+                'applicable': False,
+            },
+        }
 
     def tearDown(self):
         shutil.rmtree(self.testdir)
@@ -151,6 +163,8 @@ class TestRingManagerSync(unittest.TestCase):
             return FakeResponse(self.artifact_body)
 
         return {
+            ('GET', '/api/v1/ring_manager/status/'):
+                json_response(self.primary_status),
             ('GET', '/api/v1/rings/releases/latest/manifest/'):
                 json_response(self.manifest),
             ('GET', '/api/v1/rings/releases/release-1/files/'
@@ -163,7 +177,7 @@ class TestRingManagerSync(unittest.TestCase):
         }
 
     def _syncer(self, opener, time_func=NormalTimestamp.now, logger=None,
-                **kwargs):
+                source_url='http://primary.example.com:6205', **kwargs):
         sync_kwargs = {
             'admin_key': 'secret',
             'timeout': 12,
@@ -174,10 +188,30 @@ class TestRingManagerSync(unittest.TestCase):
         }
         sync_kwargs.update(kwargs)
         return RingManagerSync(
-            'http://primary.example.com:6205',
+            source_url,
             self.state_dir,
             self.artifact_dir,
             **sync_kwargs)
+
+    def _replica_status(self, mode='readonly',
+                        can_serve_published_reads=True, reasons=None,
+                        latest_ring_version='release-1',
+                        last_synced_at='1700000000.00000',
+                        latest_matches_local=True,
+                        synced=True, fresh=True, stale=False):
+        return {
+            'mode': mode,
+            'ring_manager_sync': {
+                'can_serve_published_reads': can_serve_published_reads,
+                'latest_ring_version': latest_ring_version,
+                'last_synced_at': last_synced_at,
+                'latest_matches_local': latest_matches_local,
+                'synced': synced,
+                'fresh': fresh,
+                'stale': stale,
+                'reasons': reasons or [],
+            },
+        }
 
     def _write_secret(self, name, value):
         path = os.path.join(self.testdir, name)
@@ -310,6 +344,209 @@ class TestRingManagerSync(unittest.TestCase):
             'sync.timing',
             [call[0][0] for call in logger.statsd_client.calls['timing']])
 
+    def test_sync_accepts_fresh_readonly_source(self):
+        routes = self._routes()
+        routes[('GET', '/api/v1/ring_manager/status/')] = json_response(
+            self._replica_status())
+        opener = FakeOpener(routes)
+        self._syncer(
+            opener, source_url='http://ring-ro.example.com:6205').sync()
+
+        with open(os.path.join(self.state_dir, 'index.json')) as fp:
+            index = json.load(fp)
+        self.assertEqual('http://ring-ro.example.com:6205',
+                         index['ring_manager_sync']['source'])
+        self.assertEqual('1700000000.00000',
+                         index['ring_manager_sync']['synced_at'])
+
+    def test_sync_skips_stale_replica_and_falls_back_to_primary(self):
+        routes = self._routes()
+        routes[('GET', 'ring-ro.example.com:6205',
+                '/api/v1/ring_manager/status/')] = json_response(
+                    self._replica_status(
+                        can_serve_published_reads=False,
+                        fresh=False, stale=True,
+                        reasons=['freshness_threshold_exceeded']))
+        routes[('GET', 'primary.example.com:6205',
+                '/api/v1/ring_manager/status/')] = json_response(
+                    self.primary_status)
+        opener = FakeOpener(routes)
+        logger = debug_logger()
+        result = self._syncer(
+            opener, logger=logger,
+            source_url=[
+                'http://ring-ro.example.com:6205',
+                'http://primary.example.com:6205',
+            ]).sync()
+        self.assertEqual('release-1', result['latest_ring_version'])
+
+        with open(os.path.join(self.state_dir, 'index.json')) as fp:
+            index = json.load(fp)
+        self.assertEqual('http://primary.example.com:6205',
+                         index['ring_manager_sync']['source'])
+
+        recon_stats = self._read_recon()['ring_manager_sync']
+        self.assertTrue(recon_stats['success'])
+        self.assertEqual('http://primary.example.com:6205',
+                         recon_stats['source'])
+        self.assertEqual([
+            'http://ring-ro.example.com:6205',
+            'http://primary.example.com:6205',
+        ], recon_stats['sources'])
+        self.assertEqual(1, len(recon_stats['source_errors']))
+        self.assertEqual('http://ring-ro.example.com:6205',
+                         recon_stats['source_errors'][0]['source'])
+        self.assertIn('freshness_threshold_exceeded',
+                      recon_stats['source_errors'][0]['error'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync.source.failures'])
+
+    def test_sync_rejects_replica_missing_required_status_fields(self):
+        routes = self._routes()
+        routes[('GET', '/api/v1/ring_manager/status/')] = json_response({
+            'mode': 'readonly',
+            'ring_manager_sync': {
+                'can_serve_published_reads': True,
+            },
+        })
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerSyncError) as caught:
+            self._syncer(
+                opener, source_url='http://ring-ro.example.com:6205').sync()
+        self.assertIn('not_synced', str(caught.exception))
+        self.assertIn('missing_latest_ring_version', str(caught.exception))
+        self.assertIn('missing_last_synced_at', str(caught.exception))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, 'index.json')))
+
+    def test_sync_rejects_replica_manifest_status_mismatch(self):
+        routes = self._routes()
+        routes[('GET', '/api/v1/ring_manager/status/')] = json_response(
+            self._replica_status(latest_ring_version='release-other'))
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerSyncError) as caught:
+            self._syncer(
+                opener, source_url='http://ring-ro.example.com:6205').sync()
+        self.assertIn('status latest version release-other',
+                      str(caught.exception))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, 'index.json')))
+
+    def test_sync_rejects_stale_replica_without_refreshing_state(self):
+        routes = self._routes()
+        routes[('GET', '/api/v1/ring_manager/status/')] = json_response(
+            self._replica_status(
+                can_serve_published_reads=False,
+                fresh=False, stale=True,
+                reasons=['freshness_threshold_exceeded']))
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerSyncError) as caught:
+            self._syncer(
+                opener, source_url='http://ring-ro.example.com:6205').sync()
+        self.assertIn('cannot serve fresh published reads',
+                      str(caught.exception))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, 'index.json')))
+        self.assertEqual(
+            ['/api/v1/ring_manager/status/'],
+            [request['path'] for request in opener.requests])
+        recon_stats = self._read_recon()['ring_manager_sync']
+        self.assertFalse(recon_stats['success'])
+        self.assertIn('freshness_threshold_exceeded',
+                      recon_stats['error'])
+
+    def test_sync_aborts_on_local_failure_without_fallback(self):
+        routes = self._routes()
+        routes[('GET', 'primary.example.com:6205',
+                '/api/v1/ring_manager/status/')] = json_response(
+                    self.primary_status)
+        routes[('GET', 'ring-ro.example.com:6205',
+                '/api/v1/ring_manager/status/')] = json_response(
+                    self._replica_status())
+        opener = FakeOpener(routes)
+
+        with mock.patch.object(
+                RingManagerSync, '_write_json_atomic',
+                side_effect=RingManagerSyncLocalError('local write failed')):
+            with self.assertRaises(RingManagerSyncLocalError):
+                self._syncer(
+                    opener,
+                    source_url=[
+                        'http://primary.example.com:6205',
+                        'http://ring-ro.example.com:6205',
+                    ]).sync()
+
+        self.assertEqual(
+            ['primary.example.com:6205'],
+            sorted(set(request['host'] for request in opener.requests)))
+        recon_stats = self._read_recon()['ring_manager_sync']
+        self.assertFalse(recon_stats['success'])
+        self.assertNotIn('source_errors', recon_stats)
+        self.assertIn('local write failed', recon_stats['error'])
+
+    def test_sync_aborts_on_invalid_local_index_without_fallback(self):
+        os.makedirs(self.state_dir)
+        with open(os.path.join(self.state_dir, 'index.json'), 'w') as fp:
+            fp.write('[]')
+        routes = self._routes()
+        routes[('GET', 'primary.example.com:6205',
+                '/api/v1/ring_manager/status/')] = json_response(
+                    self.primary_status)
+        routes[('GET', 'ring-ro.example.com:6205',
+                '/api/v1/ring_manager/status/')] = json_response(
+                    self._replica_status())
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerSyncLocalError) as caught:
+            self._syncer(
+                opener,
+                source_url=[
+                    'http://primary.example.com:6205',
+                    'http://ring-ro.example.com:6205',
+                ]).sync()
+        self.assertIn('local index.json must be an object',
+                      str(caught.exception))
+        self.assertEqual(
+            ['primary.example.com:6205'],
+            sorted(set(request['host'] for request in opener.requests)))
+
+    def test_sync_aborts_on_artifact_write_failure_without_fallback(self):
+        routes = self._routes()
+        routes[('GET', 'primary.example.com:6205',
+                '/api/v1/ring_manager/status/')] = json_response(
+                    self.primary_status)
+        routes[('GET', 'ring-ro.example.com:6205',
+                '/api/v1/ring_manager/status/')] = json_response(
+                    self._replica_status())
+        opener = FakeOpener(routes)
+        logger = debug_logger()
+
+        with mock.patch.object(
+                RingManagerSync, '_write_file_atomic',
+                side_effect=RingManagerSyncLocalError(
+                    'artifact write failed')):
+            with self.assertRaises(RingManagerSyncLocalError):
+                self._syncer(
+                    opener, logger=logger,
+                    source_url=[
+                        'http://primary.example.com:6205',
+                        'http://ring-ro.example.com:6205',
+                    ]).sync()
+
+        self.assertEqual(
+            ['primary.example.com:6205'],
+            sorted(set(request['host'] for request in opener.requests)))
+        recon_stats = self._read_recon()['ring_manager_sync']
+        self.assertFalse(recon_stats['success'])
+        self.assertNotIn('source_errors', recon_stats)
+        self.assertIn('artifact write failed', recon_stats['error'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['sync.failures'])
+        self.assertNotIn('sync.source.failures', counts)
+
     def test_sync_uses_conditional_request_for_existing_artifact(self):
         local_path = os.path.join(
             self.artifact_dir, 'release-1', 'account.ring.gz')
@@ -396,7 +633,7 @@ class TestRingManagerSync(unittest.TestCase):
         with self.assertRaises(RingManagerSyncError) as cm:
             self._syncer(opener).sync()
         self.assertIn('same-origin relative URL', str(cm.exception))
-        self.assertEqual(1, len(opener.requests))
+        self.assertEqual(2, len(opener.requests))
 
     def test_sync_rejects_artifact_url_dot_segments(self):
         manifest = dict(self.manifest)
@@ -411,7 +648,7 @@ class TestRingManagerSync(unittest.TestCase):
         with self.assertRaises(RingManagerSyncError) as cm:
             self._syncer(opener).sync()
         self.assertIn('dot segments', str(cm.exception))
-        self.assertEqual(1, len(opener.requests))
+        self.assertEqual(2, len(opener.requests))
 
     def test_sync_parser_accepts_read_credentials(self):
         from swift.ring_manager.sync import _make_parser
@@ -443,6 +680,61 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertEqual('/etc/swift/secrets/admin.key',
                          options.admin_key_file)
         self.assertEqual('/etc/swift/secrets/read.key', options.read_key_file)
+
+    def test_sync_parser_accepts_multiple_sources(self):
+        from swift.ring_manager.sync import _make_parser
+
+        _options, args = _make_parser().parse_args([
+            'https://primary.example.com:6205,'
+            'https://ring-ro.example.com:6205',
+            'https://ring-standby.example.com:6205',
+            '--ring-manager-state-dir', self.state_dir,
+            '--ring-artifact-dir', self.artifact_dir,
+        ])
+
+        self.assertEqual([
+            'https://primary.example.com:6205,'
+            'https://ring-ro.example.com:6205',
+            'https://ring-standby.example.com:6205',
+        ], args)
+
+    def test_sync_normalizes_comma_separated_sources(self):
+        syncer = self._syncer(
+            FakeOpener(self._routes()),
+            source_url=[
+                'http://primary.example.com:6205,'
+                'http://ring-ro.example.com:6205',
+                'http://ring-standby.example.com:6205',
+            ])
+
+        self.assertEqual([
+            'http://primary.example.com:6205',
+            'http://ring-ro.example.com:6205',
+            'http://ring-standby.example.com:6205',
+        ], syncer.source_urls)
+
+    def test_sync_main_passes_multiple_sources(self):
+        with mock.patch.object(sync, 'RingManagerSync') as syncer:
+            syncer.return_value.sync.return_value = {
+                'latest_ring_version': 'release-1',
+                'rings_synced': 1,
+                'ring_versions_synced': 1,
+                'manifest_files_downloaded': 1,
+                'manifest_files_unchanged': 0,
+            }
+            status = sync.main([
+                'https://primary.example.com:6205',
+                'https://ring-ro.example.com:6205',
+                '--ring-manager-state-dir', self.state_dir,
+                '--ring-artifact-dir', self.artifact_dir,
+                '--quiet',
+            ])
+
+        self.assertEqual(0, status)
+        self.assertEqual([
+            'https://primary.example.com:6205',
+            'https://ring-ro.example.com:6205',
+        ], syncer.call_args[0][0])
 
     def test_sync_main_passes_read_credentials(self):
         with mock.patch.object(sync, 'RingManagerSync') as syncer:

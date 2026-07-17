@@ -24,7 +24,8 @@ from urllib.parse import quote, urljoin
 from swift.common.concurrency import socket, urllib_request
 from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
     RECON_RING_MANAGER_FILE
-from swift.common.utils import NullLogger, dump_recon_cache, get_logger, mkdirs
+from swift.common.utils import NullLogger, dump_recon_cache, get_logger, \
+    list_from_csv, mkdirs
 from swift.common.utils import md5
 from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
     load_secret, NormalTimestamp, StateChangeHook, normal_timestamp, \
@@ -35,6 +36,10 @@ USER_AGENT = 'swift-ring-manager-sync'
 
 
 class RingManagerSyncError(Exception):
+    pass
+
+
+class RingManagerSyncLocalError(RingManagerSyncError):
     pass
 
 
@@ -60,7 +65,8 @@ class RingManagerSync(object):
             raise RingManagerSyncError('ring_manager_state_dir is required')
         if not artifact_dir:
             raise RingManagerSyncError('ring_artifact_dir is required')
-        self.source_url = source_url.rstrip('/')
+        self.source_urls = self._normalize_source_urls(source_url)
+        self.source_url = self.source_urls[0]
         self.state_dir = state_dir
         self.artifact_dir = artifact_dir
         try:
@@ -84,6 +90,24 @@ class RingManagerSync(object):
             state_change_hook, state_dir=state_dir,
             timeout=state_change_hook_timeout, logger=self.logger)
 
+    def _normalize_source_urls(self, source_url):
+        values = source_url
+        if isinstance(values, str):
+            values = list_from_csv(values)
+        urls = []
+        for value in values:
+            if isinstance(value, str):
+                urls.extend(list_from_csv(value))
+            else:
+                urls.append(value)
+        urls = [str(url).rstrip('/') for url in urls if url]
+        if not urls:
+            raise RingManagerSyncError('source_url is required')
+        return urls
+
+    def _source_urls(self):
+        return list(self.source_urls)
+
     def _timestamp(self, timestamp=None):
         timestamp = self.time_func() if timestamp is None else timestamp
         return normal_timestamp(timestamp)
@@ -91,8 +115,8 @@ class RingManagerSync(object):
     def _safe_id(self, value):
         return quote(str(value), safe='')
 
-    def _api_url(self, path_or_url):
-        return urljoin(self.source_url + '/', path_or_url)
+    def _api_url(self, source_url, path_or_url):
+        return urljoin(source_url + '/', path_or_url)
 
     def _headers(self, extra=None):
         headers = {'User-Agent': USER_AGENT}
@@ -109,8 +133,8 @@ class RingManagerSync(object):
             headers.update(extra)
         return headers
 
-    def _request(self, path_or_url, headers=None):
-        url = self._api_url(path_or_url)
+    def _request(self, source_url, path_or_url, headers=None):
+        url = self._api_url(source_url, path_or_url)
         req = urllib_request.Request(url, headers=self._headers(headers))
         try:
             resp = self.opener(req, timeout=self.timeout)
@@ -140,8 +164,8 @@ class RingManagerSync(object):
                     url, status, body.decode('utf-8', 'replace')))
         return status, body, resp.info()
 
-    def _json_request(self, path):
-        _status, body, _headers = self._request(path)
+    def _json_request(self, source_url, path):
+        _status, body, _headers = self._request(source_url, path)
         try:
             value = json.loads(body.decode('utf-8'))
         except (TypeError, ValueError, UnicodeDecodeError) as err:
@@ -165,11 +189,29 @@ class RingManagerSync(object):
             os.makedirs(directory)
 
     def _write_file_atomic(self, path, body):
-        self._mkdirs(path)
-        temp_path = '%s.tmp-%s' % (path, uuid.uuid4().hex)
-        with open(temp_path, 'wb') as fp:
-            fp.write(body)
-        os.rename(temp_path, path)
+        temp_path = None
+        try:
+            self._mkdirs(path)
+            temp_path = '%s.tmp-%s' % (path, uuid.uuid4().hex)
+            with open(temp_path, 'wb') as fp:
+                fp.write(body)
+            os.rename(temp_path, path)
+            temp_path = None
+        except RingManagerSyncLocalError:
+            raise
+        except Exception as err:
+            raise RingManagerSyncLocalError(
+                'local ring-manager sync write failed for %s: %s' %
+                (path, err))
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError as err:
+                    if err.errno != errno.ENOENT:
+                        raise RingManagerSyncLocalError(
+                            'local ring-manager sync cleanup failed for %s: '
+                            '%s' % (temp_path, err))
 
     def _write_json_atomic(self, path, value):
         body = json.dumps(value, sort_keys=True, indent=2).encode('ascii')
@@ -183,7 +225,13 @@ class RingManagerSync(object):
         except IOError as err:
             if err.errno == errno.ENOENT:
                 return default
-            raise
+            raise RingManagerSyncLocalError(
+                'local ring-manager sync read failed for %s: %s' %
+                (path, err))
+        except ValueError as err:
+            raise RingManagerSyncLocalError(
+                'local ring-manager sync JSON read failed for %s: %s' %
+                (path, err))
 
     def _local_artifact_relpath(self, version, file_info):
         return os.path.join(
@@ -231,14 +279,15 @@ class RingManagerSync(object):
         except ValueError as err:
             raise RingManagerSyncError(str(err))
 
-    def _download_file(self, file_info, default_url, local_path):
+    def _download_file(self, source_url, file_info, default_url, local_path):
         headers = {}
         if file_info.get('sha256'):
             etag = self._verified_artifact_etag(local_path, file_info)
             if etag:
                 headers['If-None-Match'] = etag
         url = self._file_url(file_info, default_url)
-        status, body, _headers = self._request(url, headers=headers)
+        status, body, _headers = self._request(
+            source_url, url, headers=headers)
         if status == 304:
             return 'unchanged'
         self._verify_download(body, file_info, url)
@@ -252,7 +301,7 @@ class RingManagerSync(object):
         local_info['path'] = self._local_artifact_relpath(version, file_info)
         return local_info
 
-    def _sync_manifest_files(self, manifest):
+    def _sync_manifest_files(self, source_url, manifest):
         version = str(manifest.get('version', ''))
         if not version:
             raise RingManagerSyncError('latest manifest has no version')
@@ -271,7 +320,8 @@ class RingManagerSync(object):
             default_url = '/api/v1/rings/releases/%s/files/%s' % (
                 quote(version, safe=''),
                 quote(file_info['name'], safe=''))
-            result = self._download_file(file_info, default_url, local_path)
+            result = self._download_file(
+                source_url, file_info, default_url, local_path)
             if result == 'downloaded':
                 downloaded += 1
             else:
@@ -286,8 +336,8 @@ class RingManagerSync(object):
         local_manifest['files'] = localized_files
         return version, local_manifest, downloaded, unchanged
 
-    def _sync_rings(self):
-        collection = self._json_request('/api/v1/rings/')
+    def _sync_rings(self, source_url):
+        collection = self._json_request(source_url, '/api/v1/rings/')
         objects = collection.get('objects', [])
         if not isinstance(objects, list):
             raise RingManagerSyncError(
@@ -306,7 +356,8 @@ class RingManagerSync(object):
             synced += 1
         return synced
 
-    def _sync_ring_artifact_versions(self, manifest_version, manifest):
+    def _sync_ring_artifact_versions(self, source_url, manifest_version,
+                                     manifest):
         synced = 0
         downloaded = unchanged = 0
         for ring in manifest.get('rings', []):
@@ -317,6 +368,7 @@ class RingManagerSync(object):
             if ring_id in (None, '') or version_id in (None, ''):
                 continue
             version = self._json_request(
+                source_url,
                 '/api/v1/rings/%s/versions/%s/' % (
                     quote(str(ring_id), safe=''),
                     quote(str(version_id), safe='')))
@@ -340,7 +392,7 @@ class RingManagerSync(object):
                     quote(str(version_id), safe=''),
                     quote(file_info['name'], safe=''))
                 result = self._download_file(
-                    file_info, default_url, local_path)
+                    source_url, file_info, default_url, local_path)
                 if result == 'downloaded':
                     downloaded += 1
                 else:
@@ -360,14 +412,15 @@ class RingManagerSync(object):
             synced += 1
         return synced, downloaded, unchanged
 
-    def _write_latest(self, version, synced_at):
+    def _write_latest(self, source_url, version, synced_at):
         index_path = self._state_path('index.json')
         index = self._read_json(index_path, {})
         if not isinstance(index, dict):
-            raise RingManagerSyncError('local index.json must be an object')
+            raise RingManagerSyncLocalError(
+                'local index.json must be an object')
         index['latest_ring_version'] = version
         index['ring_manager_sync'] = {
-            'source': self.source_url,
+            'source': source_url,
             'latest_ring_version': version,
             'synced_at': synced_at,
         }
@@ -385,10 +438,11 @@ class RingManagerSync(object):
         dump_recon_cache({'ring_manager_sync': sync_stats},
                          self.recon_cache, self.logger)
 
-    def _sync_stats(self, started_at, ended_at, synced_at, result):
+    def _sync_stats(self, source_url, started_at, ended_at, synced_at, result,
+                    source_errors=None):
         stats = dict(result)
         stats.update({
-            'source': self.source_url,
+            'source': source_url,
             'success': True,
             'sync_time': float(ended_at) - float(started_at),
             'last_attempt': ended_at.internal,
@@ -397,81 +451,204 @@ class RingManagerSync(object):
             'last_synced_at': synced_at,
             'error': {},
         })
+        if len(self.source_urls) > 1:
+            stats['sources'] = list(self.source_urls)
+        if source_errors:
+            stats['source_errors'] = list(source_errors)
         return stats
 
-    def _failure_stats(self, started_at, err):
+    def _failure_stats(self, started_at, err, source_url=None,
+                       source_errors=None):
         ended_at = self._timestamp()
         attempted_at = ended_at.internal
-        return {
-            'source': self.source_url,
+        stats = {
+            'source': source_url or self.source_url,
             'success': False,
             'sync_time': float(ended_at) - float(started_at),
             'last_attempt': ended_at.internal,
             'last_attempted_at': attempted_at,
             'error': str(err),
         }
+        if len(self.source_urls) > 1:
+            stats['sources'] = list(self.source_urls)
+        if source_errors:
+            stats['source_errors'] = list(source_errors)
+        return stats
+
+    def _source_status(self, source_url):
+        return self._json_request(source_url,
+                                  '/api/v1/ring_manager/status/')
+
+    def _validate_source(self, source_url):
+        status = self._source_status(source_url)
+        mode = status.get('mode')
+        if mode == 'primary':
+            return {
+                'mode': mode,
+                'latest_ring_version': status.get('latest_ring_version'),
+                'sync_timestamp': None,
+            }
+        if mode in ('readonly', 'standby'):
+            sync_status = status.get('ring_manager_sync')
+            if not isinstance(sync_status, dict):
+                raise RingManagerSyncError(
+                    'source %s is %s but did not include ring_manager_sync '
+                    'status' % (source_url, mode))
+            blockers = []
+            if sync_status.get('can_serve_published_reads') is not True:
+                blockers.append('cannot_serve_published_reads')
+            if sync_status.get('synced') is not True:
+                blockers.append('not_synced')
+            if sync_status.get('fresh') is not True:
+                blockers.append('not_fresh')
+            if sync_status.get('stale') is True:
+                blockers.append('stale')
+            if sync_status.get('latest_matches_local') is not True:
+                blockers.append('latest_mismatch_or_unknown')
+            sync_latest = sync_status.get('latest_ring_version')
+            if sync_latest in (None, ''):
+                blockers.append('missing_latest_ring_version')
+            synced_at = sync_status.get('last_synced_at') or \
+                sync_status.get('synced_at')
+            if synced_at in (None, ''):
+                blockers.append('missing_last_synced_at')
+            else:
+                try:
+                    synced_at = NormalTimestamp(synced_at).internal
+                except (TypeError, ValueError, AssertionError):
+                    blockers.append('invalid_last_synced_at')
+            if blockers:
+                reasons = sync_status.get('reasons')
+                if isinstance(reasons, list) and reasons:
+                    blockers.extend(str(reason) for reason in reasons)
+                raise RingManagerSyncError(
+                    'source %s is %s but cannot serve fresh published reads: '
+                    '%s' % (source_url, mode, ', '.join(blockers)))
+            return {
+                'mode': mode,
+                'latest_ring_version': str(sync_latest),
+                'sync_timestamp': synced_at,
+            }
+        raise RingManagerSyncError(
+            'source %s returned unsupported ring-manager mode %r' %
+            (source_url, mode))
+
+    def _sync_from_source(self, source_url):
+        source_status = self._validate_source(source_url)
+        manifest = self._json_request(
+            source_url, '/api/v1/rings/releases/latest/manifest/')
+        version, local_manifest, downloaded, unchanged = \
+            self._sync_manifest_files(source_url, manifest)
+        source_latest = source_status.get('latest_ring_version')
+        if source_latest not in (None, '') and str(source_latest) != version:
+            raise RingManagerSyncError(
+                'source %s status latest version %s does not match latest '
+                'manifest version %s' % (source_url, source_latest, version))
+        rings = self._sync_rings(source_url)
+        per_ring, per_ring_downloaded, per_ring_unchanged = \
+            self._sync_ring_artifact_versions(source_url, version, manifest)
+
+        self._write_json_atomic(
+            self._state_path(
+                'releases', self._safe_id(version), 'manifest.json'),
+            local_manifest)
+        ended_at = self._timestamp()
+        synced_at = source_status.get('sync_timestamp') or ended_at.internal
+        self._write_latest(source_url, version, synced_at)
+
+        return {
+            'latest_ring_version': version,
+            'manifest_files_downloaded': downloaded,
+            'manifest_files_unchanged': unchanged,
+            'rings_synced': rings,
+            'ring_versions_synced': per_ring,
+            'ring_version_files_downloaded': per_ring_downloaded,
+            'ring_version_files_unchanged': per_ring_unchanged,
+        }, synced_at, ended_at
+
+    def _record_failure(self, started_at, err, source_url=None,
+                        source_errors=None):
+        ended_at = self._timestamp()
+        stats_increment(self.logger, 'sync.failures')
+        stats_timing(
+            self.logger, 'sync.timing',
+            float(ended_at) - float(started_at))
+        self._dump_recon(self._failure_stats(
+            started_at, err, source_url=source_url,
+            source_errors=source_errors))
 
     def sync(self):
         started_at = self._timestamp()
         stats_increment(self.logger, 'sync.attempts')
-        try:
-            manifest = self._json_request(
-                '/api/v1/rings/releases/latest/manifest/')
-            version, local_manifest, downloaded, unchanged = \
-                self._sync_manifest_files(manifest)
-            rings = self._sync_rings()
-            per_ring, per_ring_downloaded, per_ring_unchanged = \
-                self._sync_ring_artifact_versions(version, manifest)
+        source_errors = []
+        last_source = None
+        last_error = None
+        for source_url in self._source_urls():
+            last_source = source_url
+            try:
+                result, synced_at, ended_at = self._sync_from_source(
+                    source_url)
+            except RingManagerSyncLocalError as err:
+                self._record_failure(
+                    started_at, err, source_url=source_url,
+                    source_errors=source_errors)
+                raise
+            except Exception as err:
+                last_error = err
+                stats_increment(self.logger, 'sync.source.failures')
+                self.logger.warning(
+                    'Unable to sync ring-manager state from %s: %s',
+                    source_url, err)
+                source_errors.append({
+                    'source': source_url,
+                    'error': str(err),
+                })
+                continue
 
-            self._write_json_atomic(
-                self._state_path(
-                    'releases', self._safe_id(version), 'manifest.json'),
-                local_manifest)
-            ended_at = self._timestamp()
-            synced_at = ended_at.internal
-            self._write_latest(version, synced_at)
-
-            result = {
-                'latest_ring_version': version,
-                'manifest_files_downloaded': downloaded,
-                'manifest_files_unchanged': unchanged,
-                'rings_synced': rings,
-                'ring_versions_synced': per_ring,
-                'ring_version_files_downloaded': per_ring_downloaded,
-                'ring_version_files_unchanged': per_ring_unchanged,
-            }
             stats_increment(self.logger, 'sync.successes')
             stats_timing(
                 self.logger, 'sync.timing',
                 float(ended_at) - float(started_at))
             stats_increment(
-                self.logger, 'sync.manifest_files.downloaded', downloaded)
+                self.logger, 'sync.manifest_files.downloaded',
+                result['manifest_files_downloaded'])
             stats_increment(
-                self.logger, 'sync.manifest_files.unchanged', unchanged)
-            stats_increment(self.logger, 'sync.rings_synced', rings)
-            stats_increment(self.logger, 'sync.ring_versions_synced', per_ring)
+                self.logger, 'sync.manifest_files.unchanged',
+                result['manifest_files_unchanged'])
+            stats_increment(self.logger, 'sync.rings_synced',
+                            result['rings_synced'])
+            stats_increment(self.logger, 'sync.ring_versions_synced',
+                            result['ring_versions_synced'])
             stats_increment(
                 self.logger, 'sync.ring_version_files.downloaded',
-                per_ring_downloaded)
+                result['ring_version_files_downloaded'])
             stats_increment(
                 self.logger, 'sync.ring_version_files.unchanged',
-                per_ring_unchanged)
+                result['ring_version_files_unchanged'])
             self._dump_recon(
-                self._sync_stats(started_at, ended_at, synced_at, result))
+                self._sync_stats(
+                    source_url, started_at, ended_at, synced_at, result,
+                    source_errors=source_errors))
             return result
-        except Exception as err:
-            ended_at = self._timestamp()
-            stats_increment(self.logger, 'sync.failures')
-            stats_timing(
-                self.logger, 'sync.timing',
-                float(ended_at) - float(started_at))
-            self._dump_recon(self._failure_stats(started_at, err))
-            raise
+
+        if len(self.source_urls) == 1 and last_error is not None:
+            self._record_failure(
+                started_at, last_error, source_url=last_source,
+                source_errors=source_errors)
+            raise last_error
+        err = RingManagerSyncError(
+            'all ring-manager sources failed: %s' % '; '.join(
+                '%s: %s' % (item['source'], item['error'])
+                for item in source_errors))
+        self._record_failure(
+            started_at, err, source_url=last_source,
+            source_errors=source_errors)
+        raise err
 
 
 def _make_parser():
     parser = optparse.OptionParser(
-        usage='%prog SOURCE_URL [options]',
+        usage='%prog SOURCE_URL [SOURCE_URL ...] [options]',
         description='Sync published ring-manager state and artifacts from '
                     'SOURCE_URL into a local ring-manager state directory.')
     parser.add_option(
@@ -544,7 +721,7 @@ def _make_parser():
 def main(argv=None):
     parser = _make_parser()
     options, args = parser.parse_args(argv)
-    if len(args) != 1:
+    if len(args) < 1:
         parser.print_usage()
         print('Error: SOURCE_URL is required')
         return 1
@@ -563,7 +740,7 @@ def main(argv=None):
             options.log_statsd_metric_prefix
     try:
         syncer = RingManagerSync(
-            args[0],
+            args,
             options.state_dir,
             options.artifact_dir,
             admin_key=options.admin_key,
