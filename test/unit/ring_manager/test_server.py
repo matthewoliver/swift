@@ -353,6 +353,18 @@ class TestRingManagerApplication(unittest.TestCase):
             'promotion_blockers': [],
             'reasons': ['mode_not_replicated'],
         }, body['ring_manager_sync'])
+        self.assertEqual({
+            'needed': False,
+            'reasons': [],
+            'sync': {
+                'needed': False,
+                'reasons': [],
+            },
+            'promotion': {
+                'needed': False,
+                'blockers': [],
+            },
+        }, body['operator_attention'])
 
     def _timestamp_seconds_ago(self, seconds):
         return NormalTimestamp(
@@ -417,6 +429,7 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertTrue(sync['published_state_promote_ready'])
         self.assertEqual([], sync['promotion_blockers'])
         self.assertEqual([], sync['reasons'])
+        self.assertFalse(body['operator_attention']['needed'])
 
     def test_standby_status_blocks_pending_sync_transaction(self):
         self._write_sync_index(self._timestamp_seconds_ago(10))
@@ -453,11 +466,20 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertFalse(sync['published_state_promote_ready'])
         self.assertEqual(['no_sync_source'], sync['promotion_blockers'])
         self.assertEqual([], sync['reasons'])
+        attention = body['operator_attention']
+        self.assertTrue(attention['needed'])
+        self.assertEqual(['promotion_not_ready'], attention['reasons'])
+        self.assertFalse(attention['sync']['needed'])
+        self.assertTrue(attention['promotion']['needed'])
+        self.assertEqual(['no_sync_source'],
+                         attention['promotion']['blockers'])
 
     def test_standby_status_reports_stale_sync(self):
         self._write_sync_index(self._timestamp_seconds_ago(301))
-        resp, body = self.get_json(
-            '/api/v1/ring_manager/status/', app=self._status_app())
+        logger = debug_logger()
+        app = self._status_app()
+        app.logger = logger
+        resp, body = self.get_json('/api/v1/ring_manager/status/', app=app)
 
         self.assertEqual(200, resp.status_int)
         sync = body['ring_manager_sync']
@@ -469,6 +491,22 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertIn('freshness_threshold_exceeded', sync['reasons'])
         self.assertIn('freshness_threshold_exceeded',
                       sync['promotion_blockers'])
+        attention = body['operator_attention']
+        self.assertTrue(attention['needed'])
+        self.assertEqual(['sync_not_fresh', 'promotion_not_ready'],
+                         attention['reasons'])
+        self.assertTrue(attention['sync']['needed'])
+        self.assertEqual(['freshness_threshold_exceeded'],
+                         attention['sync']['reasons'])
+        self.assertTrue(attention['promotion']['needed'])
+        self.assertEqual(['freshness_threshold_exceeded'],
+                         attention['promotion']['blockers'])
+        counts = logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['operator_attention'])
+        self.assertEqual(1, counts['operator_attention.sync'])
+        self.assertEqual(1, counts['operator_attention.promotion'])
+        self.assertEqual(1, counts['operator_attention.sync_not_fresh'])
+        self.assertEqual(1, counts['operator_attention.promotion_not_ready'])
 
     def test_standby_status_fails_closed_with_latest_version_mismatch(self):
         self._write_sync_index(
@@ -562,6 +600,7 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertTrue(sync['stale'])
         self.assertIn('invalid_state_index', sync['reasons'])
         self.assertIn('error', sync)
+        self.assertTrue(body['operator_attention']['needed'])
 
     def test_request_statsd_metrics(self):
         resp, body = self.get_json('/api/v1/rings/')

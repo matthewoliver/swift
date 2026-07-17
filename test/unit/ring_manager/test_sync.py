@@ -354,6 +354,15 @@ class TestRingManagerSync(unittest.TestCase):
                          recon_stats['last_success'])
         self.assertEqual('1700000000.00000',
                          recon_stats['last_synced_at'])
+        self.assertEqual({
+            'needed': False,
+            'reasons': [],
+            'source_errors': 0,
+            'sync_transaction': {
+                'pending': False,
+                'recovery_failed': False,
+            },
+        }, recon_stats['operator_attention'])
         self.assertNotIn('error', recon_stats)
 
         with open(os.path.join(
@@ -670,8 +679,19 @@ class TestRingManagerSync(unittest.TestCase):
                          recon_stats['source_errors'][0]['source'])
         self.assertIn('freshness_threshold_exceeded',
                       recon_stats['source_errors'][0]['error'])
+        self.assertEqual({
+            'needed': True,
+            'reasons': ['source_errors'],
+            'source_errors': 1,
+            'sync_transaction': {
+                'pending': False,
+                'recovery_failed': False,
+            },
+        }, recon_stats['operator_attention'])
         counts = logger.statsd_client.get_stats_counts()
         self.assertEqual(1, counts['sync.source.failures'])
+        self.assertEqual(1, counts['sync.operator_attention'])
+        self.assertEqual(1, counts['sync.operator_attention.source_errors'])
 
     def test_sync_rejects_replica_missing_required_status_fields(self):
         routes = self._routes()
@@ -758,6 +778,9 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertFalse(recon_stats['success'])
         self.assertNotIn('source_errors', recon_stats)
         self.assertIn('local write failed', recon_stats['error'])
+        self.assertEqual(['sync_failed'],
+                         recon_stats['operator_attention']['reasons'])
+        self.assertTrue(recon_stats['operator_attention']['needed'])
 
     def test_sync_rolls_back_transaction_on_latest_write_failure(self):
         os.makedirs(os.path.join(self.state_dir, 'rings'))
@@ -989,6 +1012,15 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertEqual(1, counts['sync.failures'])
         self.assertEqual(1, counts['sync.transaction.pending'])
         self.assertEqual(1, counts['sync.transaction.recovery_failures'])
+        self.assertEqual([
+            'sync_failed',
+            'sync_transaction_recovery_failed',
+        ], recon_stats['operator_attention']['reasons'])
+        self.assertEqual(1, counts['sync.operator_attention'])
+        self.assertEqual(
+            1,
+            counts['sync.operator_attention.'
+                   'sync_transaction_recovery_failed'])
 
     def test_sync_aborts_on_invalid_local_index_without_fallback(self):
         os.makedirs(self.state_dir)

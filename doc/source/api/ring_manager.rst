@@ -275,6 +275,10 @@ Its latest success or error is available from /recon/ring_manager when the
 recon middleware is configured.
 The recon result includes a ``sync_transaction`` summary, with recovery
 details when the utility observes or recovers a pending journal.
+It also includes ``operator_attention`` on success and failure.
+This is ``needed=true`` for failed sync attempts, fallback source errors, and
+failed transaction recovery, with matching ``sync.operator_attention`` and
+``sync.operator_attention.<reason>`` StatsD counters.
 State and recon timestamp fields use Swift ``NormalTimestamp.internal``
 strings, such as ``1700000000.00000``; elapsed sync time remains numeric
 seconds.
@@ -601,6 +605,18 @@ Example response::
         },
         "promotion_blockers": ["mode_not_standby"],
         "reasons": []
+      },
+      "operator_attention": {
+        "needed": false,
+        "reasons": [],
+        "sync": {
+          "needed": false,
+          "reasons": []
+        },
+        "promotion": {
+          "needed": false,
+          "blockers": []
+        }
       }
     }
 
@@ -630,6 +646,15 @@ The ``promotion_readiness`` response from ``?promotion=true`` also checks
 local builder files for enabled rings.
 Neither response fences the old primary, redirects writers, or performs
 automatic failover.
+
+``operator_attention`` summarizes conditions that should page or stop an HA
+runbook without requiring it to interpret every status field.
+It is ``needed=true`` when synchronized state is not fresh enough to prefer
+for current reads, when a sync transaction is pending recovery, or when the
+standby's published-state promotion precheck fails.
+The server emits ``operator_attention``, ``operator_attention.sync``,
+``operator_attention.promotion``, and ``operator_attention.<reason>`` StatsD
+counters when this state is present.
 
 Method negotiation
 ==================

@@ -16,6 +16,7 @@ import errno
 import json
 import optparse
 import os
+import re
 import sys
 import uuid
 
@@ -346,6 +347,44 @@ class RingManagerSync(object):
                 self.logger, 'sync.transaction.committed_cleanups')
         else:
             stats_increment(self.logger, 'sync.transaction.rollbacks')
+
+    def _metric_suffix(self, value):
+        return re.sub(r'[^A-Za-z0-9_.-]+', '_', str(value))
+
+    def _operator_attention_status(self, success=True, source_errors=None,
+                                   sync_transaction=None):
+        source_errors = list(source_errors or [])
+        sync_transaction = (
+            sync_transaction or self._default_sync_transaction_stats())
+        reasons = []
+        if not success:
+            reasons.append('sync_failed')
+        if source_errors:
+            reasons.append('source_errors')
+        if sync_transaction.get('recovery_failed'):
+            reasons.append('sync_transaction_recovery_failed')
+        elif sync_transaction.get('pending') and not \
+                sync_transaction.get('recovered'):
+            reasons.append('sync_transaction_pending')
+        return {
+            'needed': bool(reasons),
+            'reasons': reasons,
+            'source_errors': len(source_errors),
+            'sync_transaction': {
+                'pending': bool(sync_transaction.get('pending')),
+                'recovery_failed': bool(
+                    sync_transaction.get('recovery_failed')),
+            },
+        }
+
+    def _emit_operator_attention_metrics(self, attention):
+        if not attention.get('needed'):
+            return
+        stats_increment(self.logger, 'sync.operator_attention')
+        for reason in attention.get('reasons') or []:
+            stats_increment(
+                self.logger,
+                'sync.operator_attention.%s' % self._metric_suffix(reason))
 
     def _write_sync_journal(self, journal):
         self._write_file_atomic(
@@ -1032,6 +1071,9 @@ class RingManagerSync(object):
             stats['sources'] = list(self.source_urls)
         if source_errors:
             stats['source_errors'] = list(source_errors)
+        stats['operator_attention'] = self._operator_attention_status(
+            success=True, source_errors=source_errors,
+            sync_transaction=stats['sync_transaction'])
         return stats
 
     def _failure_stats(self, started_at, err, source_url=None,
@@ -1052,6 +1094,9 @@ class RingManagerSync(object):
             stats['sources'] = list(self.source_urls)
         if source_errors:
             stats['source_errors'] = list(source_errors)
+        stats['operator_attention'] = self._operator_attention_status(
+            success=False, source_errors=source_errors,
+            sync_transaction=stats['sync_transaction'])
         return stats
 
     def _source_status(self, source_url):
@@ -1178,9 +1223,11 @@ class RingManagerSync(object):
         stats_timing(
             self.logger, 'sync.timing',
             float(ended_at) - float(started_at))
-        self._dump_recon(self._failure_stats(
+        stats = self._failure_stats(
             started_at, err, source_url=source_url,
-            source_errors=source_errors, sync_transaction=sync_transaction))
+            source_errors=source_errors, sync_transaction=sync_transaction)
+        self._emit_operator_attention_metrics(stats['operator_attention'])
+        self._dump_recon(stats)
 
     def sync(self):
         started_at = self._timestamp()
@@ -1266,11 +1313,13 @@ class RingManagerSync(object):
             stats_increment(
                 self.logger, 'sync.builder_files.skipped_disabled',
                 result['builder_files_skipped_disabled'])
-            self._dump_recon(
-                self._sync_stats(
-                    source_url, started_at, ended_at, synced_at, result,
-                    source_errors=source_errors,
-                    sync_transaction=sync_transaction))
+            sync_stats = self._sync_stats(
+                source_url, started_at, ended_at, synced_at, result,
+                source_errors=source_errors,
+                sync_transaction=sync_transaction)
+            self._emit_operator_attention_metrics(
+                sync_stats['operator_attention'])
+            self._dump_recon(sync_stats)
             return result
 
         if len(self.source_urls) == 1 and last_error is not None:

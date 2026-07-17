@@ -50,6 +50,10 @@ The utility records its result through /recon/ring_manager when the recon
 middleware is in the pipeline. Recon includes a ``sync_transaction`` summary,
 and StatsD emits ``sync.transaction.*`` counters when a transaction journal is
 pending, recovered, rolled back, cleaned up, or fails recovery.
+Recon also records ``operator_attention`` for failed sync attempts, source
+fallback errors, and failed transaction recovery.
+The status endpoint summarizes stale sync, pending transaction, and standby
+promotion-precheck conditions with the same low-cardinality attention signal.
 Its state and recon timestamp fields use Swift ``NormalTimestamp.internal``
 strings, while elapsed sync time remains numeric seconds.
 

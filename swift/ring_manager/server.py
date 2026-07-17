@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 import sys
 
 from swift import __version__ as swift_version
@@ -396,6 +397,63 @@ class RingManagerApplication(object):
             status['promotion_blockers'].append('mode_not_standby')
         return status
 
+    def _operator_attention_status(self, sync_status):
+        attention = {
+            'needed': False,
+            'reasons': [],
+            'sync': {
+                'needed': False,
+                'reasons': [],
+            },
+            'promotion': {
+                'needed': False,
+                'blockers': [],
+            },
+        }
+
+        def add_reason(reason):
+            if reason not in attention['reasons']:
+                attention['reasons'].append(reason)
+
+        if sync_status.get('applicable'):
+            sync_reasons = list(sync_status.get('reasons') or [])
+            if (sync_status.get('sync_transaction_pending') or
+                    not sync_status.get('can_serve_published_reads')):
+                attention['sync']['needed'] = True
+                attention['sync']['reasons'] = sync_reasons
+                add_reason('sync_not_fresh')
+            if sync_status.get('sync_transaction_pending'):
+                add_reason('sync_transaction_pending')
+
+        if self.mode == 'standby':
+            promotion_blockers = list(
+                sync_status.get('promotion_blockers') or [])
+            promotion_ready = bool(
+                sync_status.get('published_state_promote_ready'))
+            if not promotion_ready:
+                attention['promotion']['needed'] = True
+                attention['promotion']['blockers'] = promotion_blockers
+                add_reason('promotion_not_ready')
+
+        attention['needed'] = bool(attention['reasons'])
+        return attention
+
+    def _metric_suffix(self, value):
+        return re.sub(r'[^A-Za-z0-9_.-]+', '_', str(value))
+
+    def _emit_operator_attention_metrics(self, attention):
+        if not attention.get('needed'):
+            return
+        stats_increment(self.logger, 'operator_attention')
+        if attention.get('sync', {}).get('needed'):
+            stats_increment(self.logger, 'operator_attention.sync')
+        if attention.get('promotion', {}).get('needed'):
+            stats_increment(self.logger, 'operator_attention.promotion')
+        for reason in attention.get('reasons') or []:
+            stats_increment(
+                self.logger,
+                'operator_attention.%s' % self._metric_suffix(reason))
+
     def ring_manager_status(self, req):
         index_error = None
         try:
@@ -403,7 +461,7 @@ class RingManagerApplication(object):
         except (IOError, ValueError) as err:
             latest_version = None
             index_error = str(err)
-        return http.json_response(req, {
+        body = {
             'service': self.server_type,
             'version': swift_version,
             'status': 'ok',
@@ -416,7 +474,11 @@ class RingManagerApplication(object):
                 lease_timeout=self.build_job_lease_timeout),
             'ring_manager_sync': self._ring_manager_sync_status(
                 latest_version, index_error=index_error),
-        })
+        }
+        body['operator_attention'] = self._operator_attention_status(
+            body['ring_manager_sync'])
+        self._emit_operator_attention_metrics(body['operator_attention'])
+        return http.json_response(req, body)
 
 
 def app_factory(global_conf, **local_conf):
