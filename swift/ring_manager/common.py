@@ -13,9 +13,12 @@
 # limitations under the License.
 
 import os
+import posixpath
 import stat
 import shlex
 import subprocess
+
+from urllib.parse import unquote, urlparse
 
 from swift.common.utils.timestamp import NormalTimestamp
 
@@ -185,6 +188,28 @@ def resolve_artifact_path(root, path, field_name='artifact path'):
     if common_path != root:
         raise ValueError('%s escapes ring_artifact_dir' % field_name)
     return resolved
+
+
+def validate_relative_api_url(value, field_name='artifact URL'):
+    if not isinstance(value, str) or not value:
+        raise ValueError('%s is required' % field_name)
+    parsed = urlparse(value)
+    if parsed.scheme or parsed.netloc:
+        raise ValueError('%s must be a same-origin relative URL' % field_name)
+    if parsed.fragment:
+        raise ValueError('%s must not contain a fragment' % field_name)
+    if not parsed.path.startswith('/api/v1/'):
+        raise ValueError('%s must start with /api/v1/' % field_name)
+    decoded_path = unquote(parsed.path)
+    if '\\' in decoded_path:
+        raise ValueError('%s must not contain backslashes' % field_name)
+    if any(segment in ('.', '..') for segment in decoded_path.split('/')):
+        raise ValueError('%s must not contain dot segments' % field_name)
+    normalized_path = posixpath.normpath(decoded_path)
+    if (normalized_path != '/api/v1' and
+            not normalized_path.startswith('/api/v1/')):
+        raise ValueError('%s must start with /api/v1/' % field_name)
+    return value
 
 
 def _configured(value):

@@ -348,6 +348,36 @@ class TestRingManagerSync(unittest.TestCase):
             self.assertNotIn('x-ring-manager-admin-key',
                              request['headers'])
 
+    def test_sync_rejects_cross_origin_artifact_url(self):
+        manifest = dict(self.manifest)
+        manifest['files'] = [dict(
+            self.manifest['files'][0],
+            url='https://evil.example.com/steal')]
+        routes = self._routes()
+        routes[('GET', '/api/v1/rings/releases/latest/manifest/')] = \
+            json_response(manifest)
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerSyncError) as cm:
+            self._syncer(opener).sync()
+        self.assertIn('same-origin relative URL', str(cm.exception))
+        self.assertEqual(1, len(opener.requests))
+
+    def test_sync_rejects_artifact_url_dot_segments(self):
+        manifest = dict(self.manifest)
+        manifest['files'] = [dict(
+            self.manifest['files'][0],
+            url='/api/v1/../../healthcheck')]
+        routes = self._routes()
+        routes[('GET', '/api/v1/rings/releases/latest/manifest/')] = \
+            json_response(manifest)
+        opener = FakeOpener(routes)
+
+        with self.assertRaises(RingManagerSyncError) as cm:
+            self._syncer(opener).sync()
+        self.assertIn('dot segments', str(cm.exception))
+        self.assertEqual(1, len(opener.requests))
+
     def test_sync_parser_accepts_read_credentials(self):
         from swift.ring_manager.sync import _make_parser
 

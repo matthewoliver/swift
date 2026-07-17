@@ -26,7 +26,7 @@ from urllib.parse import quote, urlencode, urljoin
 
 from swift.common.ring.utils import parse_add_value, parse_search_value
 from swift.common.utils import mkdirs
-from swift.ring_manager.common import load_secret
+from swift.ring_manager.common import load_secret, validate_relative_api_url
 
 
 USER_AGENT = 'swift-ring-manager'
@@ -781,6 +781,10 @@ def _versions_download(client, args):
             url = '/api/v1/rings/releases/%s/files/%s' % (
                 quote(str(concrete_version), safe=''),
                 quote(_artifact_name(file_info), safe=''))
+        try:
+            url = validate_relative_api_url(url, 'manifest artifact URL')
+        except ValueError as err:
+            raise RingManagerCLIError(str(err))
         body, _headers = client.request('GET', url, parse_json=False)
         path = os.path.join(args.output_dir, _artifact_name(file_info))
         _verify_artifact(body, file_info, path)

@@ -537,6 +537,48 @@ nodes:
         with open(os.path.join(output_dir, 'object.ring.gz'), 'rb') as fp:
             self.assertEqual(artifact_body, fp.read())
 
+    def test_versions_download_rejects_cross_origin_artifact_url(self):
+        opener = FakeOpener({
+            ('GET', '/api/v1/rings/releases/latest/manifest/'):
+            json_response({
+                'version': 'release-1',
+                'files': [{
+                    'name': 'object.ring.gz',
+                    'url': 'https://evil.example.com/steal',
+                }],
+            }),
+        })
+        output_dir = os.path.join(self.testdir, 'rings')
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'versions', 'download', 'latest', '--output-dir', output_dir,
+        ], opener)
+        self.assertEqual(1, status)
+        self.assertEqual('', stdout)
+        self.assertIn('same-origin relative URL', stderr)
+        self.assertEqual(1, len(opener.requests))
+
+    def test_versions_download_rejects_artifact_url_dot_segments(self):
+        opener = FakeOpener({
+            ('GET', '/api/v1/rings/releases/latest/manifest/'):
+            json_response({
+                'version': 'release-1',
+                'files': [{
+                    'name': 'object.ring.gz',
+                    'url': '/api/v1/../../healthcheck',
+                }],
+            }),
+        })
+        output_dir = os.path.join(self.testdir, 'rings')
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'versions', 'download', 'latest', '--output-dir', output_dir,
+        ], opener)
+        self.assertEqual(1, status)
+        self.assertEqual('', stdout)
+        self.assertIn('dot segments', stderr)
+        self.assertEqual(1, len(opener.requests))
+
     def test_analysis_options_are_encoded_in_query(self):
         opener = FakeOpener({
             ('GET', '/api/v1/rings/object-0/dispersion/'): json_response({}),

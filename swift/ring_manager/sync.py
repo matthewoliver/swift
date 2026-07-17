@@ -28,7 +28,7 @@ from swift.common.utils import NullLogger, dump_recon_cache, get_logger, mkdirs
 from swift.common.utils import md5
 from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
     NormalTimestamp, StateChangeHook, normal_timestamp, stats_increment, \
-    stats_timing
+    stats_timing, validate_relative_api_url
 
 
 USER_AGENT = 'swift-ring-manager-sync'
@@ -219,7 +219,11 @@ class RingManagerSync(object):
                         url, actual, expected_sha256))
 
     def _file_url(self, file_info, default_url):
-        return file_info.get('url') or default_url
+        url = file_info.get('url') or default_url
+        try:
+            return validate_relative_api_url(url, 'manifest artifact URL')
+        except ValueError as err:
+            raise RingManagerSyncError(str(err))
 
     def _download_file(self, file_info, default_url, local_path):
         headers = {}

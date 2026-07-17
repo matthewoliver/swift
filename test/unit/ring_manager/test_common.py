@@ -17,7 +17,7 @@ import tempfile
 import unittest
 
 from swift.ring_manager.common import load_secret, load_secret_from_conf, \
-    read_secret_file
+    read_secret_file, validate_relative_api_url
 
 
 class TestRingManagerCommon(unittest.TestCase):
@@ -93,6 +93,25 @@ class TestRingManagerCommon(unittest.TestCase):
         self.assertEqual('admin', load_secret_from_conf(
             conf, ('admin_key', 'ring_manager_admin_key'),
             ('admin_key_file', 'ring_manager_admin_key_file')))
+
+    def test_validate_relative_api_url(self):
+        self.assertEqual(
+            '/api/v1/rings/releases/latest/manifest/',
+            validate_relative_api_url(
+                '/api/v1/rings/releases/latest/manifest/'))
+
+    def test_validate_relative_api_url_rejects_unsafe_paths(self):
+        values = (
+            'https://evil.example.com/steal',
+            '/api/v1/../../healthcheck',
+            '/api/v1/%2e%2e/%2e%2e/healthcheck',
+            '/api/v1/files/foo%5cbar',
+            '/api/v1/rings/releases/latest/#fragment',
+        )
+        for value in values:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    validate_relative_api_url(value)
 
 
 if __name__ == '__main__':
