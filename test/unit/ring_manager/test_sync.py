@@ -179,6 +179,13 @@ class TestRingManagerSync(unittest.TestCase):
             self.artifact_dir,
             **sync_kwargs)
 
+    def _write_secret(self, name, value):
+        path = os.path.join(self.testdir, name)
+        with open(path, 'wb') as fp:
+            fp.write(value)
+        os.chmod(path, 0o600)
+        return path
+
     def _make_state_hook(self):
         hook_path = os.path.join(self.testdir, 'state-hook')
         log_path = os.path.join(self.testdir, 'state-hook.log')
@@ -335,6 +342,32 @@ class TestRingManagerSync(unittest.TestCase):
             self.assertNotIn('x-ring-manager-admin-key',
                              request['headers'])
 
+    def test_sync_uses_read_key_file_when_configured(self):
+        opener = FakeOpener(self._routes())
+
+        self._syncer(
+            opener, read_key_file=self._write_secret(
+                'read.key', b'reader\n'),
+            admin_key_file=self._write_secret(
+                'admin.key', b'admin\n'),
+            admin_key=None).sync()
+
+        for request in opener.requests:
+            self.assertEqual(
+                'reader', request['headers']['x-ring-manager-read-key'])
+            self.assertNotIn('x-ring-manager-admin-key',
+                             request['headers'])
+
+    def test_sync_rejects_inline_and_file_key_configuration(self):
+        opener = FakeOpener(self._routes())
+
+        with self.assertRaises(RingManagerSyncError) as cm:
+            self._syncer(
+                opener, read_key='reader',
+                read_key_file=self._write_secret('read.key', b'reader\n'))
+
+        self.assertIn('mutually exclusive', str(cm.exception))
+
     def test_sync_uses_read_auth_token_when_configured(self):
         opener = FakeOpener(self._routes())
 
@@ -393,6 +426,22 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertEqual('reader', options.read_key)
         self.assertEqual('reader-token', options.read_auth_token)
 
+    def test_sync_parser_accepts_key_files(self):
+        from swift.ring_manager.sync import _make_parser
+
+        options, args = _make_parser().parse_args([
+            'https://primary.example.com:6205',
+            '--ring-manager-state-dir', self.state_dir,
+            '--ring-artifact-dir', self.artifact_dir,
+            '--admin-key-file', '/etc/swift/secrets/admin.key',
+            '--read-key-file', '/etc/swift/secrets/read.key',
+        ])
+
+        self.assertEqual(['https://primary.example.com:6205'], args)
+        self.assertEqual('/etc/swift/secrets/admin.key',
+                         options.admin_key_file)
+        self.assertEqual('/etc/swift/secrets/read.key', options.read_key_file)
+
     def test_sync_main_passes_read_credentials(self):
         with mock.patch.object(sync, 'RingManagerSync') as syncer:
             syncer.return_value.sync.return_value = {
@@ -415,6 +464,30 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertEqual('reader', syncer.call_args[1]['read_key'])
         self.assertEqual('reader-token',
                          syncer.call_args[1]['read_auth_token'])
+
+    def test_sync_main_passes_key_files(self):
+        with mock.patch.object(sync, 'RingManagerSync') as syncer:
+            syncer.return_value.sync.return_value = {
+                'latest_ring_version': 'release-1',
+                'rings_synced': 1,
+                'ring_versions_synced': 1,
+                'manifest_files_downloaded': 1,
+                'manifest_files_unchanged': 0,
+            }
+            status = sync.main([
+                'https://primary.example.com:6205',
+                '--ring-manager-state-dir', self.state_dir,
+                '--ring-artifact-dir', self.artifact_dir,
+                '--admin-key-file', '/etc/swift/secrets/admin.key',
+                '--read-key-file', '/etc/swift/secrets/read.key',
+                '--quiet',
+            ])
+
+        self.assertEqual(0, status)
+        self.assertEqual('/etc/swift/secrets/admin.key',
+                         syncer.call_args[1]['admin_key_file'])
+        self.assertEqual('/etc/swift/secrets/read.key',
+                         syncer.call_args[1]['read_key_file'])
 
     def test_sync_runs_state_change_hook_for_json_writes(self):
         hook_path, log_path = self._make_state_hook()

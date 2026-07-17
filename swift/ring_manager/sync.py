@@ -27,8 +27,8 @@ from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
 from swift.common.utils import NullLogger, dump_recon_cache, get_logger, mkdirs
 from swift.common.utils import md5
 from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
-    NormalTimestamp, StateChangeHook, normal_timestamp, stats_increment, \
-    stats_timing, validate_relative_api_url
+    load_secret, NormalTimestamp, StateChangeHook, normal_timestamp, \
+    stats_increment, stats_timing, validate_relative_api_url
 
 
 USER_AGENT = 'swift-ring-manager-sync'
@@ -48,8 +48,9 @@ class RingManagerSync(object):
     """
 
     def __init__(self, source_url, state_dir, artifact_dir, admin_key=None,
-                 auth_token=None, read_key=None, read_auth_token=None,
-                 timeout=30, opener=None,
+                 admin_key_file=None, auth_token=None, read_key=None,
+                 read_key_file=None, read_auth_token=None, timeout=30,
+                 opener=None,
                  recon_cache_path=DEFAULT_RECON_CACHE_PATH, recon_dump=True,
                  logger=None, time_func=NormalTimestamp.now,
                  state_change_hook=None, state_change_hook_timeout=None):
@@ -62,9 +63,14 @@ class RingManagerSync(object):
         self.source_url = source_url.rstrip('/')
         self.state_dir = state_dir
         self.artifact_dir = artifact_dir
-        self.read_key = read_key
+        try:
+            self.read_key = load_secret(
+                read_key, 'read_key', read_key_file, 'read_key_file')
+            self.admin_key = load_secret(
+                admin_key, 'admin_key', admin_key_file, 'admin_key_file')
+        except ValueError as err:
+            raise RingManagerSyncError(str(err))
         self.read_auth_token = read_auth_token
-        self.admin_key = admin_key
         self.auth_token = auth_token
         self.timeout = timeout
         self.opener = opener or urllib_request.urlopen
@@ -477,8 +483,14 @@ def _make_parser():
         '--admin-key', dest='admin_key',
         help='Value for X-Ring-Manager-Admin-Key when fetching from source.')
     parser.add_option(
+        '--admin-key-file', dest='admin_key_file',
+        help='File containing X-Ring-Manager-Admin-Key value.')
+    parser.add_option(
         '--read-key', dest='read_key',
         help='Value for X-Ring-Manager-Read-Key when fetching from source.')
+    parser.add_option(
+        '--read-key-file', dest='read_key_file',
+        help='File containing X-Ring-Manager-Read-Key value.')
     parser.add_option(
         '--auth-token', dest='auth_token',
         help='Value for X-Auth-Token when fetching from source.')
@@ -554,8 +566,10 @@ def main(argv=None):
             options.state_dir,
             options.artifact_dir,
             admin_key=options.admin_key,
+            admin_key_file=options.admin_key_file,
             auth_token=options.auth_token,
             read_key=options.read_key,
+            read_key_file=options.read_key_file,
             read_auth_token=options.read_auth_token,
             timeout=options.timeout,
             recon_cache_path=options.recon_cache_path,

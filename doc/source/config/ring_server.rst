@@ -249,13 +249,15 @@ For example::
         --ring-manager-state-dir /etc/swift/ring-manager-state \
         --ring-artifact-dir /etc/swift/ring-manager-artifacts \
         --log-statsd-host 127.0.0.1 \
-        --read-key changeme-read \
+        --read-key-file /etc/swift/secrets/ring-manager-read.key \
         --state-change-hook /usr/local/bin/ring-manager-state-history
 
 The syncer makes only read requests.
-When ``--read-key`` or ``--read-auth-token`` is supplied, it takes precedence
-over administrator credentials so replicas do not need a credential that can
-change primary state.
+When ``--read-key``, ``--read-key-file``, or ``--read-auth-token`` is
+supplied, it takes precedence over administrator credentials so replicas do
+not need a credential that can change primary state.
+The direct command also accepts ``--read-key-file`` and ``--admin-key-file``;
+each file option is mutually exclusive with its inline equivalent.
 
 The source URL is supplied explicitly in this initial utility.
 Source failover and configuration-file support are separate follow-on work.
