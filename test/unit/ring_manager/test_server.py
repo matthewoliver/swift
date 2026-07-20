@@ -102,6 +102,7 @@ class TestRingManagerApplication(unittest.TestCase):
                 'ring_manager_state_dir': self.state_dir,
                 'ring_artifact_dir': self.artifact_dir,
                 'ring_builder_dir': self.testdir,
+                'recon_cache_path': self.testdir,
             }, logger=self.logger)
 
     def _write_latest_release(self, files=None):
@@ -319,6 +320,12 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(
             '/api/v1/ring_manager/artifact_cleanup/plan/',
             body['links']['artifact_cleanup_plan'])
+        self.assertEqual(
+            '/api/v1/ring_manager/artifact_cleanup/metadata/',
+            body['links']['artifact_cleanup_metadata'])
+        self.assertEqual(
+            '/api/v1/ring_manager/artifact_cleanup/files/',
+            body['links']['artifact_cleanup_files'])
         self.assertEqual('/api/v1/ring_manager/tombstones/',
                          body['links']['tombstones'])
         self.assertEqual('/api/v1/ring_manager/sync/trigger/',
@@ -479,6 +486,24 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(False,
                          files['active-release/object.ring.gz']['candidate'])
 
+    def test_artifact_cleanup_plan_writes_compact_recon(self):
+        resp, _body = self.get_json(
+            '/api/v1/ring_manager/artifact_cleanup/plan/?details=false')
+
+        self.assertEqual(200, resp.status_int)
+        with open(os.path.join(self.testdir, 'ring-manager.recon')) as fp:
+            recon = json.load(fp)
+        cleanup = recon['artifact_cleanup_plan']
+        self.assertTrue(cleanup['success'])
+        self.assertEqual(200, cleanup['http_status'])
+        self.assertTrue(cleanup['dry_run'])
+        self.assertTrue(cleanup['details_omitted'])
+        self.assertNotIn('manifests', cleanup)
+        self.assertNotIn('artifact_files', cleanup)
+        counts = self.logger.statsd_client.get_stats_counts()
+        self.assertEqual(1, counts['artifact_cleanup.plan.requests'])
+        self.assertEqual(1, counts['artifact_cleanup.plan.safe'])
+
     def test_tombstones_reserve_and_hide_stale_records(self):
         manifest_tombstone = self.app.store.create_ring_version_tombstone(
             self.latest_version, timestamp='1779783600.00000',
@@ -504,6 +529,169 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(False, plan['cleanup_safe'])
         self.assertIn('tombstoned_manifest_record', [
             warning['type'] for warning in plan['warnings']])
+
+    def _setup_cleanup_candidates(self):
+        os.unlink(self.artifact_path)
+        older_manifest = os.path.join(
+            self.state_dir, 'releases', 'older-version', 'manifest.json')
+        os.unlink(older_manifest)
+        current_path = os.path.join(
+            self.artifact_dir, 'current', 'object.ring.gz')
+        os.makedirs(os.path.dirname(current_path))
+        with open(current_path, 'wb') as fp:
+            fp.write(b'current')
+        self._write_latest_release(files=[{
+            'name': 'object.ring.gz',
+            'path': 'current/object.ring.gz',
+            'bytes': len(b'current'),
+            'sha256': hashlib.sha256(b'current').hexdigest(),
+        }])
+        old_path = os.path.join(
+            self.artifact_dir, 'orphan', 'object.ring.gz')
+        os.makedirs(os.path.dirname(old_path))
+        with open(old_path, 'wb') as fp:
+            fp.write(b'old')
+        os.utime(old_path, (1779780000, 1779780000))
+        self._write_json('releases/old-release/manifest.json', {
+            'version': 'old-release',
+            'created_at': '1779780000.00000',
+            'rings': [],
+            'files': [],
+        })
+        self._write_json('ring-versions/orphan-ring/99.json', {
+            'ring_id': 'orphan-ring',
+            'swift_ring_version': '99',
+            'created_at': '1779780000.00000',
+            'files': [{
+                'name': 'object.ring.gz',
+                'path': 'orphan/object.ring.gz',
+            }],
+        })
+        return old_path
+
+    def test_artifact_cleanup_metadata_requires_confirm(self):
+        resp, body = self.json_request(
+            '/api/v1/ring_manager/artifact_cleanup/metadata/', 'POST', {})
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('confirm=true is required', body['error'])
+
+    def test_artifact_cleanup_rejects_fractional_retain_versions(self):
+        for path in (
+                '/api/v1/ring_manager/artifact_cleanup/metadata/',
+                '/api/v1/ring_manager/artifact_cleanup/files/'):
+            resp, body = self.json_request(path, 'POST', {
+                'confirm': True,
+                'retain_versions': 1.9,
+            })
+            self.assertEqual(400, resp.status_int)
+            self.assertIn(
+                'retain_versions must be a non-negative integer',
+                body['error'])
+
+    def test_artifact_cleanup_metadata_tombstones_before_deleting(self):
+        old_path = self._setup_cleanup_candidates()
+
+        with mock.patch.object(self.app, '_timestamp_internal',
+                               return_value='1779787200.00000'):
+            resp, body = self.json_request(
+                '/api/v1/ring_manager/artifact_cleanup/metadata/', 'POST', {
+                    'confirm': True,
+                    'retention_age': 60,
+                })
+
+        self.assertEqual(200, resp.status_int)
+        self.assertTrue(body['cleanup_safe'])
+        self.assertTrue(body['delete_allowed'])
+        self.assertTrue(body['metadata_only'])
+        self.assertEqual(1, body['summary']['manifests']['records_deleted'])
+        self.assertEqual(
+            1, body['summary']['ring_artifact_versions']['records_deleted'],
+            body['ring_artifact_versions'])
+        self.assertTrue(os.path.exists(os.path.join(
+            self.state_dir, 'tombstones', 'versions', 'old-release.json')))
+        self.assertTrue(os.path.exists(os.path.join(
+            self.state_dir, 'tombstones', 'ring-versions', 'orphan-ring',
+            '99.json')))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, 'releases', 'old-release', 'manifest.json')))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, 'ring-versions', 'orphan-ring', '99.json')))
+        self.assertTrue(os.path.exists(old_path))
+        self.assertEqual(
+            body['summary'],
+            self.app.store.get_state_index()['artifact_cleanup_metadata']
+            ['summary'])
+
+    def test_artifact_cleanup_files_requires_metadata_first(self):
+        old_path = self._setup_cleanup_candidates()
+
+        with mock.patch.object(self.app, '_timestamp_internal',
+                               return_value='1779787200.00000'):
+            resp, body = self.json_request(
+                '/api/v1/ring_manager/artifact_cleanup/files/', 'POST', {
+                    'confirm': True,
+                    'retention_age': 60,
+                })
+
+        self.assertEqual(409, resp.status_int)
+        self.assertFalse(body['cleanup_safe'])
+        self.assertFalse(body['delete_allowed'])
+        self.assertEqual(
+            {'manifest', 'ring_artifact_version'},
+            set(blocker['source'] for blocker in body['cleanup_blockers']))
+        self.assertTrue(os.path.exists(old_path))
+
+    def test_artifact_cleanup_tombstone_failure_keeps_metadata(self):
+        self._setup_cleanup_candidates()
+
+        with mock.patch.object(
+                self.app.store, 'create_ring_version_tombstone',
+                side_effect=IOError('tombstone write failed')):
+            with mock.patch.object(self.app, '_timestamp_internal',
+                                   return_value='1779787200.00000'):
+                resp, body = self.json_request(
+                    '/api/v1/ring_manager/artifact_cleanup/metadata/',
+                    'POST', {
+                        'confirm': True,
+                        'retention_age': 60,
+                    })
+
+        self.assertEqual(500, resp.status_int)
+        self.assertEqual(1, len(body['errors']))
+        self.assertTrue(os.path.exists(os.path.join(
+            self.state_dir, 'releases', 'old-release', 'manifest.json')))
+        self.assertTrue(os.path.exists(os.path.join(
+            self.state_dir, 'ring-versions', 'orphan-ring', '99.json')))
+
+    def test_artifact_cleanup_files_delete_after_metadata(self):
+        old_path = self._setup_cleanup_candidates()
+
+        with mock.patch.object(self.app, '_timestamp_internal',
+                               return_value='1779787200.00000'):
+            resp, _body = self.json_request(
+                '/api/v1/ring_manager/artifact_cleanup/metadata/', 'POST', {
+                    'confirm': True,
+                    'retention_age': 60,
+                })
+        self.assertEqual(200, resp.status_int)
+
+        with mock.patch.object(self.app, '_timestamp_internal',
+                               return_value='1779787300.00000'):
+            resp, body = self.json_request(
+                '/api/v1/ring_manager/artifact_cleanup/files/', 'POST', {
+                    'confirm': True,
+                    'retention_age': 60,
+                })
+
+        self.assertEqual(200, resp.status_int)
+        self.assertTrue(body['artifact_files_only'])
+        self.assertTrue(body['cleanup_safe'])
+        self.assertTrue(body['delete_allowed'])
+        self.assertEqual(
+            1, body['summary']['artifact_files']['files_deleted'])
+        self.assertEqual(
+            len(b'old'), body['summary']['artifact_files']['bytes_deleted'])
+        self.assertFalse(os.path.exists(old_path))
 
     def _timestamp_seconds_ago(self, seconds):
         return NormalTimestamp(
@@ -1404,6 +1592,10 @@ class TestRingManagerApplication(unittest.TestCase):
              ('GET',), 'ring_manager_status'),
             ('^/api/v1/ring_manager/artifact_cleanup/plan/?$',
              ('GET',), 'artifact_cleanup_plan'),
+            ('^/api/v1/ring_manager/artifact_cleanup/metadata/?$',
+             ('POST',), 'artifact_cleanup_metadata'),
+            ('^/api/v1/ring_manager/artifact_cleanup/files/?$',
+             ('POST',), 'artifact_cleanup_files'),
             ('^/api/v1/ring_manager/tombstones/?$',
              ('GET',), 'ring_manager_tombstones'),
             ('^/api/v1/ring_manager/sync/trigger/?$',
@@ -2752,6 +2944,37 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertIn('Read-only ring fields', body['error'])
         self.assertFalse(os.path.exists(os.path.join(
             self.state_dir, 'rings', 'object-2.json')))
+
+    def test_ring_create_rejects_readonly_fields(self):
+        resp, body = self.json_request('/api/v1/rings/', 'POST', {
+            'name': 'Policy-2',
+            'storage_policy_index': 2,
+            'imported_at': '1779780000.00000',
+        })
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('imported_at', body['error'])
+
+    def test_ring_update_rejects_readonly_fields(self):
+        resp, body = self.json_request('/api/v1/rings/1/', 'PATCH', {
+            'latest_swift_ring_version': '99',
+        })
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('latest_swift_ring_version', body['error'])
+
+    def test_ring_replace_preserves_readonly_fields(self):
+        self.app.store.update_ring('1', {
+            'imported_at': '1779780000.00000',
+            'latest_swift_ring_version': '7',
+        })
+
+        resp, body = self.json_request('/api/v1/rings/1/', 'PUT', {
+            'name': 'Replaced',
+        })
+
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('Replaced', body['name'])
+        self.assertEqual('1779780000.00000', body['imported_at'])
+        self.assertEqual('7', body['latest_swift_ring_version'])
 
     def test_ring_update(self):
         resp, body = self.json_request('/api/v1/rings/1/', 'PATCH', {

@@ -544,6 +544,16 @@ class TestRingManagerSync(unittest.TestCase):
                 '/api/v1/rings/releases/desired')])
 
     def test_sync_copies_tombstone_reservations(self):
+        live_manifest = os.path.join(
+            self.state_dir, 'releases', 'release-old', 'manifest.json')
+        os.makedirs(os.path.dirname(live_manifest))
+        with open(live_manifest, 'w') as fp:
+            json.dump({'version': 'release-old'}, fp)
+        live_ring_version = os.path.join(
+            self.state_dir, 'ring-versions', 'account', '11.json')
+        os.makedirs(os.path.dirname(live_ring_version))
+        with open(live_ring_version, 'w') as fp:
+            json.dump({'ring_id': 'account', 'version': '11'}, fp)
         self.tombstones = {
             'versions': [{
                 'schema_version': 1,
@@ -569,6 +579,8 @@ class TestRingManagerSync(unittest.TestCase):
         result = self._syncer(FakeOpener(self._routes()), logger=logger).sync()
 
         self.assertEqual(2, result['tombstones_synced'])
+        self.assertFalse(os.path.exists(live_manifest))
+        self.assertFalse(os.path.exists(live_ring_version))
         with open(os.path.join(
                 self.state_dir, 'tombstones', 'versions',
                 'release-old.json')) as fp:

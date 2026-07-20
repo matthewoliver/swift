@@ -20,6 +20,7 @@ import os
 import tempfile
 import uuid
 
+from contextlib import contextmanager
 from urllib.parse import quote, unquote
 
 from swift.common.utils import config_true_value, fsync, fsync_dir, lock_path
@@ -119,6 +120,11 @@ CLEANUP_BLOCKING_WARNING_TYPES = (
     'tombstoned_manifest_record',
     'tombstoned_ring_artifact_version_record',
 )
+REPAIRABLE_CLEANUP_WARNING_TYPES = (
+    'tombstoned_manifest_record',
+    'tombstoned_ring_artifact_version_record',
+)
+ARTIFACT_FILE_CLEANUP_BLOCKER_SAMPLE_LIMIT = 10
 
 
 def _add_reason(reasons, key, reason):
@@ -229,7 +235,8 @@ class RingManagerStore(object):
                     if err.errno != errno.ENOENT:
                         raise
 
-    def _delete_state_file(self, path, missing_ok=False):
+    def _delete_state_file(self, path, missing_ok=False,
+                           run_state_change_hook=True):
         if path is None:
             raise ValueError(
                 'ring_manager_state_dir is required for mutating requests')
@@ -242,13 +249,22 @@ class RingManagerStore(object):
         directory = os.path.dirname(path)
         if directory:
             fsync_dir(directory)
-        self.state_change_hook.run('delete', path)
+        if run_state_change_hook:
+            self.state_change_hook.run('delete', path)
         return True
 
     def _state_dir_path(self, *parts):
         if not self.state_dir:
             return None
         return os.path.join(self.state_dir, *parts)
+
+    @contextmanager
+    def published_state_lock(self):
+        if not self.state_dir:
+            raise ValueError(
+                'ring_manager_state_dir is required for mutating requests')
+        with lock_path(self.state_dir, name='ring-manager-published-state'):
+            yield
 
     def _state_index(self):
         index = self._read_json_file(
@@ -1469,6 +1485,627 @@ class RingManagerStore(object):
             })
         return plan
 
+    def _artifact_metadata_cleanup_result(self, plan, timestamp):
+        def candidate_rows(key):
+            return [row for row in plan.get(key) or []
+                    if row.get('candidate')]
+
+        def metadata_summary(rows):
+            return {
+                'candidates': len(rows),
+                'tombstones_written': 0,
+                'already_tombstoned': 0,
+                'records_deleted': 0,
+                'already_deleted': 0,
+                'skipped': 0,
+            }
+
+        artifact_file_summary = (
+            plan.get('summary', {}).get('artifact_files', {}))
+        artifact_files = candidate_rows('artifact_files')
+        return {
+            'dry_run': False,
+            'delete_allowed': False,
+            'metadata_only': True,
+            'cleanup_safe': plan.get('cleanup_safe'),
+            'cleanup_blockers': copy.deepcopy(
+                plan.get('cleanup_blockers') or []),
+            'generated_at': timestamp,
+            'started_at': timestamp,
+            'completed_at': None,
+            'retention_age': plan.get('retention_age'),
+            'retain_versions': plan.get('retain_versions'),
+            'latest_ring_version': plan.get('latest_ring_version'),
+            'summary': {
+                'manifests': metadata_summary(
+                    candidate_rows('manifests')),
+                'ring_artifact_versions': metadata_summary(
+                    candidate_rows('ring_artifact_versions')),
+                'artifact_files': {
+                    'candidates': len(artifact_files),
+                    'left_untouched': len(artifact_files),
+                    'candidate_bytes': artifact_file_summary.get(
+                        'candidate_bytes', 0),
+                },
+                'repairs': {
+                    'tombstoned_live_records': 0,
+                },
+                'warnings': len(plan.get('warnings') or []),
+            },
+            'warnings': copy.deepcopy(plan.get('warnings') or []),
+            'manifests': [],
+            'ring_artifact_versions': [],
+            'artifact_files': [
+                {
+                    'path': row.get('path'),
+                    'bytes': row.get('bytes'),
+                    'reasons': copy.deepcopy(row.get('reasons') or []),
+                    'action': 'left_untouched',
+                } for row in artifact_files
+            ],
+            'repairs': [],
+            'errors': [],
+            'skipped': [],
+        }
+
+    def _artifact_metadata_cleanup_status(self, result):
+        status = copy.deepcopy(result)
+        for key in ('manifests', 'ring_artifact_versions',
+                    'artifact_files', 'warnings', 'repairs', 'skipped'):
+            status.pop(key, None)
+        status['details_omitted'] = True
+        return status
+
+    def _record_artifact_metadata_cleanup(self, result):
+        status = self._artifact_metadata_cleanup_status(result)
+
+        def mutate(index):
+            index['artifact_cleanup_metadata'] = status
+            return True, None
+        self._mutate_state_index(mutate)
+
+    def _artifact_file_cleanup_result(self, plan, timestamp):
+        artifact_file_summary = (
+            plan.get('summary', {}).get('artifact_files', {}))
+        artifact_files = [
+            row for row in plan.get('artifact_files') or []
+            if row.get('candidate')]
+        return {
+            'dry_run': False,
+            'delete_allowed': False,
+            'artifact_files_only': True,
+            'cleanup_safe': plan.get('cleanup_safe'),
+            'cleanup_blockers': copy.deepcopy(
+                plan.get('cleanup_blockers') or []),
+            'generated_at': timestamp,
+            'started_at': timestamp,
+            'completed_at': None,
+            'retention_age': plan.get('retention_age'),
+            'retain_versions': plan.get('retain_versions'),
+            'latest_ring_version': plan.get('latest_ring_version'),
+            'summary': {
+                'artifact_files': {
+                    'candidates': len(artifact_files),
+                    'files_deleted': 0,
+                    'already_deleted': 0,
+                    'bytes_deleted': 0,
+                    'candidate_bytes': artifact_file_summary.get(
+                        'candidate_bytes', 0),
+                    'skipped': 0,
+                },
+                'warnings': len(plan.get('warnings') or []),
+            },
+            'warnings': copy.deepcopy(plan.get('warnings') or []),
+            'artifact_files': [],
+            'errors': [],
+            'skipped': [],
+        }
+
+    def _artifact_file_cleanup_status(self, result):
+        status = copy.deepcopy(result)
+        for key in ('artifact_files', 'warnings', 'skipped'):
+            status.pop(key, None)
+        status['details_omitted'] = True
+        return status
+
+    def _record_artifact_file_cleanup(self, result):
+        status = self._artifact_file_cleanup_status(result)
+
+        def mutate(index):
+            index['artifact_cleanup_files'] = status
+            return True, None
+        self._mutate_state_index(mutate)
+
+    def _record_cleanup_skip(self, result, section, entry, reason):
+        entry['record'] = 'skipped'
+        entry['reason'] = reason
+        result[section].append(entry)
+        result['summary'][section]['skipped'] += 1
+        result['skipped'].append(copy.deepcopy(entry))
+
+    def _metadata_cleanup_error(self, result, section, entry, err):
+        entry['error'] = str(err)
+        result[section].append(entry)
+        result['summary'][section]['skipped'] += 1
+        result['errors'].append(copy.deepcopy(entry))
+
+    def _cleanup_manifest_metadata(self, row, version_paths, result,
+                                   timestamp, deleted_by, reason):
+        version_id = row.get('version')
+        entry = {
+            'version': version_id,
+            'reasons': copy.deepcopy(row.get('reasons') or []),
+        }
+        if version_id in (None, ''):
+            self._record_cleanup_skip(
+                result, 'manifests', entry, 'missing_version')
+            return
+        version_id = str(version_id)
+        entry['version'] = version_id
+
+        tombstoned = self.ring_version_tombstoned(version_id)
+        if tombstoned:
+            entry['tombstone'] = 'already_exists'
+            result['summary']['manifests']['already_tombstoned'] += 1
+        else:
+            try:
+                self.create_ring_version_tombstone(
+                    version_id, timestamp=timestamp, deleted_by=deleted_by,
+                    reason=reason)
+            except Exception as err:
+                entry['tombstone'] = 'failed'
+                self._metadata_cleanup_error(
+                    result, 'manifests', entry, err)
+                return
+            entry['tombstone'] = 'written'
+            result['summary']['manifests']['tombstones_written'] += 1
+
+        path = version_paths.get(version_id)
+        try:
+            if path is None:
+                entry['record'] = 'already_deleted'
+                result['summary']['manifests']['already_deleted'] += 1
+            elif self._delete_state_file(path, missing_ok=True):
+                entry['record'] = 'deleted'
+                result['summary']['manifests']['records_deleted'] += 1
+            else:
+                entry['record'] = 'already_deleted'
+                result['summary']['manifests']['already_deleted'] += 1
+        except Exception as err:
+            entry['record'] = 'delete_failed'
+            self._metadata_cleanup_error(result, 'manifests', entry, err)
+            return
+        result['manifests'].append(entry)
+
+    def _cleanup_ring_artifact_version_metadata(
+            self, row, record_paths, result, timestamp, deleted_by, reason):
+        ring_id = row.get('ring_id')
+        version_id = row.get('version')
+        entry = {
+            'ring_id': ring_id,
+            'version': version_id,
+            'reasons': copy.deepcopy(row.get('reasons') or []),
+        }
+        if ring_id in (None, '') or version_id in (None, ''):
+            self._record_cleanup_skip(
+                result, 'ring_artifact_versions', entry,
+                'missing_ring_id_or_version')
+            return
+        ring_id = str(ring_id)
+        version_id = str(version_id)
+        entry['ring_id'] = ring_id
+        entry['version'] = version_id
+
+        tombstoned = self.ring_artifact_version_tombstoned(
+            ring_id, version_id)
+        if tombstoned:
+            entry['tombstone'] = 'already_exists'
+            result['summary']['ring_artifact_versions'][
+                'already_tombstoned'] += 1
+        else:
+            try:
+                self.create_ring_artifact_version_tombstone(
+                    ring_id, version_id, timestamp=timestamp,
+                    deleted_by=deleted_by, reason=reason)
+            except Exception as err:
+                entry['tombstone'] = 'failed'
+                self._metadata_cleanup_error(
+                    result, 'ring_artifact_versions', entry, err)
+                return
+            entry['tombstone'] = 'written'
+            result['summary']['ring_artifact_versions'][
+                'tombstones_written'] += 1
+
+        path = record_paths.get((ring_id, version_id))
+        try:
+            if path is None:
+                entry['record'] = 'already_deleted'
+                result['summary']['ring_artifact_versions'][
+                    'already_deleted'] += 1
+            elif self._delete_state_file(path, missing_ok=True):
+                entry['record'] = 'deleted'
+                result['summary']['ring_artifact_versions'][
+                    'records_deleted'] += 1
+            else:
+                entry['record'] = 'already_deleted'
+                result['summary']['ring_artifact_versions'][
+                    'already_deleted'] += 1
+        except Exception as err:
+            entry['record'] = 'delete_failed'
+            self._metadata_cleanup_error(
+                result, 'ring_artifact_versions', entry, err)
+            return
+        result['ring_artifact_versions'].append(entry)
+
+    def _active_build_cleanup_plan(self, builds, timestamp, retention_age,
+                                   retain_versions):
+        active_namespaces, active_unknown_namespaces, unknown_state_builds = \
+            self._active_build_artifact_namespaces(builds)
+        cleanup_blockers = self._artifact_cleanup_blockers(
+            [], active_namespaces, active_unknown_namespaces,
+            unknown_state_builds)
+        if not cleanup_blockers:
+            return None
+        try:
+            latest_id = self.get_latest_ring_version_id()
+        except RingVersionNotFound:
+            latest_id = None
+        return {
+            'dry_run': True,
+            'delete_allowed': False,
+            'cleanup_safe': False,
+            'cleanup_blockers': cleanup_blockers,
+            'generated_at': timestamp,
+            'retention_age': retention_age,
+            'retain_versions': retain_versions,
+            'latest_ring_version': latest_id,
+            'active_build_namespaces': active_namespaces,
+            'active_builds_with_unknown_namespaces':
+                active_unknown_namespaces,
+            'ring_builds_with_unknown_states': unknown_state_builds,
+            'summary': {
+                'artifact_files': {
+                    'candidate_bytes': 0,
+                },
+            },
+            'warnings': [],
+            'manifests': [],
+            'ring_artifact_versions': [],
+            'artifact_files': [],
+        }
+
+    def _active_build_cleanup_result(self, builds, timestamp, retention_age,
+                                     retain_versions):
+        plan = self._active_build_cleanup_plan(
+            builds, timestamp, retention_age, retain_versions)
+        if plan is None:
+            return None
+        return self._artifact_metadata_cleanup_result(plan, timestamp)
+
+    def _repairable_cleanup_blockers(self, blockers):
+        return blockers and all(
+            blocker.get('type') in REPAIRABLE_CLEANUP_WARNING_TYPES
+            for blocker in blockers)
+
+    def _tombstoned_live_record_paths(self):
+        manifests = {}
+        for version in self._ring_versions(include_tombstoned=True):
+            version_id = self._ring_version_id(version)
+            if self.ring_version_tombstoned(version_id):
+                manifests[version_id] = version.get('_manifest_path')
+        ring_versions = {}
+        for version in self._all_ring_artifact_versions(
+                include_tombstoned=True):
+            ring_id = version.get('ring_id')
+            if ring_id in (None, ''):
+                continue
+            version_id = self._ring_artifact_version_id(version)
+            if self.ring_artifact_version_tombstoned(ring_id, version_id):
+                ring_versions[(str(ring_id), version_id)] = \
+                    version.get('_record_path')
+        return manifests, ring_versions
+
+    def _repair_tombstoned_live_records(self, blockers, result):
+        manifest_paths, ring_version_paths = \
+            self._tombstoned_live_record_paths()
+        for blocker in blockers:
+            blocker_type = blocker.get('type')
+            repair = copy.deepcopy(blocker)
+            try:
+                if blocker_type == 'tombstoned_manifest_record':
+                    version_id = str(blocker.get('version'))
+                    path = manifest_paths.get(version_id)
+                    if path is None:
+                        repair['record'] = 'already_deleted'
+                    elif self._delete_state_file(path, missing_ok=True):
+                        repair['record'] = 'deleted'
+                    else:
+                        repair['record'] = 'already_deleted'
+                elif blocker_type == 'tombstoned_ring_artifact_version_record':
+                    ring_id = str(blocker.get('ring_id'))
+                    version_id = str(blocker.get('version'))
+                    path = ring_version_paths.get((ring_id, version_id))
+                    if path is None:
+                        repair['record'] = 'already_deleted'
+                    elif self._delete_state_file(path, missing_ok=True):
+                        repair['record'] = 'deleted'
+                    else:
+                        repair['record'] = 'already_deleted'
+                else:
+                    repair['record'] = 'skipped'
+            except Exception as err:
+                repair['record'] = 'delete_failed'
+                repair['error'] = str(err)
+                result['errors'].append(copy.deepcopy(repair))
+                result['repairs'].append(repair)
+                return False
+            result['repairs'].append(repair)
+            result['summary']['repairs']['tombstoned_live_records'] += 1
+        return True
+
+    def cleanup_artifact_metadata(self, retention_age=None,
+                                  retain_versions=None, timestamp=None,
+                                  deleted_by='artifact_cleanup',
+                                  reason='retention_policy'):
+        """
+        Tombstone and delete cleanup-candidate metadata records.
+
+        This intentionally prunes only served JSON metadata:
+        ``releases/<id>/manifest.json`` and
+        ``ring-versions/<ring-id>/<swift-ring-version>.json``. Ring artifact
+        files are left untouched for a later cleanup phase.
+        """
+        if not self.state_dir:
+            raise ValueError(
+                'ring_manager_state_dir is required for cleanup requests')
+        timestamp = normal_timestamp_internal(timestamp)
+        builds_dir = self._collection_dir('ring_builds')
+        with lock_path(builds_dir, name='ring-build-queue'):
+            with self.published_state_lock():
+                builds = self._list_dir_objects('ring_builds')
+                active_result = self._active_build_cleanup_result(
+                    builds, timestamp, retention_age, retain_versions)
+                if active_result is not None:
+                    return active_result
+
+                plan = self.plan_artifact_cleanup(
+                    retention_age=retention_age,
+                    retain_versions=retain_versions,
+                    timestamp=timestamp,
+                    include_details=True)
+                result = self._artifact_metadata_cleanup_result(
+                    plan, timestamp)
+                if not plan.get('cleanup_safe'):
+                    blockers = plan.get('cleanup_blockers') or []
+                    if not self._repairable_cleanup_blockers(blockers):
+                        return result
+                    if not self._repair_tombstoned_live_records(
+                            blockers, result):
+                        result['completed_at'] = normal_timestamp_internal()
+                        self._record_artifact_metadata_cleanup(result)
+                        return result
+                    plan = self.plan_artifact_cleanup(
+                        retention_age=retention_age,
+                        retain_versions=retain_versions,
+                        timestamp=timestamp,
+                        include_details=True)
+                    repaired_result = self._artifact_metadata_cleanup_result(
+                        plan, timestamp)
+                    repaired_result['repairs'] = result['repairs']
+                    repaired_result['summary']['repairs'] = \
+                        result['summary']['repairs']
+                    result = repaired_result
+                    if not plan.get('cleanup_safe'):
+                        result['completed_at'] = normal_timestamp_internal()
+                        self._record_artifact_metadata_cleanup(result)
+                        return result
+
+                result['delete_allowed'] = True
+                version_paths = dict(
+                    (self._ring_version_id(version),
+                     version.get('_manifest_path'))
+                    for version in self._ring_versions())
+                record_paths = dict(
+                    ((str(version.get('ring_id')),
+                      self._ring_artifact_version_id(version)),
+                     version.get('_record_path'))
+                    for version in self._all_ring_artifact_versions())
+
+                for row in plan.get('manifests') or []:
+                    if row.get('candidate'):
+                        self._cleanup_manifest_metadata(
+                            row, version_paths, result, timestamp,
+                            deleted_by, reason)
+                        if result['errors']:
+                            break
+                for row in plan.get('ring_artifact_versions') or []:
+                    if result['errors']:
+                        break
+                    if row.get('candidate'):
+                        self._cleanup_ring_artifact_version_metadata(
+                            row, record_paths, result, timestamp,
+                            deleted_by, reason)
+
+                result['completed_at'] = normal_timestamp_internal()
+                self._record_artifact_metadata_cleanup(result)
+                return result
+
+    def artifact_cleanup_metadata_stats(self):
+        try:
+            cleanup = self._state_index().get(
+                'artifact_cleanup_metadata', {})
+        except (IOError, ValueError):
+            return {}
+        if not isinstance(cleanup, dict):
+            return {}
+        return copy.deepcopy(cleanup)
+
+    def _delete_artifact_file(self, relpath, missing_ok=False):
+        root = os.path.realpath(self.ring_artifact_dir)
+        relpath = str(relpath)
+        if os.path.isabs(relpath):
+            path = os.path.abspath(relpath)
+        else:
+            path = os.path.abspath(os.path.join(root, relpath))
+        try:
+            common_path = os.path.commonpath([root, path])
+        except ValueError:
+            common_path = None
+        if common_path != root:
+            raise ValueError(
+                'artifact cleanup path escapes ring_artifact_dir')
+        directory = os.path.dirname(path)
+        if os.path.realpath(directory) != os.path.abspath(directory):
+            raise ValueError(
+                'artifact cleanup path contains a symbolic directory')
+        try:
+            os.unlink(path)
+        except OSError as err:
+            if err.errno == errno.ENOENT and missing_ok:
+                return False
+            raise
+        if directory:
+            fsync_dir(directory)
+        return True
+
+    def _record_artifact_file_cleanup_skip(self, result, entry, reason):
+        entry['file'] = 'skipped'
+        entry['reason'] = reason
+        result['artifact_files'].append(entry)
+        result['summary']['artifact_files']['skipped'] += 1
+        result['skipped'].append(copy.deepcopy(entry))
+
+    def _artifact_file_cleanup_error(self, result, entry, err):
+        entry['file'] = 'delete_failed'
+        entry['error'] = str(err)
+        result['artifact_files'].append(entry)
+        result['summary']['artifact_files']['skipped'] += 1
+        result['errors'].append(copy.deepcopy(entry))
+
+    def _cleanup_artifact_file(self, row, result):
+        relpath = row.get('path')
+        entry = {
+            'path': relpath,
+            'bytes': row.get('bytes'),
+            'reasons': copy.deepcopy(row.get('reasons') or []),
+        }
+        if relpath in (None, ''):
+            self._record_artifact_file_cleanup_skip(
+                result, entry, 'missing_path')
+            return
+        relpath = str(relpath)
+        entry['path'] = relpath
+        try:
+            if self._delete_artifact_file(relpath, missing_ok=True):
+                entry['file'] = 'deleted'
+                result['summary']['artifact_files']['files_deleted'] += 1
+                result['summary']['artifact_files']['bytes_deleted'] += (
+                    row.get('bytes') or 0)
+            else:
+                entry['file'] = 'already_deleted'
+                result['summary']['artifact_files']['already_deleted'] += 1
+        except Exception as err:
+            self._artifact_file_cleanup_error(result, entry, err)
+            return
+        result['artifact_files'].append(entry)
+
+    def _artifact_file_cleanup_metadata_blockers(self, plan):
+        manifest_versions = [
+            row.get('version') for row in plan.get('manifests') or []
+            if row.get('candidate')]
+        ring_versions = [
+            {
+                'ring_id': row.get('ring_id'),
+                'version': row.get('version'),
+            } for row in plan.get('ring_artifact_versions') or []
+            if row.get('candidate')]
+        blockers = []
+        if manifest_versions:
+            blockers.append({
+                'type': 'metadata_cleanup_required',
+                'source': 'manifest',
+                'candidates': len(manifest_versions),
+                'versions': manifest_versions[
+                    :ARTIFACT_FILE_CLEANUP_BLOCKER_SAMPLE_LIMIT],
+                'details_truncated': (
+                    len(manifest_versions) >
+                    ARTIFACT_FILE_CLEANUP_BLOCKER_SAMPLE_LIMIT),
+            })
+        if ring_versions:
+            blockers.append({
+                'type': 'metadata_cleanup_required',
+                'source': 'ring_artifact_version',
+                'candidates': len(ring_versions),
+                'ring_versions': ring_versions[
+                    :ARTIFACT_FILE_CLEANUP_BLOCKER_SAMPLE_LIMIT],
+                'details_truncated': (
+                    len(ring_versions) >
+                    ARTIFACT_FILE_CLEANUP_BLOCKER_SAMPLE_LIMIT),
+            })
+        return blockers
+
+    def cleanup_artifact_files(self, retention_age=None, retain_versions=None,
+                               timestamp=None):
+        """
+        Delete cleanup-candidate ring artifact files.
+
+        This phase only unlinks artifact files from ``ring_artifact_dir``. It
+        does not write tombstones, delete manifests, or delete per-ring
+        artifact-version JSON metadata.
+        """
+        if not self.state_dir:
+            raise ValueError(
+                'ring_manager_state_dir is required for cleanup requests')
+        if not self.ring_artifact_dir:
+            raise ValueError(
+                'ring_artifact_dir is required for cleanup requests')
+        timestamp = normal_timestamp_internal(timestamp)
+        builds_dir = self._collection_dir('ring_builds')
+        with lock_path(builds_dir, name='ring-build-queue'):
+            with self.published_state_lock():
+                builds = self._list_dir_objects('ring_builds')
+                active_plan = self._active_build_cleanup_plan(
+                    builds, timestamp, retention_age, retain_versions)
+                if active_plan is not None:
+                    return self._artifact_file_cleanup_result(
+                        active_plan, timestamp)
+
+                plan = self.plan_artifact_cleanup(
+                    retention_age=retention_age,
+                    retain_versions=retain_versions,
+                    timestamp=timestamp,
+                    include_details=True)
+                result = self._artifact_file_cleanup_result(plan, timestamp)
+                if not plan.get('cleanup_safe'):
+                    return result
+                metadata_blockers = \
+                    self._artifact_file_cleanup_metadata_blockers(plan)
+                if metadata_blockers:
+                    result['cleanup_safe'] = False
+                    result['cleanup_blockers'] = metadata_blockers
+                    return result
+
+                result['delete_allowed'] = True
+                for row in plan.get('artifact_files') or []:
+                    if row.get('candidate'):
+                        self._cleanup_artifact_file(row, result)
+                        if result['errors']:
+                            break
+
+                result['completed_at'] = normal_timestamp_internal()
+                self._record_artifact_file_cleanup(result)
+                return result
+
+    def artifact_cleanup_file_stats(self):
+        try:
+            cleanup = self._state_index().get(
+                'artifact_cleanup_files', {})
+        except (IOError, ValueError):
+            return {}
+        if not isinstance(cleanup, dict):
+            return {}
+        return copy.deepcopy(cleanup)
+
     def _ring_artifact_version_id(self, version):
         return str(version.get(
             'swift_ring_version', version.get('version', version.get('id'))))
@@ -1495,7 +2132,7 @@ class RingManagerStore(object):
 
     def _public_ring_artifact_version(self, ring_id, version, latest=False):
         public_version = copy.deepcopy(version)
-        for key in ('_artifact_root', 'artifact_dir'):
+        for key in ('_artifact_root', '_record_path', 'artifact_dir'):
             public_version.pop(key, None)
         public_version['ring_id'] = ring_id
         public_version['version'] = self._ring_artifact_version_id(version)
@@ -1556,6 +2193,7 @@ class RingManagerStore(object):
                     self.ring_artifact_version_tombstoned(
                         ring_id, version_id)):
                 continue
+            version['_record_path'] = path
             version['_artifact_root'] = directory
             versions.append(version)
         return versions
@@ -1607,6 +2245,7 @@ class RingManagerStore(object):
                         self.ring_artifact_version_tombstoned(
                             ring_id, version_id)):
                     continue
+                version['_record_path'] = path
                 version['_artifact_root'] = directory
                 versions.append(version)
         return versions
@@ -1675,6 +2314,7 @@ class RingManagerStore(object):
         version = copy.deepcopy(
             self._find_ring_artifact_version(ring_id, version_id))
         version.pop('_artifact_root', None)
+        version.pop('_record_path', None)
         return version
 
     def get_concrete_ring_artifact_version_id(self, ring_id, version_id):

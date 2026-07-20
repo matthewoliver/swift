@@ -81,12 +81,6 @@ RING_FIELDS = [
     'devices_url',
 ]
 
-PARTITION_POWER_READONLY_FIELDS = set([
-    'next_part_power',
-    'partition_power_increase_state',
-    'allowed_partition_power_actions',
-])
-
 
 class RingController(object):
     """Own ring-specific routes and their orchestration."""
@@ -381,10 +375,10 @@ class RingController(object):
             },
         })
 
-    def _check_partition_power_fields(self, metadata):
+    def _check_writable_ring_metadata(self, metadata):
         readonly = sorted(
             key for key in metadata
-            if key in PARTITION_POWER_READONLY_FIELDS)
+            if key in RING_API_READONLY_FIELDS)
         if readonly:
             raise ValueError(
                 'Read-only ring fields may not be set: %s' %
@@ -571,7 +565,7 @@ class RingController(object):
     def ring_list(self, req):
         if req.method == 'POST':
             payload = self._json_request_body(req)
-            self._check_partition_power_fields(payload)
+            self._check_writable_ring_metadata(payload)
             metadata, builder_updates = \
                 self._builder_manager.split_builder_fields(payload)
             try:
@@ -623,7 +617,7 @@ class RingController(object):
             return HTTPNoContent(request=req)
         if req.method in ('PUT', 'PATCH'):
             payload = self._json_request_body(req)
-            self._check_partition_power_fields(payload)
+            self._check_writable_ring_metadata(payload)
             metadata, builder_updates = \
                 self._builder_manager.split_builder_fields(payload)
             try:
@@ -643,6 +637,10 @@ class RingController(object):
             except RingBuilderManagerError as err:
                 return self._json_error(req, HTTPBadRequest, str(err))
             metadata.update(builder_metadata)
+            if req.method == 'PUT':
+                for field in RING_API_READONLY_FIELDS:
+                    if field in existing:
+                        metadata[field] = existing[field]
             try:
                 ring = self._store.update_ring(
                     ring_id, metadata,

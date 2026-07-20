@@ -1127,3 +1127,95 @@ nodes:
             self.assertEqual(1, status)
             self.assertEqual('', stdout)
             self.assertIn(message, stderr)
+
+    def test_cleanup_metadata_posts_confirmed_policy(self):
+        body = {
+            'dry_run': False,
+            'delete_allowed': True,
+            'metadata_only': True,
+            'cleanup_safe': True,
+            'cleanup_blockers': [],
+            'summary': {
+                'manifests': {'candidates': 1, 'tombstones_written': 1,
+                              'records_deleted': 1},
+                'ring_artifact_versions': {
+                    'candidates': 1, 'tombstones_written': 1,
+                    'records_deleted': 1},
+                'artifact_files': {'candidates': 1, 'left_untouched': 1},
+            },
+            'warnings': [],
+            'skipped': [],
+            'errors': [],
+        }
+        opener = FakeOpener({
+            ('POST', '/api/v1/ring_manager/artifact_cleanup/metadata/'):
+            json_response(body),
+        })
+
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--admin-key', 'secret', '--read-key', 'reader',
+            'cleanup', 'metadata', '--retention-age', '1209600',
+            '--retain-versions', '2', '--confirm',
+        ], opener)
+
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual(
+            'secret',
+            opener.requests[0]['headers']['x-ring-manager-admin-key'])
+        self.assertEqual({
+            'confirm': True,
+            'retention_age': 1209600.0,
+            'retain_versions': 2,
+        }, json.loads(opener.requests[0]['body'].decode('ascii')))
+        self.assertIn('Metadata only: yes', stdout)
+
+    def test_cleanup_metadata_requires_confirm(self):
+        opener = FakeOpener({})
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--admin-key', 'secret', 'cleanup', 'metadata',
+        ], opener)
+        self.assertEqual(1, status)
+        self.assertEqual('', stdout)
+        self.assertEqual([], opener.requests)
+        self.assertIn('requires --confirm', stderr)
+
+    def test_cleanup_files_formats_conflict(self):
+        body = {
+            'dry_run': False,
+            'delete_allowed': False,
+            'artifact_files_only': True,
+            'cleanup_safe': False,
+            'cleanup_blockers': [{'type': 'metadata_cleanup_required'}],
+            'summary': {'artifact_files': {'candidates': 1}},
+            'warnings': [],
+            'skipped': [],
+            'errors': [],
+        }
+        opener = FakeOpener({
+            ('POST', '/api/v1/ring_manager/artifact_cleanup/files/'):
+            FakeResponse(json.dumps(body).encode('ascii'), status=409),
+        })
+
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--admin-key', 'secret', 'cleanup', 'files', '--confirm',
+        ], opener)
+
+        self.assertEqual(1, status)
+        self.assertEqual('', stderr)
+        self.assertIn('Cleanup safe: no', stdout)
+        self.assertIn('metadata_cleanup_required', stdout)
+
+    def test_cleanup_files_requires_confirm(self):
+        opener = FakeOpener({})
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--admin-key', 'secret', 'cleanup', 'files',
+        ], opener)
+        self.assertEqual(1, status)
+        self.assertEqual('', stdout)
+        self.assertEqual([], opener.requests)
+        self.assertIn('requires --confirm', stderr)

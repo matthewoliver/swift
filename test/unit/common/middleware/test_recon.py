@@ -1353,7 +1353,10 @@ class TestReconSuccess(TestCase):
         self.fakecache.fakeout = from_cache_response
         rv = self.app.get_ring_manager_info()
         self.assertEqual(self.fakecache.fakeout_calls,
-                         [((['ring_manager_sync'],
+                         [((['ring_manager_sync',
+                             'artifact_cleanup_plan',
+                             'artifact_cleanup_metadata',
+                             'artifact_cleanup_files'],
                             self._full_recon_path(
                                 None, recon_file=RECON_RING_MANAGER_FILE)),
                            {'ignore_missing': True})])

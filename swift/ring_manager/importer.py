@@ -20,7 +20,7 @@ import shutil
 
 from swift.common import exceptions as swift_exceptions
 from swift.common.ring.ring import RingData
-from swift.common.utils import config_true_value, lock_path, md5, mkdirs
+from swift.common.utils import config_true_value, md5, mkdirs
 from swift.ring_manager.builder import RingBuilderManager, \
     RingBuilderManagerError
 from swift.ring_manager.common import NormalTimestamp, \
@@ -65,7 +65,7 @@ class RingImporter(object):
         if not self.store.state_dir:
             raise RingImporterError(
                 'ring_manager_state_dir is required for ring import')
-        return lock_path(self.store.state_dir, name='ring-manager-import')
+        return self.store.published_state_lock()
 
     def _timestamp(self, timestamp=None):
         timestamp = self.time_func() if timestamp is None else timestamp

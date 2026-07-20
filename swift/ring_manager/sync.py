@@ -279,8 +279,15 @@ class RingManagerSync(object):
 
     def _stage_json_write(self, state_writes, path, value):
         state_writes.append({
+            'op': 'write',
             'path': path,
             'body': self._json_body(value),
+        })
+
+    def _stage_state_delete(self, state_writes, path):
+        state_writes.append({
+            'op': 'delete',
+            'path': path,
         })
 
     def _backup_existing_path(self, path):
@@ -498,12 +505,37 @@ class RingManagerSync(object):
         backup_path = self._backup_existing_path(path)
         entry = {
             'kind': kind,
+            'op': 'write',
             'path': path,
             'backup_path': backup_path,
         }
         self._record_journal_entry(journal, entry)
         touched.append(entry)
         self._write_file_atomic(path, body)
+
+    def _commit_path_delete(self, touched, journal, path, kind='state'):
+        backup_path = self._backup_existing_path(path)
+        entry = {
+            'kind': kind,
+            'op': 'delete',
+            'path': path,
+            'backup_path': backup_path,
+        }
+        self._record_journal_entry(journal, entry)
+        touched.append(entry)
+        try:
+            os.unlink(path)
+        except OSError as err:
+            if err.errno != errno.ENOENT:
+                raise RingManagerSyncLocalError(
+                    'local ring-manager sync delete failed for %s: %s' %
+                    (path, err))
+            return False
+        else:
+            directory = os.path.dirname(path)
+            if directory:
+                fsync_dir(directory)
+            return True
 
     def _cleanup_backups(self, touched):
         for entry in touched:
@@ -577,14 +609,21 @@ class RingManagerSync(object):
         state_paths = []
         try:
             for write in state_writes:
-                self._commit_path_body(
-                    touched, journal, write['path'], write['body'])
-                state_paths.append(write['path'])
+                op = write.get('op', 'write')
+                if op == 'delete':
+                    changed = self._commit_path_delete(
+                        touched, journal, write['path'])
+                    if changed:
+                        state_paths.append((write['path'], op))
+                else:
+                    self._commit_path_body(
+                        touched, journal, write['path'], write['body'])
+                    state_paths.append((write['path'], op))
             for builder in staged_builders:
                 self._commit_staged_builder(touched, journal, builder)
             self._commit_path_body(
                 touched, journal, index_write['path'], index_write['body'])
-            state_paths.append(index_write['path'])
+            state_paths.append((index_write['path'], 'write'))
             journal['committed'] = True
             self._write_sync_journal(journal)
         except Exception:
@@ -604,8 +643,8 @@ class RingManagerSync(object):
             raise
         self._cleanup_backups(touched)
         self._remove_sync_journal()
-        for path in state_paths:
-            self.state_change_hook.run('write', path)
+        for path, op in state_paths:
+            self.state_change_hook.run(op, path)
 
     def _stage_builder_file(self, path, body, ring_id):
         temp_path = None
@@ -1084,6 +1123,18 @@ class RingManagerSync(object):
                     '%s.json' % self._safe_id(tombstone['version']))
             self._stage_json_write(state_writes, path, tombstone['body'])
 
+    def _stage_tombstoned_live_record_deletes(self, state_writes, tombstones):
+        for tombstone in tombstones:
+            if tombstone['kind'] == 'version':
+                path = self._state_path(
+                    'releases', self._safe_id(tombstone['version']),
+                    'manifest.json')
+            else:
+                path = self._state_path(
+                    'ring-versions', self._safe_id(tombstone['ring_id']),
+                    '%s.json' % self._safe_id(tombstone['version']))
+            self._stage_state_delete(state_writes, path)
+
     def _index_write(self, source_url, latest_version, desired_version,
                      desired_info, synced_at):
         index_path = self._state_path('index.json')
@@ -1334,6 +1385,8 @@ class RingManagerSync(object):
                 self._stage_ring_artifact_versions(
                     state_writes, desired['ring_versions'])
             self._stage_tombstones(state_writes, tombstones)
+            self._stage_tombstoned_live_record_deletes(
+                state_writes, tombstones)
             self._stage_json_write(
                 state_writes,
                 self._state_path(

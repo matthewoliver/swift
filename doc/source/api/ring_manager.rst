@@ -59,6 +59,8 @@ Example response::
         "rings": "/api/v1/rings/",
         "status": "/api/v1/ring_manager/status/",
         "artifact_cleanup_plan": "/api/v1/ring_manager/artifact_cleanup/plan/",
+        "artifact_cleanup_metadata": "/api/v1/ring_manager/artifact_cleanup/metadata/",
+        "artifact_cleanup_files": "/api/v1/ring_manager/artifact_cleanup/files/",
         "tombstones": "/api/v1/ring_manager/tombstones/",
         "sync_trigger": "/api/v1/ring_manager/sync/trigger/"
       },
@@ -103,6 +105,25 @@ The optional ``details=false`` parameter returns just policy, warning, and
 summary data.
 ``swift-ring-manager cleanup plan --check`` exits non-zero unless this verdict
 is explicitly safe.
+
+``POST /api/v1/ring_manager/artifact_cleanup/metadata/`` requires
+``confirm=true`` and repeats the plan under the build and published-state
+locks.
+It writes tombstones before removing candidate release manifests and per-ring
+artifact-version JSON.
+It leaves artifact bytes in place, records a bounded last-attempt summary, and
+returns ``409 Conflict`` if the locked plan is unsafe.
+
+``POST /api/v1/ring_manager/artifact_cleanup/files/`` also requires
+``confirm=true`` and repeats the plan under the same locks.
+It only unlinks candidate artifact files after the corresponding candidate
+metadata has already been removed.
+It returns ``409 Conflict`` with ``metadata_cleanup_required`` blockers rather
+than leaving served metadata that points at deleted bytes.
+
+Use ``swift-ring-manager cleanup metadata --confirm`` first, then
+``swift-ring-manager cleanup files --confirm`` after reviewing the result.
+Both commands return non-zero for unsafe or failed cleanup results.
 
 ``GET /api/v1/ring_manager/tombstones/`` lists reservation records that stop a
 previously pruned release ID or per-ring artifact version from being reused.

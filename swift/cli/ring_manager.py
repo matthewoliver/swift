@@ -673,6 +673,151 @@ def _format_cleanup_plan(value):
     return '\n'.join(lines) + '\n'
 
 
+def _metadata_cleanup_rows(value):
+    if not isinstance(value, dict):
+        return []
+    summary = value.get('summary') or {}
+    rows = []
+    for name, label in (
+            ('manifests', 'manifests'),
+            ('ring_artifact_versions', 'ring artifact versions')):
+        item = summary.get(name) or {}
+        rows.append({
+            'name': label,
+            'candidates': item.get('candidates', 0),
+            'tombstones_written': item.get('tombstones_written', 0),
+            'already_tombstoned': item.get('already_tombstoned', 0),
+            'records_deleted': item.get('records_deleted', 0),
+            'already_deleted': item.get('already_deleted', 0),
+            'left_untouched': '',
+            'skipped': item.get('skipped', 0),
+        })
+    artifact_files = summary.get('artifact_files') or {}
+    rows.append({
+        'name': 'artifact files',
+        'candidates': artifact_files.get('candidates', 0),
+        'tombstones_written': '',
+        'already_tombstoned': '',
+        'records_deleted': '',
+        'already_deleted': '',
+        'left_untouched': artifact_files.get('left_untouched', 0),
+        'skipped': '',
+    })
+    return rows
+
+
+def _format_cleanup_metadata(value):
+    if not isinstance(value, dict):
+        return '%s\n' % value
+    lines = [
+        'Dry run: %s' % _format_bool(value.get('dry_run')),
+        'Delete allowed: %s' % _format_bool(value.get('delete_allowed')),
+        'Metadata only: %s' % _format_bool(value.get('metadata_only')),
+        'Cleanup safe: %s' % _format_bool(value.get('cleanup_safe')),
+        'Cleanup blockers: %s' % len(value.get('cleanup_blockers') or []),
+        'Started: %s' % (value.get('started_at') or ''),
+        'Completed: %s' % (value.get('completed_at') or ''),
+        'Retention age: %s' % _format_seconds(value.get('retention_age')),
+        'Retain versions: %s' % (
+            '' if value.get('retain_versions') is None
+            else value.get('retain_versions')),
+        '',
+        _format_table(_metadata_cleanup_rows(value), (
+            ('STATE', 'name'),
+            ('CANDIDATES', 'candidates'),
+            ('TOMBSTONES', 'tombstones_written'),
+            ('ALREADY_TS', 'already_tombstoned'),
+            ('DELETED', 'records_deleted'),
+            ('ALREADY_GONE', 'already_deleted'),
+            ('LEFT_UNTOUCHED', 'left_untouched'),
+            ('SKIPPED', 'skipped'),
+        )).rstrip(),
+    ]
+    blockers = value.get('cleanup_blockers') or []
+    if blockers:
+        lines.append('')
+        lines.append('Cleanup blockers:')
+        for blocker in blockers:
+            lines.append('  %s' % _table_value(blocker))
+    skipped = value.get('skipped') or []
+    if skipped:
+        lines.append('')
+        lines.append('Skipped:')
+        for item in skipped:
+            lines.append('  %s' % _table_value(item))
+    errors = value.get('errors') or []
+    if errors:
+        lines.append('')
+        lines.append('Errors:')
+        for item in errors:
+            lines.append('  %s' % _table_value(item))
+    return '\n'.join(lines) + '\n'
+
+
+def _artifact_file_cleanup_rows(value):
+    if not isinstance(value, dict):
+        return []
+    artifact_files = (value.get('summary') or {}).get(
+        'artifact_files') or {}
+    return [{
+        'name': 'artifact files',
+        'candidates': artifact_files.get('candidates', 0),
+        'files_deleted': artifact_files.get('files_deleted', 0),
+        'already_deleted': artifact_files.get('already_deleted', 0),
+        'bytes_deleted': artifact_files.get('bytes_deleted', 0),
+        'candidate_bytes': artifact_files.get('candidate_bytes', 0),
+        'skipped': artifact_files.get('skipped', 0),
+    }]
+
+
+def _format_cleanup_files(value):
+    if not isinstance(value, dict):
+        return '%s\n' % value
+    lines = [
+        'Dry run: %s' % _format_bool(value.get('dry_run')),
+        'Delete allowed: %s' % _format_bool(value.get('delete_allowed')),
+        'Artifact files only: %s' % _format_bool(
+            value.get('artifact_files_only')),
+        'Cleanup safe: %s' % _format_bool(value.get('cleanup_safe')),
+        'Cleanup blockers: %s' % len(value.get('cleanup_blockers') or []),
+        'Started: %s' % (value.get('started_at') or ''),
+        'Completed: %s' % (value.get('completed_at') or ''),
+        'Retention age: %s' % _format_seconds(value.get('retention_age')),
+        'Retain versions: %s' % (
+            '' if value.get('retain_versions') is None
+            else value.get('retain_versions')),
+        '',
+        _format_table(_artifact_file_cleanup_rows(value), (
+            ('STATE', 'name'),
+            ('CANDIDATES', 'candidates'),
+            ('DELETED', 'files_deleted'),
+            ('ALREADY_GONE', 'already_deleted'),
+            ('BYTES_DELETED', 'bytes_deleted'),
+            ('CANDIDATE_BYTES', 'candidate_bytes'),
+            ('SKIPPED', 'skipped'),
+        )).rstrip(),
+    ]
+    blockers = value.get('cleanup_blockers') or []
+    if blockers:
+        lines.append('')
+        lines.append('Cleanup blockers:')
+        for blocker in blockers:
+            lines.append('  %s' % _table_value(blocker))
+    skipped = value.get('skipped') or []
+    if skipped:
+        lines.append('')
+        lines.append('Skipped:')
+        for item in skipped:
+            lines.append('  %s' % _table_value(item))
+    errors = value.get('errors') or []
+    if errors:
+        lines.append('')
+        lines.append('Errors:')
+        for item in errors:
+            lines.append('  %s' % _table_value(item))
+    return '\n'.join(lines) + '\n'
+
+
 def _format_list(value):
     if not value:
         return 'none'
@@ -1268,6 +1413,66 @@ def _cleanup_plan(client, args):
     return result
 
 
+def _cleanup_metadata(client, args):
+    _require_confirm(args, 'cleanup metadata')
+    body = {'confirm': True}
+    if args.retention_age is not None:
+        if (not math.isfinite(args.retention_age) or
+                args.retention_age < 0):
+            raise RingManagerCLIError(
+                '--retention-age must be a finite non-negative number')
+        body['retention_age'] = args.retention_age
+    if args.retain_versions is not None:
+        if args.retain_versions < 0:
+            raise RingManagerCLIError(
+                '--retain-versions must be a non-negative integer')
+        body['retain_versions'] = args.retain_versions
+    if args.dry_run:
+        return {
+            'method': 'POST',
+            'path': '/api/v1/ring_manager/artifact_cleanup/metadata/',
+            'body': body,
+        }
+    result = client.request(
+        'POST', '/api/v1/ring_manager/artifact_cleanup/metadata/',
+        body=body, admin=True, acceptable_statuses=(409, 500))
+    if (not isinstance(result, dict) or
+            result.get('cleanup_safe') is not True or
+            result.get('errors')):
+        args.exit_status = 1
+    return result
+
+
+def _cleanup_files(client, args):
+    _require_confirm(args, 'cleanup files')
+    body = {'confirm': True}
+    if args.retention_age is not None:
+        if (not math.isfinite(args.retention_age) or
+                args.retention_age < 0):
+            raise RingManagerCLIError(
+                '--retention-age must be a finite non-negative number')
+        body['retention_age'] = args.retention_age
+    if args.retain_versions is not None:
+        if args.retain_versions < 0:
+            raise RingManagerCLIError(
+                '--retain-versions must be a non-negative integer')
+        body['retain_versions'] = args.retain_versions
+    if args.dry_run:
+        return {
+            'method': 'POST',
+            'path': '/api/v1/ring_manager/artifact_cleanup/files/',
+            'body': body,
+        }
+    result = client.request(
+        'POST', '/api/v1/ring_manager/artifact_cleanup/files/',
+        body=body, admin=True, acceptable_statuses=(409, 500))
+    if (not isinstance(result, dict) or
+            result.get('cleanup_safe') is not True or
+            result.get('errors')):
+        args.exit_status = 1
+    return result
+
+
 def _add_ring_payload_args(parser):
     parser.add_argument(
         '--from-file',
@@ -1402,6 +1607,42 @@ def make_parser():
              'default unless --json is used.')
     cleanup_plan.set_defaults(
         func=_cleanup_plan, formatter=_format_cleanup_plan)
+    cleanup_metadata = cleanup_sub.add_parser(
+        'metadata',
+        help='Tombstone and delete cleanup-candidate manifest and per-ring '
+             'artifact-version JSON metadata.')
+    cleanup_metadata.add_argument(
+        '--retention-age', type=float,
+        help='Delete only candidate metadata older than SECONDS according to '
+             'the locked cleanup recheck.')
+    cleanup_metadata.add_argument(
+        '--retain-versions', type=int,
+        help='Protect this many newest published cluster manifests in '
+             'addition to the latest pointer during the locked recheck.')
+    cleanup_metadata.add_argument(
+        '--confirm', action='store_true',
+        help='Required acknowledgement that cleanup metadata will mutate '
+             'ring-manager state.')
+    cleanup_metadata.set_defaults(
+        func=_cleanup_metadata, formatter=_format_cleanup_metadata)
+    cleanup_files = cleanup_sub.add_parser(
+        'files',
+        help='Delete cleanup-candidate artifact files from the ring artifact '
+             'store without deleting manifest or per-ring metadata JSON.')
+    cleanup_files.add_argument(
+        '--retention-age', type=float,
+        help='Delete only candidate artifact files older than SECONDS '
+             'according to the locked cleanup recheck.')
+    cleanup_files.add_argument(
+        '--retain-versions', type=int,
+        help='Protect this many newest published cluster manifests in '
+             'addition to the latest pointer during the locked recheck.')
+    cleanup_files.add_argument(
+        '--confirm', action='store_true',
+        help='Required acknowledgement that cleanup files will unlink '
+             'artifact files from ring_artifact_dir.')
+    cleanup_files.set_defaults(
+        func=_cleanup_files, formatter=_format_cleanup_files)
 
     rings = subparsers.add_parser(
         'rings', help='Manage logical Swift ring metadata.')

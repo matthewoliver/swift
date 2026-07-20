@@ -185,6 +185,32 @@ Build and publication metrics include::
     builders.parts_changed
     artifacts.written
     artifacts.bytes
+    artifact_cleanup.plan.requests
+    artifact_cleanup.plan.safe
+    artifact_cleanup.plan.unsafe
+    artifact_cleanup.plan.blockers
+    artifact_cleanup.plan.timing
+    artifact_cleanup.metadata.requests
+    artifact_cleanup.metadata.successes
+    artifact_cleanup.metadata.conflicts
+    artifact_cleanup.metadata.errors
+    artifact_cleanup.metadata.blockers
+    artifact_cleanup.metadata.errors_seen
+    artifact_cleanup.metadata.manifests.tombstones_written
+    artifact_cleanup.metadata.manifests.records_deleted
+    artifact_cleanup.metadata.ring_artifact_versions.tombstones_written
+    artifact_cleanup.metadata.ring_artifact_versions.records_deleted
+    artifact_cleanup.metadata.artifact_files.left_untouched
+    artifact_cleanup.metadata.timing
+    artifact_cleanup.files.requests
+    artifact_cleanup.files.successes
+    artifact_cleanup.files.conflicts
+    artifact_cleanup.files.errors
+    artifact_cleanup.files.blockers
+    artifact_cleanup.files.errors_seen
+    artifact_cleanup.files.artifact_files.files_deleted
+    artifact_cleanup.files.artifact_files.bytes_deleted
+    artifact_cleanup.files.timing
 
 State-change hook metrics include::
 
@@ -471,16 +497,27 @@ They must be regular files owned by root or the effective service user and
 must not allow group or other permissions.
 Modes such as ``0400`` or ``0600`` are suitable.
 
-Published-state cleanup planning
-================================
+Published-state cleanup
+=======================
 
 Build-job retention does not prune published releases or immutable artifacts.
 Use ``GET /api/v1/ring_manager/artifact_cleanup/plan/`` to inspect a dry-run
 retention graph instead.
 The admin-only endpoint accepts ``retention_age``, ``retain_versions``, and
 ``details`` parameters but makes no destructive change.
-It reports ``cleanup_safe`` and explicit blockers so a later pruning feature
-cannot mistake a partial graph for a deletion plan.
+It reports ``cleanup_safe`` and explicit blockers so an operator can reject a
+partial graph before starting cleanup.
+
+Use the confirmed metadata phase before the confirmed file phase.
+Metadata cleanup writes tombstones before deleting served release or per-ring
+artifact-version JSON and file cleanup refuses to unlink bytes while candidate
+metadata still exists.
+Both phases re-plan after taking the build and published-state locks.
+
+The server honours ``recon_cache_path`` and ``recon_dump`` for cleanup API
+attempts, using the same ``ring-manager.recon`` file as the sync utility.
+Recon stores compact last-attempt safety, status, and summary data without
+candidate detail rows.
 
 Process management
 ==================

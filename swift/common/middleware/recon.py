@@ -367,11 +367,16 @@ class ReconMiddleware(object):
                                       ignore_missing=True)
 
     def get_ring_manager_info(self):
-        """get ring-manager sync info, if any"""
+        """get ring-manager info, if any"""
 
-        return self._from_recon_cache(['ring_manager_sync'],
-                                      self.ring_manager_recon_cache,
-                                      ignore_missing=True)
+        return self._from_recon_cache([
+            'ring_manager_sync',
+            'artifact_cleanup_plan',
+            'artifact_cleanup_metadata',
+            'artifact_cleanup_files',
+        ],
+            self.ring_manager_recon_cache,
+            ignore_missing=True)
 
     def get_ring_manager_agent_info(self):
         """get ring-manager agent info, if any"""

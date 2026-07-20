@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 import re
 import shlex
@@ -23,12 +24,15 @@ from swift import __version__ as swift_version
 from swift.common import exceptions as swift_exceptions
 from swift.common.concurrency import GreenPool, Queue, Semaphore, Timeout, \
     spawn, tpool
+from swift.common.recon import DEFAULT_RECON_CACHE_PATH, \
+    RECON_RING_MANAGER_FILE
 from swift.common.swob import HTTPBadRequest, HTTPConflict, \
     HTTPException, HTTPForbidden, HTTPInternalServerError, \
     HTTPMethodNotAllowed, HTTPNotFound, Request, Response, wsgi_to_str
 from swift.common.utils import config_true_value, get_log_line, get_logger, \
     config_positive_float_value, config_positive_int_value, \
-    LOG_LINE_DEFAULT_FORMAT, non_negative_float, parse_options
+    LOG_LINE_DEFAULT_FORMAT, dump_recon_cache, mkdirs, non_negative_float, \
+    parse_options
 from swift.common.wsgi import run_wsgi
 from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID, \
     RingBuilderManager, RingBuilderManagerError
@@ -74,6 +78,11 @@ class RingManagerApplication(object):
         self.log_format = conf.get('log_format', LOG_LINE_DEFAULT_FORMAT)
         self.anonymization_method = conf.get('log_anonymization_method', 'md5')
         self.anonymization_salt = conf.get('log_anonymization_salt', '')
+        self.recon_cache_path = conf.get(
+            'recon_cache_path', DEFAULT_RECON_CACHE_PATH)
+        self.recon_cache = os.path.join(
+            self.recon_cache_path, RECON_RING_MANAGER_FILE)
+        self.recon_dump = config_true_value(conf.get('recon_dump', 'true'))
         state_dir = conf.get(
             'ring_manager_state_dir', DEFAULT_RING_MANAGER_STATE_DIR)
         ring_artifact_dir = conf.get(
@@ -172,6 +181,11 @@ class RingManagerApplication(object):
                           ('GET',), self.ring_manager_status),
             routing.Route(r'^/api/v1/ring_manager/artifact_cleanup/plan/?$',
                           ('GET',), self.artifact_cleanup_plan),
+            routing.Route(
+                r'^/api/v1/ring_manager/artifact_cleanup/metadata/?$',
+                ('POST',), self.artifact_cleanup_metadata),
+            routing.Route(r'^/api/v1/ring_manager/artifact_cleanup/files/?$',
+                          ('POST',), self.artifact_cleanup_files),
             routing.Route(r'^/api/v1/ring_manager/tombstones/?$',
                           ('GET',), self.ring_manager_tombstones),
             routing.Route(r'^/api/v1/ring_manager/sync/trigger/?$',
@@ -262,6 +276,10 @@ class RingManagerApplication(object):
             'status': '/api/v1/ring_manager/status/',
             'artifact_cleanup_plan':
                 '/api/v1/ring_manager/artifact_cleanup/plan/',
+            'artifact_cleanup_metadata':
+                '/api/v1/ring_manager/artifact_cleanup/metadata/',
+            'artifact_cleanup_files':
+                '/api/v1/ring_manager/artifact_cleanup/files/',
             'tombstones': '/api/v1/ring_manager/tombstones/',
             'sync_trigger': '/api/v1/ring_manager/sync/trigger/',
             'rings': '/api/v1/rings/',
@@ -826,6 +844,9 @@ class RingManagerApplication(object):
             'build_job_lease_timeout': self.build_job_lease_timeout,
             'ring_builds': self.store.ring_build_queue_stats(
                 lease_timeout=self.build_job_lease_timeout),
+            'artifact_cleanup_metadata':
+                self.store.artifact_cleanup_metadata_stats(),
+            'artifact_cleanup_files': self.store.artifact_cleanup_file_stats(),
             'ring_manager_sync': self._ring_manager_sync_status(
                 latest_version, desired_version, index_error=index_error),
             'sync_trigger': self._sync_trigger_status(),
@@ -851,20 +872,180 @@ class RingManagerApplication(object):
         value = req.params.get(name)
         if value in (None, ''):
             return None
+        return self._non_negative_int_value(value, name)
+
+    def _non_negative_int_value(self, value, name):
+        if isinstance(value, bool):
+            raise ValueError('%s must be a non-negative integer' % name)
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = int(value)
+            except ValueError:
+                raise ValueError(
+                    '%s must be a non-negative integer' % name)
+        else:
+            raise ValueError('%s must be a non-negative integer' % name)
+        if parsed < 0:
+            raise ValueError('%s must be a non-negative integer' % name)
+        return parsed
+
+    def _payload_non_negative_float(self, req, payload, name):
+        value = payload.get(name)
+        if value in (None, ''):
+            return self._query_non_negative_float(req, name)
         try:
-            value = int(value)
+            return non_negative_float(value)
         except (TypeError, ValueError):
-            raise ValueError('%s must be a non-negative integer' % name)
-        if value < 0:
-            raise ValueError('%s must be a non-negative integer' % name)
-        return value
+            raise ValueError('%s must be a non-negative number' % name)
+
+    def _payload_non_negative_int(self, req, payload, name):
+        value = payload.get(name)
+        if value in (None, ''):
+            return self._query_non_negative_int(req, name)
+        return self._non_negative_int_value(value, name)
 
     def _timestamp_internal(self, timestamp=None):
         if timestamp is None:
             return NormalTimestamp.now().internal
         return NormalTimestamp(timestamp).internal
 
+    def _dump_recon(self, stats):
+        if not self.recon_dump:
+            return
+        try:
+            mkdirs(os.path.dirname(self.recon_cache))
+        except Exception as err:
+            self.logger.exception('Exception creating recon cache path: %s' %
+                                  err)
+            return
+        dump_recon_cache(stats, self.recon_cache, self.logger)
+
+    def _cleanup_recon_stats(self, result, status):
+        blockers = result.get('cleanup_blockers') or []
+        warnings = result.get('warnings') or []
+        errors = result.get('errors') or []
+        skipped = result.get('skipped') or []
+        failed = status >= 500 or bool(errors)
+        blocked = status == 409 or (
+            status < 500 and result.get('cleanup_safe') is False)
+        success = status < 400 and not failed
+        if result.get('dry_run'):
+            success = success and result.get('cleanup_safe') is True
+        stats = {
+            'success': bool(success),
+            'http_status': status,
+            'blocked': bool(blocked),
+            'failed': bool(failed),
+            'dry_run': bool(result.get('dry_run')),
+            'delete_allowed': bool(result.get('delete_allowed')),
+            'cleanup_safe': result.get('cleanup_safe'),
+            'generated_at': result.get('generated_at'),
+            'started_at': result.get('started_at'),
+            'completed_at': result.get('completed_at'),
+            'retention_age': result.get('retention_age'),
+            'retain_versions': result.get('retain_versions'),
+            'latest_ring_version': result.get('latest_ring_version'),
+            'summary': copy.deepcopy(result.get('summary') or {}),
+            'cleanup_blocker_count': len(blockers),
+            'cleanup_blocker_types': sorted(set(
+                str(blocker.get('type')) for blocker in blockers
+                if isinstance(blocker, dict) and blocker.get('type'))),
+            'warning_count': len(warnings),
+            'error_count': len(errors),
+            'skipped_count': len(skipped),
+            'details_omitted': True,
+        }
+        if result.get('requires_tombstones') is not None:
+            stats['requires_tombstones'] = bool(
+                result.get('requires_tombstones'))
+        if result.get('metadata_only') is not None:
+            stats['metadata_only'] = bool(result.get('metadata_only'))
+        if result.get('artifact_files_only') is not None:
+            stats['artifact_files_only'] = bool(
+                result.get('artifact_files_only'))
+        for key in ('active_build_namespaces',
+                    'active_builds_with_unknown_namespaces',
+                    'ring_builds_with_unknown_states'):
+            if result.get(key) is not None:
+                stats['%s_count' % key] = len(result.get(key) or [])
+        return stats
+
+    def _recon_cleanup_result(self, key, result, status):
+        self._dump_recon({
+            key: self._cleanup_recon_stats(result, status),
+        })
+
+    def _summary_counter(self, summary, *path):
+        value = summary
+        for key in path:
+            if not isinstance(value, dict):
+                return 0
+            value = value.get(key)
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, (int, float)):
+            return value
+        return 0
+
+    def _emit_counter_metric(self, metric, value):
+        if value:
+            stats_increment(self.logger, metric, value)
+
+    def _emit_artifact_cleanup_metrics(self, kind, result, status):
+        base = 'artifact_cleanup.%s' % kind
+        stats_increment(self.logger, '%s.requests' % base)
+        if status >= 500:
+            stats_increment(self.logger, '%s.errors' % base)
+        elif status == 409:
+            stats_increment(self.logger, '%s.conflicts' % base)
+        elif kind == 'plan':
+            if result.get('cleanup_safe') is True:
+                stats_increment(self.logger, '%s.safe' % base)
+            else:
+                stats_increment(self.logger, '%s.unsafe' % base)
+        else:
+            stats_increment(self.logger, '%s.successes' % base)
+
+        self._emit_counter_metric(
+            '%s.blockers' % base, len(result.get('cleanup_blockers') or []))
+        self._emit_counter_metric(
+            '%s.warnings' % base, len(result.get('warnings') or []))
+        self._emit_counter_metric(
+            '%s.errors_seen' % base, len(result.get('errors') or []))
+        self._emit_counter_metric(
+            '%s.skipped' % base, len(result.get('skipped') or []))
+
+        summary = result.get('summary') or {}
+        if kind == 'plan':
+            return
+        if kind == 'metadata':
+            for section in ('manifests', 'ring_artifact_versions'):
+                for field in ('tombstones_written', 'already_tombstoned',
+                              'records_deleted', 'already_deleted',
+                              'skipped'):
+                    self._emit_counter_metric(
+                        '%s.%s.%s' % (base, section, field),
+                        self._summary_counter(summary, section, field))
+            self._emit_counter_metric(
+                '%s.artifact_files.left_untouched' % base,
+                self._summary_counter(
+                    summary, 'artifact_files', 'left_untouched'))
+            self._emit_counter_metric(
+                '%s.repairs.tombstoned_live_records' % base,
+                self._summary_counter(
+                    summary, 'repairs', 'tombstoned_live_records'))
+            return
+        if kind == 'files':
+            for field in ('files_deleted', 'already_deleted',
+                          'bytes_deleted', 'skipped'):
+                self._emit_counter_metric(
+                    '%s.artifact_files.%s' % (base, field),
+                    self._summary_counter(summary, 'artifact_files', field))
+
     def artifact_cleanup_plan(self, req):
+        start_time = float(NormalTimestamp.now())
         retention_age = self._query_non_negative_float(req, 'retention_age')
         retain_versions = self._query_non_negative_int(
             req, 'retain_versions')
@@ -874,7 +1055,65 @@ class RingManagerApplication(object):
             retain_versions=retain_versions,
             timestamp=self._timestamp_internal(),
             include_details=include_details)
+        self._recon_cleanup_result('artifact_cleanup_plan', plan, 200)
+        self._emit_artifact_cleanup_metrics('plan', plan, 200)
+        stats_timing_since(
+            self.logger, 'artifact_cleanup.plan.timing', start_time)
         return http.json_response(req, plan)
+
+    def artifact_cleanup_metadata(self, req):
+        start_time = float(NormalTimestamp.now())
+        payload = http.json_request_body(req, self.max_json_request_body_size)
+        confirm = payload.get('confirm', req.params.get('confirm'))
+        if not config_true_value(str(confirm)):
+            return http.json_error(
+                req, HTTPBadRequest,
+                'confirm=true is required for metadata cleanup')
+        retention_age = self._payload_non_negative_float(
+            req, payload, 'retention_age')
+        retain_versions = self._payload_non_negative_int(
+            req, payload, 'retain_versions')
+        result = self.store.cleanup_artifact_metadata(
+            retention_age=retention_age,
+            retain_versions=retain_versions,
+            timestamp=self._timestamp_internal())
+        if result.get('errors'):
+            status = 500
+        else:
+            status = 200 if result.get('cleanup_safe') is True else 409
+        self._recon_cleanup_result(
+            'artifact_cleanup_metadata', result, status)
+        self._emit_artifact_cleanup_metrics('metadata', result, status)
+        stats_timing_since(
+            self.logger, 'artifact_cleanup.metadata.timing', start_time)
+        return http.json_response(req, result, status=status)
+
+    def artifact_cleanup_files(self, req):
+        start_time = float(NormalTimestamp.now())
+        payload = http.json_request_body(req, self.max_json_request_body_size)
+        confirm = payload.get('confirm', req.params.get('confirm'))
+        if not config_true_value(str(confirm)):
+            return http.json_error(
+                req, HTTPBadRequest,
+                'confirm=true is required for artifact file cleanup')
+        retention_age = self._payload_non_negative_float(
+            req, payload, 'retention_age')
+        retain_versions = self._payload_non_negative_int(
+            req, payload, 'retain_versions')
+        result = self.store.cleanup_artifact_files(
+            retention_age=retention_age,
+            retain_versions=retain_versions,
+            timestamp=self._timestamp_internal())
+        if result.get('errors'):
+            status = 500
+        else:
+            status = 200 if result.get('cleanup_safe') is True else 409
+        self._recon_cleanup_result(
+            'artifact_cleanup_files', result, status)
+        self._emit_artifact_cleanup_metrics('files', result, status)
+        stats_timing_since(
+            self.logger, 'artifact_cleanup.files.timing', start_time)
+        return http.json_response(req, result, status=status)
 
     def ring_manager_tombstones(self, req):
         return http.json_response(req, self.store.list_tombstones())

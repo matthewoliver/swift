@@ -185,10 +185,12 @@ The plan fails closed when its reachability graph has missing or uncertain
 state, including active build namespaces.
 The CLI equivalent is ``swift-ring-manager cleanup plan --check``.
 
-Future destructive cleanup must leave a tombstone before removing published
+Confirmed metadata cleanup leaves a tombstone before removing published
 release or per-ring artifact-version JSON.
 Tombstones reserve those identifiers, take precedence over stale restored JSON,
 and are copied to read-only and standby state by ``swift-ring-manager-sync``.
+Artifact-file cleanup is a separate metadata-first operation, so it cannot
+unlink an artifact while candidate metadata still serves it.
 
 Publication
 ===========

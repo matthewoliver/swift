@@ -88,6 +88,19 @@ The command uses admin credentials even though it is a read request.
 Use \fB\-\-check\fR in automation to exit non-zero when the API reports a
 blocker or omits the cleanup safety verdict.
 .TP
+\fBcleanup metadata\fR [\fB\-\-retention-age\fR \fISECONDS\fR] [\fB\-\-retain-versions\fR \fICOUNT\fR] \fB\-\-confirm\fR
+Re-plan cleanup under the published-state lock, write tombstones, and delete
+only candidate release manifests and per-ring artifact-version JSON.
+Artifact files are left untouched.
+The command exits non-zero when cleanup is blocked or any metadata delete
+fails.
+.TP
+\fBcleanup files\fR [\fB\-\-retention-age\fR \fISECONDS\fR] [\fB\-\-retain-versions\fR \fICOUNT\fR] \fB\-\-confirm\fR
+Re-plan cleanup under the published-state lock and unlink candidate artifact
+files only after candidate metadata has been removed.
+The command returns a conflict without deleting files when metadata cleanup is
+still required.
+.TP
 \fBrings list\fR
 List logical Swift rings.
 .TP
