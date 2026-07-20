@@ -165,6 +165,10 @@ class TestRingManagerSync(unittest.TestCase):
                 'applicable': False,
             },
         }
+        self.tombstones = {
+            'versions': [],
+            'ring_versions': [],
+        }
 
     def tearDown(self):
         shutil.rmtree(self.testdir)
@@ -205,6 +209,8 @@ class TestRingManagerSync(unittest.TestCase):
         return {
             ('GET', '/api/v1/ring_manager/status/'):
                 json_response(self.primary_status),
+            ('GET', '/api/v1/ring_manager/tombstones/'):
+                json_response(self.tombstones),
             ('GET', '/api/v1/rings/releases/latest/manifest/'):
                 json_response(self.manifest),
             ('GET', '/api/v1/rings/releases/desired/'):
@@ -316,6 +322,7 @@ class TestRingManagerSync(unittest.TestCase):
             'ring_versions_synced': 1,
             'ring_version_files_downloaded': 0,
             'ring_version_files_unchanged': 1,
+            'tombstones_synced': 0,
             'builder_files_synced': 0,
             'builder_files_downloaded': 0,
             'builder_files_unchanged': 0,
@@ -535,6 +542,44 @@ class TestRingManagerSync(unittest.TestCase):
             request for request in opener.requests
             if request['path'].startswith(
                 '/api/v1/rings/releases/desired')])
+
+    def test_sync_copies_tombstone_reservations(self):
+        self.tombstones = {
+            'versions': [{
+                'schema_version': 1,
+                'type': 'ring_version',
+                'id': 'release-old',
+                'version': 'release-old',
+                'deleted_at': '1779783600.00000',
+                'deleted_by': 'artifact_cleanup',
+                'reason': 'retention_policy',
+            }],
+            'ring_versions': [{
+                'schema_version': 1,
+                'type': 'ring_artifact_version',
+                'ring_id': 'account',
+                'version': '11',
+                'deleted_at': '1779783601.00000',
+                'deleted_by': 'artifact_cleanup',
+                'reason': 'retention_policy',
+            }],
+        }
+        logger = debug_logger()
+
+        result = self._syncer(FakeOpener(self._routes()), logger=logger).sync()
+
+        self.assertEqual(2, result['tombstones_synced'])
+        with open(os.path.join(
+                self.state_dir, 'tombstones', 'versions',
+                'release-old.json')) as fp:
+            self.assertEqual(self.tombstones['versions'][0], json.load(fp))
+        with open(os.path.join(
+                self.state_dir, 'tombstones', 'ring-versions', 'account',
+                '11.json')) as fp:
+            self.assertEqual(self.tombstones['ring_versions'][0],
+                             json.load(fp))
+        self.assertEqual(2, logger.statsd_client.get_stats_counts()[
+            'sync.tombstones_synced'])
 
     def test_sync_builder_files_when_enabled(self):
         self.rings['objects'][0]['builder_files'] = [

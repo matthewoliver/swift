@@ -25,8 +25,8 @@ swift\-ring\-manager \- manage a Swift ring-manager service over HTTP
 .PP
 .B swift-ring-manager
 is an operator CLI for the Swift ring-manager control-plane API.
-It manages ring metadata and builder-backed device membership, and reports
-ring analysis.
+It manages ring metadata and builder-backed device membership, reports ring
+analysis, and plans published-state cleanup.
 It talks to a running
 .B swift-ring-manager-server
 and follows its read and write restrictions.
@@ -80,6 +80,13 @@ Show ring-manager service status. With \fB\-\-promotion\fR, request the standby
 promotion precheck, print its concise builder and published-state summary, and
 exit non-zero until it is ready. The check does not fence the old primary,
 redirect writers, or promote the standby.
+.TP
+\fBcleanup plan\fR [\fB\-\-retention-age\fR \fISECONDS\fR] [\fB\-\-retain-versions\fR \fICOUNT\fR] [\fB\-\-check\fR] [\fB\-\-details\fR|\fB\-\-summary\fR]
+Dry-run published-state cleanup and print protected and candidate manifest,
+per-ring artifact-version, and artifact-file counts.
+The command uses admin credentials even though it is a read request.
+Use \fB\-\-check\fR in automation to exit non-zero when the API reports a
+blocker or omits the cleanup safety verdict.
 .TP
 \fBrings list\fR
 List logical Swift rings.

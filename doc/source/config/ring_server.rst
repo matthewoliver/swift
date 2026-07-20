@@ -471,6 +471,17 @@ They must be regular files owned by root or the effective service user and
 must not allow group or other permissions.
 Modes such as ``0400`` or ``0600`` are suitable.
 
+Published-state cleanup planning
+================================
+
+Build-job retention does not prune published releases or immutable artifacts.
+Use ``GET /api/v1/ring_manager/artifact_cleanup/plan/`` to inspect a dry-run
+retention graph instead.
+The admin-only endpoint accepts ``retention_age``, ``retain_versions``, and
+``details`` parameters but makes no destructive change.
+It reports ``cleanup_safe`` and explicit blockers so a later pruning feature
+cannot mistake a partial graph for a deletion plan.
+
 Process management
 ==================
 

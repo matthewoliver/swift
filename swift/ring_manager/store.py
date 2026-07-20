@@ -15,6 +15,7 @@
 import copy
 import errno
 import json
+import math
 import os
 import tempfile
 import uuid
@@ -44,15 +45,37 @@ class RingVersionFileNotFound(KeyError):
     pass
 
 
+class RingVersionReserved(Exception):
+    def __init__(self, version):
+        self.version = version
+        super(RingVersionReserved, self).__init__(
+            'published ring version %s is reserved by tombstone' % version)
+
+
+class RingArtifactVersionReserved(Exception):
+    def __init__(self, ring_id, version):
+        self.ring_id = ring_id
+        self.version = version
+        super(RingArtifactVersionReserved, self).__init__(
+            'ring %s artifact version %s is reserved by tombstone' % (
+                ring_id, version))
+
+
 class RingBuildNotFound(KeyError):
     pass
 
 
 class RingBuildPublishedVersionConflict(Exception):
-    def __init__(self, version):
+    def __init__(self, version, reserved=False):
         self.version = version
+        self.reserved = reserved
+        if reserved:
+            message = 'published ring version %s is reserved by tombstone' % \
+                version
+        else:
+            message = 'published ring version %s already exists' % version
         super(RingBuildPublishedVersionConflict, self).__init__(
-            'published ring version %s already exists' % version)
+            message)
 
 
 class RingBuildVersionConflict(Exception):
@@ -80,6 +103,28 @@ class RingDesiredVersionConflict(Exception):
 
 TERMINAL_RING_BUILD_STATES = ('completed', 'failed', 'cancelled')
 READY_RING_BUILD_STATES = ('queued', 'deferred')
+ACTIVE_RING_BUILD_STATES = READY_RING_BUILD_STATES + ('building',)
+CLEANUP_BLOCKING_WARNING_TYPES = (
+    'artifact_scan_failed',
+    'artifact_stat_failed',
+    'invalid_artifact_path',
+    'invalid_manifest_ring',
+    'missing_artifact_dir',
+    'missing_artifact_file',
+    'missing_latest_ring_artifact',
+    'missing_latest_ring_version',
+    'missing_ring_artifact_version',
+    'missing_ring_id',
+    'ring_artifact_version_ring_id_mismatch',
+    'tombstoned_manifest_record',
+    'tombstoned_ring_artifact_version_record',
+)
+
+
+def _add_reason(reasons, key, reason):
+    reasons.setdefault(key, [])
+    if reason not in reasons[key]:
+        reasons[key].append(reason)
 
 
 class RingManagerStore(object):
@@ -104,6 +149,16 @@ class RingManagerStore(object):
         if path is None:
             return False
         return os.path.exists(path)
+
+    def _ring_version_tombstone_file(self, version_id):
+        return self._state_dir_path(
+            'tombstones', 'versions',
+            '%s.json' % self._safe_id(version_id))
+
+    def _ring_artifact_version_tombstone_file(self, ring_id, version_id):
+        return self._state_dir_path(
+            'tombstones', 'ring-versions', self._safe_id(ring_id),
+            '%s.json' % self._safe_id(version_id))
 
     def _read_json_file(self, path, default=None):
         if path is None:
@@ -299,6 +354,43 @@ class RingManagerStore(object):
             self._object_id_matches(obj, 'cluster_id', cluster_id) or
             self._object_id_matches(obj, 'cluster', cluster_id)
         )
+
+    def _artifact_relpath(self, path):
+        if not self.ring_artifact_dir:
+            return None
+        root = os.path.realpath(self.ring_artifact_dir)
+        resolved = os.path.realpath(path)
+        try:
+            common_path = os.path.commonpath([root, resolved])
+        except ValueError:
+            return None
+        if common_path != root:
+            return None
+        return os.path.relpath(resolved, root).replace(os.sep, '/')
+
+    def _artifact_file_relpath(self, version, file_info, warnings,
+                               owner_type, owner_id):
+        try:
+            path = self._resolve_artifact_path(version, file_info)
+        except (RingVersionFileNotFound, ValueError) as err:
+            warnings.append({
+                'type': 'invalid_artifact_path',
+                'owner_type': owner_type,
+                'owner_id': str(owner_id),
+                'file': copy.deepcopy(file_info),
+                'error': str(err),
+            })
+            return None
+        relpath = self._artifact_relpath(path)
+        if relpath is None:
+            warnings.append({
+                'type': 'invalid_artifact_path',
+                'owner_type': owner_type,
+                'owner_id': str(owner_id),
+                'file': copy.deepcopy(file_info),
+                'error': 'artifact path escapes ring_artifact_dir',
+            })
+        return relpath
 
     def _with_resource_uri(self, obj, collection):
         obj = copy.deepcopy(obj)
@@ -637,6 +729,9 @@ class RingManagerStore(object):
                 request.get('artifact_only', 'false')))
             if not artifact_only and request.get('version') is not None:
                 version = str(request['version'])
+                if self.ring_version_tombstoned(version):
+                    raise RingBuildPublishedVersionConflict(
+                        version, reserved=True)
                 if self.ring_version_exists(version):
                     raise RingBuildPublishedVersionConflict(version)
                 conflict = self._active_ring_build_for_version(
@@ -864,6 +959,516 @@ class RingManagerStore(object):
             'stale_recovered': stale_recovered,
         }
 
+    def _manifest_retention_sets(self, versions, latest_id, retention_age,
+                                 retain_versions, cutoff):
+        newest = []
+        for version in versions:
+            newest.append((
+                self._timestamp_float(version),
+                self._ring_version_id(version),
+            ))
+        newest.sort(key=lambda item: (
+            item[0] is None, -(item[0] or 0), item[1]))
+        retained_newest = set()
+        if retain_versions is not None:
+            for _timestamp, version_id in newest[:retain_versions]:
+                retained_newest.add(version_id)
+
+        protected = set()
+        candidates = set()
+        reasons = {}
+        no_policy = retention_age is None and retain_versions is None
+        for version in versions:
+            version_id = self._ring_version_id(version)
+            if latest_id is not None and str(version_id) == str(latest_id):
+                protected.add(version_id)
+                _add_reason(reasons, version_id, 'latest')
+            if retain_versions is not None and version_id in retained_newest:
+                protected.add(version_id)
+                _add_reason(reasons, version_id, 'retained_newest')
+            if retention_age is not None:
+                timestamp = self._timestamp_float(version)
+                if timestamp is None:
+                    protected.add(version_id)
+                    _add_reason(reasons, version_id, 'missing_timestamp')
+                elif timestamp > cutoff:
+                    protected.add(version_id)
+                    _add_reason(reasons, version_id, 'recent')
+                else:
+                    _add_reason(reasons, version_id, 'older_than_retention')
+            if no_policy:
+                protected.add(version_id)
+                _add_reason(reasons, version_id, 'no_retention_policy')
+            if version_id not in protected:
+                candidates.add(version_id)
+                if retain_versions is not None:
+                    _add_reason(reasons, version_id,
+                                'outside_retained_newest')
+                if not reasons.get(version_id):
+                    _add_reason(reasons, version_id, 'unprotected')
+        return protected, candidates, reasons
+
+    def _active_build_artifact_namespaces(self, builds):
+        namespaces = {}
+        unknown_namespaces = []
+        unknown_states = []
+        for build in builds:
+            state = build.get('state')
+            if state in TERMINAL_RING_BUILD_STATES:
+                continue
+            if state not in ACTIVE_RING_BUILD_STATES:
+                unknown_states.append({
+                    'id': str(build.get('id', '')),
+                    'state': None if state is None else str(state),
+                })
+                continue
+            request = build.get('request') or {}
+            namespace = None
+            if config_true_value(str(request.get('artifact_only', 'false'))):
+                namespace = request.get('artifact_namespace')
+            else:
+                namespace = request.get('version') or build.get('version')
+            if namespace in (None, ''):
+                unknown_namespaces.append(str(build.get('id', '')))
+                continue
+            namespaces.setdefault(str(namespace), [])
+            namespaces[str(namespace)].append(str(build.get('id', '')))
+        return namespaces, unknown_namespaces, unknown_states
+
+    def _artifact_files(self, warnings):
+        root = self.ring_artifact_dir
+        if not root:
+            warnings.append({
+                'type': 'missing_artifact_dir',
+                'error': 'ring_artifact_dir is required',
+            })
+            return []
+
+        def onerror(err):
+            path = getattr(err, 'filename', None)
+            warning_type = 'artifact_scan_failed'
+            if err.errno == errno.ENOENT and path is not None:
+                if os.path.realpath(path) == os.path.realpath(root):
+                    warning_type = 'missing_artifact_dir'
+            warning = {
+                'type': warning_type,
+                'error': str(err),
+            }
+            if path:
+                relpath = self._artifact_relpath(path)
+                warning['path'] = relpath if relpath is not None else path
+            warnings.append(warning)
+        try:
+            names = list(os.walk(root, onerror=onerror))
+        except OSError as err:
+            if err.errno == errno.ENOENT:
+                return []
+            raise
+        files = []
+        for directory, _dirs, filenames in names:
+            for filename in sorted(filenames):
+                path = os.path.join(directory, filename)
+                relpath = self._artifact_relpath(path)
+                if relpath is None:
+                    continue
+                try:
+                    stat_result = os.stat(path)
+                except OSError as err:
+                    warnings.append({
+                        'type': 'artifact_stat_failed',
+                        'path': relpath,
+                        'error': str(err),
+                    })
+                    files.append({
+                        'path': relpath,
+                        'bytes': None,
+                        'mtime': None,
+                    })
+                    continue
+                files.append({
+                    'path': relpath,
+                    'bytes': stat_result.st_size,
+                    'mtime': stat_result.st_mtime,
+                })
+        files.sort(key=lambda item: item['path'])
+        return files
+
+    def _record_artifact_file_reference(self, version, file_info, reasons,
+                                        warnings, owner_type, owner_id,
+                                        reason):
+        relpath = self._artifact_file_relpath(
+            version, file_info, warnings, owner_type, owner_id)
+        if relpath is None:
+            return
+        _add_reason(reasons, relpath, reason)
+
+    def _artifact_cleanup_blockers(self, warnings, active_namespaces,
+                                   active_unknown_namespaces,
+                                   unknown_state_builds):
+        blockers = []
+        for warning in warnings:
+            warning_type = warning.get('type')
+            if warning_type not in CLEANUP_BLOCKING_WARNING_TYPES:
+                continue
+            blocker = copy.deepcopy(warning)
+            blocker['source'] = 'warning'
+            blockers.append(blocker)
+        for namespace, build_ids in sorted(active_namespaces.items()):
+            for build_id in sorted(build_ids):
+                blockers.append({
+                    'type': 'active_build_namespace',
+                    'source': 'active_build',
+                    'namespace': namespace,
+                    'build_id': build_id,
+                })
+        for build_id in active_unknown_namespaces:
+            blockers.append({
+                'type': 'active_build_unknown_namespace',
+                'source': 'active_build',
+                'build_id': build_id,
+            })
+        for build in unknown_state_builds:
+            blockers.append({
+                'type': 'unknown_ring_build_state',
+                'source': 'ring_build',
+                'build_id': build.get('id'),
+                'state': build.get('state'),
+            })
+        return blockers
+
+    def _tombstoned_live_record_warnings(self):
+        warnings = []
+        for version in self._ring_versions(include_tombstoned=True):
+            version_id = self._ring_version_id(version)
+            if self.ring_version_tombstoned(version_id):
+                warnings.append({
+                    'type': 'tombstoned_manifest_record',
+                    'version': version_id,
+                    'action': 'treat_record_as_deleted',
+                })
+        for version in self._all_ring_artifact_versions(
+                include_tombstoned=True):
+            ring_id = version.get('ring_id')
+            if ring_id in (None, ''):
+                continue
+            version_id = self._ring_artifact_version_id(version)
+            if self.ring_artifact_version_tombstoned(ring_id, version_id):
+                warnings.append({
+                    'type': 'tombstoned_ring_artifact_version_record',
+                    'ring_id': str(ring_id),
+                    'version': version_id,
+                    'action': 'treat_record_as_deleted',
+                })
+        return warnings
+
+    def plan_artifact_cleanup(self, retention_age=None, retain_versions=None,
+                              timestamp=None, include_details=True):
+        """
+        Build a dry-run published-state retention graph.
+
+        This only reports protected and candidate manifests, per-ring artifact
+        version records, and artifact files. It does not create tombstones or
+        delete any state.
+        """
+        if retention_age is not None:
+            retention_age = float(retention_age)
+            if not math.isfinite(retention_age) or retention_age < 0:
+                raise ValueError(
+                    'retention_age must be a finite non-negative number')
+        if retain_versions is not None:
+            retain_versions = int(retain_versions)
+            if retain_versions < 0:
+                raise ValueError('retain_versions must be non-negative')
+        timestamp = normal_timestamp_internal(timestamp)
+        now = normal_timestamp_float(timestamp)
+        cutoff = None if retention_age is None else now - retention_age
+        warnings = self._tombstoned_live_record_warnings()
+        versions = self._ring_versions()
+        try:
+            latest_id = self.get_latest_ring_version_id()
+        except RingVersionNotFound:
+            latest_id = None
+        version_ids = set(self._ring_version_id(version)
+                          for version in versions)
+        protected_manifests, candidate_manifests, manifest_reasons = \
+            self._manifest_retention_sets(
+                versions, latest_id, retention_age, retain_versions, cutoff)
+        if (latest_id is None and version_ids) or (
+                latest_id is not None and str(latest_id) not in version_ids):
+            warnings.append({
+                'type': 'missing_latest_ring_version',
+                'version': None if latest_id is None else str(latest_id),
+                'action': 'protected_all_manifests',
+            })
+            for version_id in version_ids:
+                protected_manifests.add(version_id)
+                candidate_manifests.discard(version_id)
+                _add_reason(
+                    manifest_reasons, version_id,
+                    'missing_latest_ring_version_fail_closed')
+
+        protected_records = {}
+        file_reasons = {}
+        for version in versions:
+            version_id = self._ring_version_id(version)
+            if version_id not in protected_manifests:
+                continue
+            for file_info in version.get('files', []):
+                self._record_artifact_file_reference(
+                    version, file_info, file_reasons, warnings,
+                    'manifest', version_id,
+                    'manifest:%s' % version_id)
+            for ring in version.get('rings', []):
+                if not isinstance(ring, dict):
+                    warnings.append({
+                        'type': 'invalid_manifest_ring',
+                        'manifest': version_id,
+                        'ring': copy.deepcopy(ring),
+                    })
+                    continue
+                ring_id = ring.get('ring_id')
+                swift_ring_version = ring.get(
+                    'swift_ring_version', ring.get('version'))
+                if ring_id in (None, '') or swift_ring_version in (None, ''):
+                    warnings.append({
+                        'type': 'invalid_manifest_ring',
+                        'manifest': version_id,
+                        'ring': copy.deepcopy(ring),
+                    })
+                    continue
+                key = (str(ring_id), str(swift_ring_version))
+                _add_reason(
+                    protected_records, key,
+                    'manifest:%s' % version_id)
+
+        rings = self._list_dir_objects('rings')
+        for ring in rings:
+            ring_id = ring.get('id')
+            if ring_id in (None, ''):
+                continue
+            try:
+                version_id = self._latest_ring_artifact_version_id_for_ring(
+                    ring)
+            except RingVersionNotFound:
+                warnings.append({
+                    'type': 'missing_latest_ring_artifact',
+                    'ring_id': str(ring_id),
+                })
+                continue
+            if version_id is None:
+                for key_name in ('latest_swift_ring_version',
+                                 'latest_version'):
+                    if ring.get(key_name) is not None:
+                        warnings.append({
+                            'type': 'missing_latest_ring_artifact',
+                            'ring_id': str(ring_id),
+                            'version': str(ring[key_name]),
+                            'field': key_name,
+                        })
+                        break
+                continue
+            key = (str(ring_id), str(version_id))
+            _add_reason(protected_records, key,
+                        'ring_latest:%s' % ring_id)
+
+        builds = self._list_dir_objects('ring_builds')
+        active_namespaces, active_unknown_namespaces, unknown_state_builds = \
+            self._active_build_artifact_namespaces(builds)
+
+        record_rows = []
+        ring_ids = set(str(ring.get('id')) for ring in rings
+                       if ring.get('id') not in (None, ''))
+        all_records = {}
+        for version in self._all_ring_artifact_versions():
+            ring_id = version.get('ring_id')
+            if ring_id in (None, ''):
+                warnings.append({
+                    'type': 'missing_ring_id',
+                    'version': self._ring_artifact_version_id(version),
+                })
+                continue
+            version_id = self._ring_artifact_version_id(version)
+            key = (str(ring_id), str(version_id))
+            if version.get('_ring_id_mismatch') is not None:
+                warnings.append({
+                    'type': 'ring_artifact_version_ring_id_mismatch',
+                    'ring_id': str(ring_id),
+                    'version': str(version_id),
+                    'record_ring_id': version['_ring_id_mismatch'],
+                })
+            if str(ring_id) not in ring_ids:
+                version.setdefault('_missing_ring_metadata', True)
+            all_records[key] = version
+        for key, reasons in sorted(protected_records.items()):
+            if key not in all_records:
+                ring_id, version_id = key
+                warnings.append({
+                    'type': 'missing_ring_artifact_version',
+                    'ring_id': ring_id,
+                    'version': version_id,
+                    'reasons': reasons,
+                })
+        for key, version in sorted(all_records.items()):
+            ring_id, version_id = key
+            reasons = protected_records.get(key, [])
+            candidate = False
+            if not reasons:
+                for build_id in active_unknown_namespaces:
+                    reason = 'active_build_unknown_namespace:%s' % build_id
+                    if reason not in reasons:
+                        reasons.append(reason)
+                if reasons:
+                    pass
+                elif retention_age is None:
+                    reasons = ['no_retention_policy']
+                else:
+                    version_timestamp = self._timestamp_float(version)
+                    if version_timestamp is None:
+                        reasons = ['missing_timestamp']
+                    elif version_timestamp > cutoff:
+                        reasons = ['recent']
+                    else:
+                        candidate = True
+                        reasons = ['unreferenced', 'older_than_retention']
+            if reasons and not candidate:
+                for file_info in version.get('files', []):
+                    self._record_artifact_file_reference(
+                        version, file_info, file_reasons, warnings,
+                        'ring_artifact_version',
+                        '%s/%s' % (ring_id, version_id),
+                        'ring_artifact_version:%s/%s' % (
+                            ring_id, version_id))
+            record_rows.append({
+                'ring_id': ring_id,
+                'version': version_id,
+                'candidate': candidate,
+                'protected': not candidate,
+                'reasons': reasons,
+                'created_at': version.get('created_at'),
+                'files': len(version.get('files', [])),
+                'missing_ring_metadata': bool(
+                    version.get('_missing_ring_metadata')),
+            })
+
+        artifact_file_rows = []
+        artifact_files = self._artifact_files(warnings)
+        artifact_file_paths = set(item['path'] for item in artifact_files)
+        for relpath, reasons in sorted(file_reasons.items()):
+            if relpath not in artifact_file_paths:
+                warnings.append({
+                    'type': 'missing_artifact_file',
+                    'path': relpath,
+                    'reasons': reasons,
+                })
+        for file_info in artifact_files:
+            relpath = file_info['path']
+            reasons = list(file_reasons.get(relpath, []))
+            for namespace, build_ids in active_namespaces.items():
+                prefix = namespace.rstrip('/') + '/'
+                if relpath == namespace or relpath.startswith(prefix):
+                    for build_id in build_ids:
+                        reason = 'active_build:%s' % build_id
+                        if reason not in reasons:
+                            reasons.append(reason)
+            candidate = False
+            if not reasons:
+                for build_id in active_unknown_namespaces:
+                    reason = 'active_build_unknown_namespace:%s' % build_id
+                    if reason not in reasons:
+                        reasons.append(reason)
+            if not reasons:
+                if retention_age is None:
+                    reasons = ['no_retention_policy']
+                elif file_info.get('mtime') is None:
+                    reasons = ['missing_timestamp']
+                elif file_info['mtime'] > cutoff:
+                    reasons = ['recent']
+                else:
+                    candidate = True
+                    reasons = ['unreferenced', 'older_than_retention']
+            artifact_file_rows.append({
+                'path': relpath,
+                'candidate': candidate,
+                'protected': not candidate,
+                'reasons': reasons,
+                'bytes': file_info.get('bytes'),
+            })
+
+        manifest_rows = []
+        for version in versions:
+            version_id = self._ring_version_id(version)
+            candidate = version_id in candidate_manifests
+            manifest_rows.append({
+                'version': version_id,
+                'candidate': candidate,
+                'protected': not candidate,
+                'reasons': manifest_reasons.get(version_id, []),
+                'created_at': version.get('created_at'),
+                'files': len(version.get('files', [])),
+                'rings': len(version.get('rings', [])),
+                'latest': latest_id is not None and
+                str(version_id) == str(latest_id),
+                'resource_uri': self._ring_version_uri(version),
+            })
+        manifest_rows.sort(key=lambda item: item['version'])
+
+        def count_candidates(rows):
+            return len([item for item in rows if item.get('candidate')])
+
+        candidate_bytes = sum(
+            item.get('bytes') or 0 for item in artifact_file_rows
+            if item.get('candidate'))
+        cleanup_blockers = self._artifact_cleanup_blockers(
+            warnings, active_namespaces, active_unknown_namespaces,
+            unknown_state_builds)
+        plan = {
+            'dry_run': True,
+            'delete_allowed': False,
+            'cleanup_safe': not cleanup_blockers,
+            'cleanup_blockers': cleanup_blockers,
+            'generated_at': timestamp,
+            'retention_age': retention_age,
+            'retain_versions': retain_versions,
+            'latest_ring_version': latest_id,
+            'active_build_namespaces': active_namespaces,
+            'active_builds_with_unknown_namespaces':
+                active_unknown_namespaces,
+            'ring_builds_with_unknown_states': unknown_state_builds,
+            'summary': {
+                'manifests': {
+                    'total': len(manifest_rows),
+                    'protected': len(manifest_rows) -
+                    count_candidates(manifest_rows),
+                    'candidates': count_candidates(manifest_rows),
+                },
+                'ring_artifact_versions': {
+                    'total': len(record_rows),
+                    'protected': len(record_rows) -
+                    count_candidates(record_rows),
+                    'candidates': count_candidates(record_rows),
+                },
+                'artifact_files': {
+                    'total': len(artifact_file_rows),
+                    'protected': len(artifact_file_rows) -
+                    count_candidates(artifact_file_rows),
+                    'candidates': count_candidates(artifact_file_rows),
+                    'candidate_bytes': candidate_bytes,
+                },
+                'warnings': len(warnings),
+            },
+            'warnings': warnings,
+            'requires_tombstones': bool(
+                count_candidates(manifest_rows) or count_candidates(
+                    record_rows)),
+        }
+        if include_details:
+            plan.update({
+                'manifests': manifest_rows,
+                'ring_artifact_versions': record_rows,
+                'artifact_files': artifact_file_rows,
+            })
+        return plan
+
     def _ring_artifact_version_id(self, version):
         return str(version.get(
             'swift_ring_version', version.get('version', version.get('id'))))
@@ -914,7 +1519,7 @@ class RingManagerStore(object):
             return None
         return os.path.join(directory, '%s.json' % self._safe_id(version_id))
 
-    def _ring_artifact_versions(self, ring_id):
+    def _ring_artifact_versions(self, ring_id, include_tombstoned=False):
         directory = self._ring_artifact_versions_dir(ring_id)
         if directory is None:
             return []
@@ -947,14 +1552,71 @@ class RingManagerStore(object):
                 raise ValueError(
                     'ring artifact version %r does not match state path %r' %
                     (version_id, path_id))
+            if (not include_tombstoned and
+                    self.ring_artifact_version_tombstoned(
+                        ring_id, version_id)):
+                continue
             version['_artifact_root'] = directory
             versions.append(version)
+        return versions
+
+    def _all_ring_artifact_versions(self, include_tombstoned=False):
+        root = self._state_dir_path('ring-versions')
+        if root is None:
+            return []
+        try:
+            ring_dirs = sorted(os.listdir(root))
+        except OSError as err:
+            if err.errno == errno.ENOENT:
+                return []
+            raise
+        versions = []
+        for ring_dir in ring_dirs:
+            directory = os.path.join(root, ring_dir)
+            if not os.path.isdir(directory):
+                continue
+            try:
+                names = sorted(os.listdir(directory))
+            except OSError as err:
+                if err.errno == errno.ENOENT:
+                    continue
+                raise
+            for name in names:
+                if not name.endswith('.json'):
+                    continue
+                path = os.path.join(directory, name)
+                version = self._read_json_file(path)
+                if version is None:
+                    continue
+                if not isinstance(version, dict):
+                    raise ValueError('%s must be a JSON object' % path)
+                ring_id = unquote(ring_dir)
+                if (version.get('ring_id') is not None and
+                        str(version.get('ring_id')) != str(ring_id)):
+                    version['_ring_id_mismatch'] = str(version.get('ring_id'))
+                version['ring_id'] = ring_id
+                version_id = validate_artifact_version_id(
+                    self._ring_artifact_version_id(version),
+                    'ring artifact version')
+                path_id = unquote(name[:-5])
+                if version_id != path_id:
+                    raise ValueError(
+                        'ring artifact version %r does not match state path '
+                        '%r' % (version_id, path_id))
+                if (not include_tombstoned and
+                        self.ring_artifact_version_tombstoned(
+                            ring_id, version_id)):
+                    continue
+                version['_artifact_root'] = directory
+                versions.append(version)
         return versions
 
     def _find_ring_artifact_version(self, ring_id, version_id):
         if version_id == 'latest':
             return self._find_latest_ring_artifact_version(ring_id)
         version_id = str(version_id)
+        if self.ring_artifact_version_tombstoned(ring_id, version_id):
+            raise RingVersionNotFound(version_id)
         for version in self._ring_artifact_versions(ring_id):
             if self._ring_artifact_version_id(version) == version_id:
                 return version
@@ -969,6 +1631,19 @@ class RingManagerStore(object):
             if version.get('latest'):
                 return version
         raise RingVersionNotFound('latest')
+
+    def _latest_ring_artifact_version_id_for_ring(self, ring):
+        ring_id = ring.get('id')
+        if ring_id in (None, ''):
+            return None
+        for key in ('latest_swift_ring_version', 'latest_version'):
+            if ring.get(key) is not None:
+                self._find_ring_artifact_version(ring_id, ring[key])
+                return str(ring[key])
+        for version in self._ring_artifact_versions(ring_id):
+            if version.get('latest'):
+                return self._ring_artifact_version_id(version)
+        return None
 
     def list_ring_artifact_versions(self, ring_id):
         self.get_ring(ring_id)
@@ -1013,6 +1688,71 @@ class RingManagerStore(object):
             return False
         return True
 
+    def ring_artifact_version_tombstoned(self, ring_id, version_id):
+        return self._path_exists(
+            self._ring_artifact_version_tombstone_file(ring_id, version_id))
+
+    def ring_artifact_version_reserved(self, ring_id, version_id):
+        return self.ring_artifact_version_exists(
+            ring_id, version_id) or self.ring_artifact_version_tombstoned(
+                ring_id, version_id)
+
+    def create_ring_artifact_version_tombstone(
+            self, ring_id, version_id, timestamp=None,
+            deleted_by='artifact_cleanup', reason='retention_policy'):
+        timestamp = normal_timestamp_internal(timestamp)
+        tombstone = {
+            'schema_version': 1,
+            'type': 'ring_artifact_version',
+            'ring_id': str(ring_id),
+            'version': str(version_id),
+            'deleted_at': timestamp,
+            'deleted_by': deleted_by,
+            'reason': reason,
+        }
+        self._write_json_file(
+            self._ring_artifact_version_tombstone_file(ring_id, version_id),
+            tombstone)
+        return copy.deepcopy(tombstone)
+
+    def _list_ring_artifact_version_tombstones(self):
+        root = self._state_dir_path('tombstones', 'ring-versions')
+        if root is None:
+            return []
+        try:
+            ring_dirs = sorted(os.listdir(root))
+        except OSError as err:
+            if err.errno == errno.ENOENT:
+                return []
+            raise
+        tombstones = []
+        for ring_dir in ring_dirs:
+            directory = os.path.join(root, ring_dir)
+            if not os.path.isdir(directory):
+                continue
+            try:
+                names = sorted(os.listdir(directory))
+            except OSError as err:
+                if err.errno == errno.ENOENT:
+                    continue
+                raise
+            for name in names:
+                if not name.endswith('.json'):
+                    continue
+                path = os.path.join(directory, name)
+                tombstone = self._read_json_file(path)
+                if tombstone is None:
+                    continue
+                if not isinstance(tombstone, dict):
+                    raise ValueError('%s must be a JSON object' % path)
+                tombstone = copy.deepcopy(tombstone)
+                tombstone.setdefault('schema_version', 1)
+                tombstone.setdefault('type', 'ring_artifact_version')
+                tombstone.setdefault('ring_id', unquote(ring_dir))
+                tombstone.setdefault('version', unquote(name[:-5]))
+                tombstones.append(tombstone)
+        return tombstones
+
     def get_ring_artifact_version_file(self, ring_id, version_id, file_name):
         version = self._find_ring_artifact_version(ring_id, version_id)
         for file_info in version.get('files', []):
@@ -1030,6 +1770,8 @@ class RingManagerStore(object):
         version_id = validate_artifact_version_id(
             self._ring_artifact_version_id(version),
             'ring artifact version')
+        if self.ring_artifact_version_tombstoned(ring_id, version_id):
+            raise RingArtifactVersionReserved(ring_id, version_id)
         if self.ring_artifact_version_exists(ring_id, version_id):
             raise ValueError(
                 'ring %s artifact version %s already exists' % (
@@ -1038,7 +1780,7 @@ class RingManagerStore(object):
             self._ring_artifact_version_file(ring_id, version_id), version)
         return self._public_ring_artifact_version(ring_id, version)
 
-    def _ring_versions(self):
+    def _ring_versions(self, include_tombstoned=False):
         releases_dir = self._state_dir_path('releases')
         if releases_dir is None:
             return []
@@ -1074,6 +1816,9 @@ class RingManagerStore(object):
                 raise ValueError(
                     'release version %r does not match state path %r' %
                     (version_id, path_id))
+            if (not include_tombstoned and
+                    self.ring_version_tombstoned(version_id)):
+                continue
             version['_manifest_path'] = manifest_path
             version['_artifact_root'] = artifact_root
             versions.append(version)
@@ -1093,6 +1838,8 @@ class RingManagerStore(object):
 
     def _find_ring_version(self, version_id):
         version_id = str(version_id)
+        if self.ring_version_tombstoned(version_id):
+            raise RingVersionNotFound(version_id)
         for version in self._ring_versions():
             if self._ring_version_id(version) == version_id:
                 return version
@@ -1223,6 +1970,64 @@ class RingManagerStore(object):
             return False
         return True
 
+    def ring_version_tombstoned(self, version_id):
+        return self._path_exists(self._ring_version_tombstone_file(version_id))
+
+    def ring_version_reserved(self, version_id):
+        return self.ring_version_exists(version_id) or \
+            self.ring_version_tombstoned(version_id)
+
+    def create_ring_version_tombstone(
+            self, version_id, timestamp=None, deleted_by='artifact_cleanup',
+            reason='retention_policy'):
+        timestamp = normal_timestamp_internal(timestamp)
+        tombstone = {
+            'schema_version': 1,
+            'type': 'ring_version',
+            'id': str(version_id),
+            'version': str(version_id),
+            'deleted_at': timestamp,
+            'deleted_by': deleted_by,
+            'reason': reason,
+        }
+        self._write_json_file(
+            self._ring_version_tombstone_file(version_id), tombstone)
+        return copy.deepcopy(tombstone)
+
+    def _list_ring_version_tombstones(self):
+        directory = self._state_dir_path('tombstones', 'versions')
+        if directory is None:
+            return []
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError as err:
+            if err.errno == errno.ENOENT:
+                return []
+            raise
+        tombstones = []
+        for name in names:
+            if not name.endswith('.json'):
+                continue
+            path = os.path.join(directory, name)
+            tombstone = self._read_json_file(path)
+            if tombstone is None:
+                continue
+            if not isinstance(tombstone, dict):
+                raise ValueError('%s must be a JSON object' % path)
+            tombstone = copy.deepcopy(tombstone)
+            tombstone.setdefault('schema_version', 1)
+            tombstone.setdefault('type', 'ring_version')
+            tombstone.setdefault('id', unquote(name[:-5]))
+            tombstone.setdefault('version', tombstone['id'])
+            tombstones.append(tombstone)
+        return tombstones
+
+    def list_tombstones(self):
+        return {
+            'versions': self._list_ring_version_tombstones(),
+            'ring_versions': self._list_ring_artifact_version_tombstones(),
+        }
+
     def save_ring_version(self, version):
         version = copy.deepcopy(version)
         version_id = validate_artifact_version_id(
@@ -1231,6 +2036,8 @@ class RingManagerStore(object):
             raise ValueError(
                 'published ring version %s is reserved for an API selector' %
                 version_id)
+        if self.ring_version_tombstoned(version_id):
+            raise RingVersionReserved(version_id)
         if self.ring_version_exists(version_id):
             raise ValueError(
                 'published ring version %s already exists' % version_id)

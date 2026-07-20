@@ -575,6 +575,104 @@ def _format_versions_list(value):
     ))
 
 
+def _cleanup_summary_rows(value):
+    if not isinstance(value, dict):
+        return []
+    summary = value.get('summary') or {}
+    rows = []
+    for name, label in (
+            ('manifests', 'manifests'),
+            ('ring_artifact_versions', 'ring artifact versions'),
+            ('artifact_files', 'artifact files')):
+        item = summary.get(name) or {}
+        row = {
+            'name': label,
+            'total': item.get('total', 0),
+            'protected': item.get('protected', 0),
+            'candidates': item.get('candidates', 0),
+        }
+        if name == 'artifact_files':
+            row['candidate_bytes'] = item.get('candidate_bytes', 0)
+        rows.append(row)
+    return rows
+
+
+def _candidate_rows(value, key):
+    if not isinstance(value, dict):
+        return []
+    return [row for row in value.get(key) or [] if row.get('candidate')]
+
+
+def _format_cleanup_plan(value):
+    if not isinstance(value, dict):
+        return '%s\n' % value
+    lines = [
+        'Dry run: %s' % _format_bool(value.get('dry_run')),
+        'Delete allowed: %s' % _format_bool(value.get('delete_allowed')),
+        'Cleanup safe: %s' % _format_bool(value.get('cleanup_safe')),
+        'Cleanup blockers: %s' % len(value.get('cleanup_blockers') or []),
+        'Generated: %s' % (value.get('generated_at') or ''),
+        'Latest: %s' % (value.get('latest_ring_version') or ''),
+        'Retention age: %s' % _format_seconds(value.get('retention_age')),
+        'Retain versions: %s' % (
+            '' if value.get('retain_versions') is None
+            else value.get('retain_versions')),
+        'Requires tombstones: %s' % _format_bool(
+            value.get('requires_tombstones')),
+        '',
+        _format_table(_cleanup_summary_rows(value), (
+            ('STATE', 'name'),
+            ('TOTAL', 'total'),
+            ('PROTECTED', 'protected'),
+            ('CANDIDATES', 'candidates'),
+            ('CANDIDATE_BYTES', 'candidate_bytes'),
+        )).rstrip(),
+    ]
+    unknown = value.get('active_builds_with_unknown_namespaces') or []
+    if unknown:
+        lines.extend(('', 'Active builds with unknown namespaces: %s' %
+                      _format_list(unknown)))
+    blockers = value.get('cleanup_blockers') or []
+    if blockers:
+        lines.append('')
+        lines.append('Cleanup blockers:')
+        for blocker in blockers:
+            lines.append('  %s' % _table_value(blocker))
+    warnings = value.get('warnings') or []
+    lines.append('')
+    lines.append('Warnings: %d' % len(warnings))
+    for warning in warnings:
+        lines.append('  %s' % _table_value(warning))
+
+    detail_sections = (
+        ('Manifest candidates', 'manifests', (
+            ('VERSION', 'version'),
+            ('CREATED', 'created_at'),
+            ('FILES', 'files'),
+            ('RINGS', 'rings'),
+            ('REASONS', 'reasons'),
+        )),
+        ('Ring artifact version candidates', 'ring_artifact_versions', (
+            ('RING', 'ring_id'),
+            ('VERSION', 'version'),
+            ('CREATED', 'created_at'),
+            ('FILES', 'files'),
+            ('REASONS', 'reasons'),
+        )),
+        ('Artifact file candidates', 'artifact_files', (
+            ('PATH', 'path'),
+            ('BYTES', 'bytes'),
+            ('REASONS', 'reasons'),
+        )),
+    )
+    for title, key, columns in detail_sections:
+        rows = _candidate_rows(value, key)
+        if rows:
+            lines.extend(('', '%s:' % title,
+                          _format_table(rows, columns).rstrip()))
+    return '\n'.join(lines) + '\n'
+
+
 def _format_list(value):
     if not value:
         return 'none'
@@ -1142,6 +1240,34 @@ def _status(client, args):
     return result
 
 
+def _cleanup_plan(client, args):
+    params = []
+    if args.retention_age is not None:
+        if (not math.isfinite(args.retention_age) or
+                args.retention_age < 0):
+            raise RingManagerCLIError(
+                '--retention-age must be a finite non-negative number')
+        params.append(('retention_age', '%g' % args.retention_age))
+    if args.retain_versions is not None:
+        if args.retain_versions < 0:
+            raise RingManagerCLIError(
+                '--retain-versions must be a non-negative integer')
+        params.append(('retain_versions', str(args.retain_versions)))
+    include_details = args.details
+    if include_details is None:
+        include_details = args.json
+    params.append(('details', 'true' if include_details else 'false'))
+    path = '/api/v1/ring_manager/artifact_cleanup/plan/'
+    if params:
+        path = '%s?%s' % (path, urlencode(params))
+    result = client.request('GET', path, admin=True)
+    if args.check and (
+            not isinstance(result, dict) or
+            result.get('cleanup_safe') is not True):
+        args.exit_status = 1
+    return result
+
+
 def _add_ring_payload_args(parser):
     parser.add_argument(
         '--from-file',
@@ -1246,6 +1372,36 @@ def make_parser():
         help='Request promotion readiness checks and exit non-zero unless '
              'the standby is ready to promote.')
     status.set_defaults(func=_status)
+
+    cleanup = subparsers.add_parser(
+        'cleanup', help='Plan ring-manager state cleanup.')
+    cleanup_sub = cleanup.add_subparsers(dest='cleanup_command')
+    cleanup_sub.required = True
+    cleanup_plan = cleanup_sub.add_parser(
+        'plan', help='Dry-run published-state cleanup and report candidates.')
+    cleanup_plan.add_argument(
+        '--retention-age', type=float,
+        help='Consider unreferenced objects older than SECONDS as cleanup '
+             'candidates.')
+    cleanup_plan.add_argument(
+        '--retain-versions', type=int,
+        help='Protect this many newest published cluster manifests in '
+             'addition to the latest pointer.')
+    cleanup_plan.add_argument(
+        '--check', action='store_true',
+        help='Exit non-zero when the cleanup plan reports blockers. Normal '
+             'cleanup plan output remains exploratory and exits zero on a '
+             'successful API call.')
+    cleanup_detail_group = cleanup_plan.add_mutually_exclusive_group()
+    cleanup_detail_group.add_argument(
+        '--details', dest='details', action='store_true', default=None,
+        help='Request detailed cleanup graph data and print candidate rows.')
+    cleanup_detail_group.add_argument(
+        '--summary', dest='details', action='store_false', default=None,
+        help='Request only policy, warning, and summary counts. This is the '
+             'default unless --json is used.')
+    cleanup_plan.set_defaults(
+        func=_cleanup_plan, formatter=_format_cleanup_plan)
 
     rings = subparsers.add_parser(
         'rings', help='Manage logical Swift ring metadata.')

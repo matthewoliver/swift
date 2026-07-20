@@ -26,8 +26,9 @@ from swift.ring_manager.builder import RingBuilderManager, \
 from swift.ring_manager.common import NormalTimestamp, \
     RING_API_READONLY_FIELDS, normal_timestamp, resolve_artifact_path, \
     validate_artifact_version_id, validate_path_component
-from swift.ring_manager.store import RingAlreadyExists, RingNotFound, \
-    RingVersionFileNotFound
+from swift.ring_manager.store import RingAlreadyExists, \
+    RingArtifactVersionReserved, RingNotFound, RingVersionFileNotFound, \
+    RingVersionReserved
 
 
 class RingImporterError(RingBuilderManagerError):
@@ -540,10 +541,15 @@ class RingImporter(object):
     def _preflight(self, specs, publish_version, force):
         if publish_version is not None:
             publish_version = validate_artifact_version_id(publish_version)
-        if (publish_version is not None and
-                self.store.ring_version_exists(publish_version)):
-            raise RingImporterError(
-                'published ring version %s already exists' % publish_version)
+        if publish_version is not None:
+            if self.store.ring_version_tombstoned(publish_version):
+                raise RingImporterError(
+                    'published ring version %s is reserved by tombstone' %
+                    publish_version)
+            if self.store.ring_version_exists(publish_version):
+                raise RingImporterError(
+                    'published ring version %s already exists' %
+                    publish_version)
         seen_ring_ids = set()
         for spec in specs:
             ring_id = spec['metadata']['id']
@@ -552,6 +558,12 @@ class RingImporter(object):
                     'ring %s appears more than once in import request' %
                     ring_id)
             seen_ring_ids.add(ring_id)
+            if (spec.get('source_ring_path') is not None and
+                    self.store.ring_artifact_version_tombstoned(
+                        ring_id, spec['builder'].version)):
+                raise RingImporterError(
+                    'ring %s artifact version %s is reserved by tombstone' %
+                    (ring_id, spec['builder'].version))
             try:
                 ring = self.store.get_ring(ring_id)
             except RingNotFound:
@@ -663,8 +675,11 @@ class RingImporter(object):
                         'files': [file_info],
                     }
                     if not reused_artifact:
-                        self.store.save_ring_artifact_version(
-                            ring_id, ring_version)
+                        try:
+                            self.store.save_ring_artifact_version(
+                                ring_id, ring_version)
+                        except RingArtifactVersionReserved as err:
+                            raise RingImporterError(str(err))
                     self.store.update_ring(ring_id, {
                         'latest_swift_ring_version': swift_ring_version,
                         'device_count': spec['device_count'],
@@ -699,7 +714,10 @@ class RingImporter(object):
                 'files': manifest_files,
                 'import_results': import_results,
             }
-            self.store.save_ring_version(manifest)
+            try:
+                self.store.save_ring_version(manifest)
+            except RingVersionReserved as err:
+                raise RingImporterError(str(err))
             if set_latest:
                 self.store.set_latest_ring_version(publish_version)
             public_manifest = self.store.get_ring_version_manifest(

@@ -1076,3 +1076,54 @@ nodes:
             'node_ips': ['10.0.0.1'],
             'risk_count': 2,
         }, json.loads(opener.requests[0]['body'].decode('ascii')))
+
+    def test_cleanup_plan_uses_admin_credentials_and_check_verdict(self):
+        body = {
+            'dry_run': True,
+            'delete_allowed': False,
+            'cleanup_safe': False,
+            'cleanup_blockers': [{'type': 'missing_artifact_file'}],
+            'summary': {
+                'manifests': {'total': 1, 'protected': 1, 'candidates': 0},
+                'ring_artifact_versions': {
+                    'total': 1, 'protected': 1, 'candidates': 0},
+                'artifact_files': {
+                    'total': 1, 'protected': 1, 'candidates': 0,
+                    'candidate_bytes': 0},
+                'warnings': 1,
+            },
+            'warnings': [{'type': 'missing_artifact_file'}],
+            'requires_tombstones': False,
+        }
+        opener = FakeOpener({
+            ('GET', '/api/v1/ring_manager/artifact_cleanup/plan/'):
+            json_response(body),
+        })
+
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--admin-key', 'secret', '--read-key', 'reader',
+            'cleanup', 'plan', '--check',
+        ], opener)
+
+        self.assertEqual(1, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('details=false', opener.requests[0]['query'])
+        self.assertEqual(
+            'secret',
+            opener.requests[0]['headers']['x-ring-manager-admin-key'])
+        self.assertNotIn('x-ring-manager-read-key',
+                         opener.requests[0]['headers'])
+        self.assertIn('Cleanup safe: no', stdout)
+
+    def test_cleanup_plan_rejects_invalid_policy_arguments(self):
+        for argv, message in (
+                (['--retention-age', 'nan'], 'finite non-negative number'),
+                (['--retain-versions', '-1'], 'non-negative integer')):
+            status, stdout, stderr = self._run([
+                '--url', 'http://primary.example.com:6205',
+                'cleanup', 'plan',
+            ] + argv, FakeOpener({}))
+            self.assertEqual(1, status)
+            self.assertEqual('', stdout)
+            self.assertIn(message, stderr)

@@ -17,6 +17,9 @@ from swift.ring_manager.common import load_secret_from_conf, stats_increment
 
 
 READ_METHODS = ('GET', 'HEAD')
+ADMIN_READ_PATHS = (
+    '/api/v1/ring_manager/artifact_cleanup/plan',
+)
 
 
 class RingManagerAuthMiddleware(object):
@@ -70,7 +73,8 @@ class RingManagerAuthMiddleware(object):
         path = req.path.rstrip('/')
         return (
             path.endswith('/builder') or
-            path.endswith('/builder/file'))
+            path.endswith('/builder/file') or
+            path in ADMIN_READ_PATHS)
 
     def _authorized(self, req):
         if self._admin_authorized(req):

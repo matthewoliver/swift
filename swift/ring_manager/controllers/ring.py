@@ -34,7 +34,7 @@ from swift.ring_manager.importer import RingImporter, RingImporterError, \
     RingImportConflict
 from swift.ring_manager.publisher import RingBuilderPublisherError
 from swift.ring_manager.common import NormalTimestamp, \
-    RING_API_READONLY_FIELDS, stats_increment
+    RING_API_READONLY_FIELDS, stats_increment, validate_artifact_version_id
 from swift.ring_manager.routing import Route
 from swift.ring_manager.store import RingAlreadyExists, RingBuildNotFound, \
     RingBuildPublishedVersionConflict, RingBuildStateConflict, \
@@ -813,6 +813,16 @@ class RingController(object):
         return self._collection_response(req, versions)
 
     def _validate_release_build_request(self, payload):
+        version = payload.get('version')
+        if version is not None:
+            version = validate_artifact_version_id(version)
+            if self._store.ring_version_tombstoned(version):
+                raise RingBuilderPublisherError(
+                    'published ring version %s is reserved by tombstone' %
+                    version)
+            if self._store.ring_version_exists(version):
+                raise RingBuilderPublisherError(
+                    'published ring version %s already exists' % version)
         ring_ids = payload.get('rings')
         if ring_ids is None:
             return
@@ -836,11 +846,18 @@ class RingController(object):
             if ring_id in (None, ''):
                 raise RingBuilderPublisherError(
                     'artifact-only builds require ring_id')
-            self._store.get_ring(ring_id)
+            ring = self._store.get_ring(ring_id)
             if payload.get('version') is not None:
                 raise RingBuilderPublisherError(
                     'artifact-only builds do not accept version; the Swift '
                     'builder version identifies the resulting ring artifact')
+            _builder_path, builder = self._builder_manager.load_builder(ring)
+            if (not self._publisher._builder_needs_rebalance(builder) and
+                    self._store.ring_artifact_version_tombstoned(
+                        ring_id, builder.version)):
+                raise RingBuilderPublisherError(
+                    'ring %s artifact version %s is reserved by tombstone' % (
+                        ring_id, builder.version))
             return
         self._validate_release_build_request(payload)
 

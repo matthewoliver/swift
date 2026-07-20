@@ -170,6 +170,10 @@ class RingManagerApplication(object):
             routing.Route(r'^/api/v1/?$', ('GET',), self.api_root),
             routing.Route(r'^/api/v1/ring_manager/status/?$',
                           ('GET',), self.ring_manager_status),
+            routing.Route(r'^/api/v1/ring_manager/artifact_cleanup/plan/?$',
+                          ('GET',), self.artifact_cleanup_plan),
+            routing.Route(r'^/api/v1/ring_manager/tombstones/?$',
+                          ('GET',), self.ring_manager_tombstones),
             routing.Route(r'^/api/v1/ring_manager/sync/trigger/?$',
                           ('POST',), self.ring_manager_sync_trigger,
                           read_only_methods=('POST',)),
@@ -256,6 +260,9 @@ class RingManagerApplication(object):
     def _api_links(self):
         return {
             'status': '/api/v1/ring_manager/status/',
+            'artifact_cleanup_plan':
+                '/api/v1/ring_manager/artifact_cleanup/plan/',
+            'tombstones': '/api/v1/ring_manager/tombstones/',
             'sync_trigger': '/api/v1/ring_manager/sync/trigger/',
             'rings': '/api/v1/rings/',
             'rings_import': '/api/v1/rings/import/',
@@ -830,6 +837,47 @@ class RingManagerApplication(object):
             body['ring_manager_sync'], body.get('promotion_readiness'))
         self._emit_operator_attention_metrics(body['operator_attention'])
         return http.json_response(req, body)
+
+    def _query_non_negative_float(self, req, name):
+        value = req.params.get(name)
+        if value in (None, ''):
+            return None
+        try:
+            return non_negative_float(value)
+        except ValueError:
+            raise ValueError('%s must be a non-negative number' % name)
+
+    def _query_non_negative_int(self, req, name):
+        value = req.params.get(name)
+        if value in (None, ''):
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise ValueError('%s must be a non-negative integer' % name)
+        if value < 0:
+            raise ValueError('%s must be a non-negative integer' % name)
+        return value
+
+    def _timestamp_internal(self, timestamp=None):
+        if timestamp is None:
+            return NormalTimestamp.now().internal
+        return NormalTimestamp(timestamp).internal
+
+    def artifact_cleanup_plan(self, req):
+        retention_age = self._query_non_negative_float(req, 'retention_age')
+        retain_versions = self._query_non_negative_int(
+            req, 'retain_versions')
+        include_details = config_true_value(req.params.get('details', 'true'))
+        plan = self.store.plan_artifact_cleanup(
+            retention_age=retention_age,
+            retain_versions=retain_versions,
+            timestamp=self._timestamp_internal(),
+            include_details=include_details)
+        return http.json_response(req, plan)
+
+    def ring_manager_tombstones(self, req):
+        return http.json_response(req, self.store.list_tombstones())
 
     def ring_manager_sync_trigger(self, req):
         stats_increment(self.logger, 'sync_trigger.requests')

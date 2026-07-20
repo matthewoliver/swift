@@ -58,6 +58,8 @@ Example response::
         "ring_versions": "/api/v1/rings/releases/",
         "rings": "/api/v1/rings/",
         "status": "/api/v1/ring_manager/status/",
+        "artifact_cleanup_plan": "/api/v1/ring_manager/artifact_cleanup/plan/",
+        "tombstones": "/api/v1/ring_manager/tombstones/",
         "sync_trigger": "/api/v1/ring_manager/sync/trigger/"
       },
       "mode": "primary",
@@ -79,6 +81,34 @@ read-only and therefore remains available in these modes.
 The ``POST /api/v1/ring_manager/sync/trigger/`` route is also explicitly
 read-only: it can only request a configured local pull from a replica and
 cannot change published state or promote the server.
+
+Artifact cleanup planning
+=========================
+
+``GET /api/v1/ring_manager/artifact_cleanup/plan/`` returns an admin-only
+dry-run retention graph for release manifests, per-ring artifact-version
+records, and artifact files.
+It never deletes files, writes tombstones, or otherwise mutates state.
+The planner protects the latest release, retained releases, their referenced
+artifacts, each ring's latest artifact version, and namespaces owned by active
+build jobs.
+It reports candidate rows only when an optional ``retention_age`` or
+``retain_versions`` policy permits them.
+
+``cleanup_safe`` is false when incomplete or inconsistent state would make a
+future destructive cleanup unsafe.
+``cleanup_blockers`` identifies conditions such as a missing latest release,
+missing protected references, invalid paths, scan failures, and active jobs.
+The optional ``details=false`` parameter returns just policy, warning, and
+summary data.
+``swift-ring-manager cleanup plan --check`` exits non-zero unless this verdict
+is explicitly safe.
+
+``GET /api/v1/ring_manager/tombstones/`` lists reservation records that stop a
+previously pruned release ID or per-ring artifact version from being reused.
+Tombstones take precedence over stale JSON that later reappears on disk.
+They are synchronized to replicas so standby promotion retains the same
+no-reuse invariant.
 
 Ring resources
 ==============

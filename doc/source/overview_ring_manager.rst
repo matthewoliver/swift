@@ -177,6 +177,19 @@ Builder metadata and builder-file downloads require the administrator credential
 The service verifies that a builder resolves below ``ring_builder_dir`` and streams a private snapshot so an in-progress response is stable across concurrent builder replacement.
 The temporary snapshot is removed when the response closes.
 
+Published-state cleanup is planned through the admin-only dry-run endpoint
+``GET /api/v1/ring_manager/artifact_cleanup/plan/``.
+It reports protected and candidate manifests, artifact-version records, and
+artifact files without deleting state or reserving identifiers.
+The plan fails closed when its reachability graph has missing or uncertain
+state, including active build namespaces.
+The CLI equivalent is ``swift-ring-manager cleanup plan --check``.
+
+Future destructive cleanup must leave a tombstone before removing published
+release or per-ring artifact-version JSON.
+Tombstones reserve those identifiers, take precedence over stale restored JSON,
+and are copied to read-only and standby state by ``swift-ring-manager-sync``.
+
 Publication
 ===========
 

@@ -1026,6 +1026,64 @@ class RingManagerSync(object):
                     '%s.json' % self._safe_id(version['version_id'])),
                 version['body'])
 
+    def _sync_tombstones(self, source_url):
+        body = self._json_request(
+            source_url, '/api/v1/ring_manager/tombstones/')
+        versions = body.get('versions', [])
+        ring_versions = body.get('ring_versions', [])
+        if not isinstance(versions, list):
+            raise RingManagerSyncError('tombstone versions must be a list')
+        if not isinstance(ring_versions, list):
+            raise RingManagerSyncError(
+                'tombstone ring_versions must be a list')
+        tombstones = []
+        for tombstone in versions:
+            if not isinstance(tombstone, dict):
+                raise RingManagerSyncError(
+                    'tombstone versions entries must be objects')
+            version_id = tombstone.get('version', tombstone.get('id'))
+            if version_id in (None, ''):
+                raise RingManagerSyncError(
+                    'tombstone versions entries require version or id')
+            local_tombstone = dict(tombstone)
+            local_tombstone.setdefault('id', str(version_id))
+            local_tombstone.setdefault('version', str(version_id))
+            tombstones.append({
+                'kind': 'version',
+                'version': str(version_id),
+                'body': local_tombstone,
+            })
+        for tombstone in ring_versions:
+            if not isinstance(tombstone, dict):
+                raise RingManagerSyncError(
+                    'tombstone ring_versions entries must be objects')
+            ring_id = tombstone.get('ring_id')
+            version_id = tombstone.get('version')
+            if ring_id in (None, '') or version_id in (None, ''):
+                raise RingManagerSyncError(
+                    'tombstone ring_versions entries require ring_id and '
+                    'version')
+            tombstones.append({
+                'kind': 'ring_version',
+                'ring_id': str(ring_id),
+                'version': str(version_id),
+                'body': dict(tombstone),
+            })
+        return tombstones
+
+    def _stage_tombstones(self, state_writes, tombstones):
+        for tombstone in tombstones:
+            if tombstone['kind'] == 'version':
+                path = self._state_path(
+                    'tombstones', 'versions',
+                    '%s.json' % self._safe_id(tombstone['version']))
+            else:
+                path = self._state_path(
+                    'tombstones', 'ring-versions',
+                    self._safe_id(tombstone['ring_id']),
+                    '%s.json' % self._safe_id(tombstone['version']))
+            self._stage_json_write(state_writes, path, tombstone['body'])
+
     def _index_write(self, source_url, latest_version, desired_version,
                      desired_info, synced_at):
         index_path = self._state_path('index.json')
@@ -1266,6 +1324,7 @@ class RingManagerSync(object):
             _rings, ring_objects = self._sync_rings(source_url)
             builder_stats = self._sync_builder_files(
                 source_url, ring_objects, staged_builders)
+            tombstones = self._sync_tombstones(source_url)
 
             state_writes = []
             rings = self._stage_rings(state_writes, ring_objects)
@@ -1274,6 +1333,7 @@ class RingManagerSync(object):
             if desired is not None and desired is not latest:
                 self._stage_ring_artifact_versions(
                     state_writes, desired['ring_versions'])
+            self._stage_tombstones(state_writes, tombstones)
             self._stage_json_write(
                 state_writes,
                 self._state_path(
@@ -1323,6 +1383,7 @@ class RingManagerSync(object):
             'ring_version_files_unchanged': sum(
                 result['ring_version_files_unchanged']
                 for result in release_results),
+            'tombstones_synced': len(tombstones),
             'builder_files_synced': builder_stats['builder_files_synced'],
             'builder_files_downloaded': builder_stats[
                 'builder_files_downloaded'],
@@ -1417,6 +1478,8 @@ class RingManagerSync(object):
             stats_increment(
                 self.logger, 'sync.ring_version_files.unchanged',
                 result['ring_version_files_unchanged'])
+            stats_increment(self.logger, 'sync.tombstones_synced',
+                            result['tombstones_synced'])
             stats_increment(
                 self.logger, 'sync.builder_files.synced',
                 result['builder_files_synced'])

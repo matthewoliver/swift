@@ -25,8 +25,8 @@ from swift.ring_manager.builder import RingBuilderManager, \
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
     NormalTimestamp, normal_timestamp, stats_increment, stats_timing, \
     validate_artifact_version_id
-from swift.ring_manager.store import RingDesiredVersionConflict, \
-    RingVersionNotFound
+from swift.ring_manager.store import RingArtifactVersionReserved, \
+    RingDesiredVersionConflict, RingVersionNotFound, RingVersionReserved
 
 
 class RingBuilderPublisherError(RingBuilderManagerError):
@@ -308,6 +308,11 @@ class RingBuilderPublisher(object):
             raise RingBuilderPublisherError(
                 'ring %s has no builder devices to build' % ring.get('id'))
         needs_rebalance = self._builder_needs_rebalance(builder)
+        if not needs_rebalance and self.store.ring_artifact_version_tombstoned(
+                ring['id'], builder.version):
+            raise RingBuilderPublisherError(
+                'ring %s artifact version %s is reserved by tombstone' % (
+                    ring['id'], builder.version))
         min_part_seconds_left = builder.min_part_seconds_left
         rebalance_started_at = self._timestamp()
         try:
@@ -341,6 +346,11 @@ class RingBuilderPublisher(object):
                 self.logger, 'builders.parts_changed', changed_parts)
         ring_id = ring['id']
         swift_ring_version = builder.version
+        if self.store.ring_artifact_version_tombstoned(
+                ring_id, swift_ring_version):
+            raise RingBuilderPublisherError(
+                'ring %s artifact version %s is reserved by tombstone' % (
+                    ring_id, swift_ring_version))
         ring_version = {
             'ring_id': ring_id,
             'version': swift_ring_version,
@@ -351,7 +361,10 @@ class RingBuilderPublisher(object):
             'artifact_dir': self.ring_artifact_dir,
             'files': [file_info],
         }
-        self.store.save_ring_artifact_version(ring_id, ring_version)
+        try:
+            self.store.save_ring_artifact_version(ring_id, ring_version)
+        except RingArtifactVersionReserved as err:
+            raise RingBuilderPublisherError(str(err))
         updates = {
             'latest_swift_ring_version': swift_ring_version,
             'device_count': self.builder_manager.active_device_count(builder),
@@ -431,6 +444,10 @@ class RingBuilderPublisher(object):
         publish_version = validate_artifact_version_id(
             payload.get('version') or
             ('release-%s' % self._timestamp_internal()), 'release version')
+        if self.store.ring_version_tombstoned(publish_version):
+            raise RingBuilderPublisherError(
+                'published ring version %s is reserved by tombstone' %
+                publish_version)
         if self.store.ring_version_exists(publish_version):
             raise RingBuilderPublisherError(
                 'published ring version %s already exists' % publish_version)
@@ -508,7 +525,10 @@ class RingBuilderPublisher(object):
             'build_results': build_results,
             'carried_forward': carried_forward,
         }
-        self.store.save_ring_version(manifest)
+        try:
+            self.store.save_ring_version(manifest)
+        except RingVersionReserved as err:
+            raise RingBuilderPublisherError(str(err))
         if set_latest:
             self.store.set_latest_ring_version(publish_version)
         desired_update = None
