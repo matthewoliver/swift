@@ -15,9 +15,11 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
-from swift.ring_manager.common import load_secret, load_secret_from_conf, \
-    read_secret_file, validate_relative_api_url
+from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
+    StateChangeHook, load_secret, load_secret_from_conf, read_secret_file, \
+    validate_relative_api_url
 
 
 class TestRingManagerCommon(unittest.TestCase):
@@ -33,6 +35,26 @@ class TestRingManagerCommon(unittest.TestCase):
             fp.write(body)
         os.chmod(path, 0o600)
         return path
+
+    def test_state_change_hook_zero_timeout_uses_default(self):
+        seen_timeouts = []
+
+        class FakeHookProcess(object):
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                seen_timeouts.append(timeout)
+                return b'', b''
+
+        with mock.patch(
+                'swift.ring_manager.common.subprocess.Popen',
+                return_value=FakeHookProcess()):
+            StateChangeHook(
+                '/bin/true', state_dir=self.testdir,
+                timeout=0).run('write', os.path.join(
+                    self.testdir, 'index.json'))
+
+        self.assertEqual([DEFAULT_STATE_CHANGE_HOOK_TIMEOUT], seen_timeouts)
 
     def test_read_secret_file_strips_one_trailing_newline(self):
         self.assertEqual('secret', read_secret_file(

@@ -83,15 +83,23 @@ class StateChangeHook(object):
     """Best-effort hook for external state history or audit integrations."""
 
     def __init__(self, command=None, state_dir=None, timeout=None,
-                 logger=None):
+                 logger=None, background_runner=None):
         self.command = command
         self.state_dir = os.path.abspath(state_dir) if state_dir else None
-        self.timeout = (DEFAULT_STATE_CHANGE_HOOK_TIMEOUT
-                        if timeout is None else float(timeout))
-        if self.timeout < 0:
+        self.timeout = self._normal_timeout(timeout)
+        self.logger = logger
+        self.background_runner = background_runner
+
+    def _normal_timeout(self, timeout):
+        if timeout is None:
+            return DEFAULT_STATE_CHANGE_HOOK_TIMEOUT
+        timeout = float(timeout)
+        if timeout == 0:
+            return DEFAULT_STATE_CHANGE_HOOK_TIMEOUT
+        if timeout < 0:
             raise ValueError(
                 'ring_manager_state_change_hook_timeout must be non-negative')
-        self.logger = logger
+        return timeout
 
     def _log_warning(self, msg, *args):
         if self.logger:
@@ -107,6 +115,19 @@ class StateChangeHook(object):
             return path
 
     def run(self, action, path):
+        if self.background_runner:
+            try:
+                self.background_runner(self._run, action, path)
+            except Exception as err:
+                stats_increment(self.logger, 'state_change_hook.failures')
+                self._log_warning(
+                    'Unable to queue ring-manager state change hook %r for '
+                    '%s %s: %s', self.command, action, self._relpath(path),
+                    err)
+            return
+        self._run(action, path)
+
+    def _run(self, action, path):
         if not self.command:
             return
         try:
@@ -132,7 +153,7 @@ class StateChangeHook(object):
             proc = subprocess.Popen(
                 argv, cwd=self.state_dir, env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = proc.communicate(timeout=self.timeout or None)
+            stdout, stderr = proc.communicate(timeout=self.timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()

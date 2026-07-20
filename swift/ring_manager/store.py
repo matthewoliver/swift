@@ -141,12 +141,13 @@ class RingManagerStore(object):
 
     def __init__(self, state_dir=None, ring_artifact_dir=None,
                  state_change_hook=None, state_change_hook_timeout=None,
-                 logger=None):
+                 logger=None, state_change_hook_background_runner=None):
         self.state_dir = state_dir
         self.ring_artifact_dir = ring_artifact_dir
         self.state_change_hook = StateChangeHook(
             state_change_hook, state_dir=state_dir,
-            timeout=state_change_hook_timeout, logger=logger)
+            timeout=state_change_hook_timeout, logger=logger,
+            background_runner=state_change_hook_background_runner)
 
     def _safe_id(self, object_id):
         return quote(str(object_id), safe='')

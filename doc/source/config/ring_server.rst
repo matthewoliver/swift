@@ -88,10 +88,19 @@ Server options
     Optional best-effort command to run after each state JSON write or delete.
     The command is split with shell-like quoting and executed without a shell.
     Use a wrapper script for multi-step work.
+    The server queues hook execution in a background worker after the state
+    write completes.
+
+``ring_manager_state_change_hook_queue_size``
+    Maximum number of queued server hook executions.
+    The default is ``1000``.
+    When the queue is full, new best-effort hook work is dropped and recorded
+    as a hook failure; the completed state write is not rolled back.
 
 ``ring_manager_state_change_hook_timeout``
     Seconds to wait for the state-change hook.
-    The default is ``30``; use ``0`` for no timeout.
+    The default is ``30``; use ``0`` for the default timeout.
+    Hooks never wait forever.
 
 ``ring_artifact_dir``
     Root directory for immutable ring artefacts referenced by release manifests.
@@ -216,6 +225,7 @@ State-change hook metrics include::
 
     state_change_hook.successes
     state_change_hook.failures
+    state_change_hook.dropped
     state_change_hook.timeouts
     state_change_hook.timing
 
@@ -300,6 +310,14 @@ record one history::
     ring_manager_state_change_hook = /usr/local/bin/ring-manager-state-history
     ring_manager_state_change_hook_timeout = 30
 
+The server runs configured hooks from a background worker so slow external
+history commands do not delay mutating HTTP responses.
+Its hook queue is bounded by ``ring_manager_state_change_hook_queue_size``.
+When the queue is full, newer best-effort hook work is dropped, logged, and
+counted as a hook failure rather than blocking the completed state write.
+The builder daemon and sync command run their hooks synchronously after their
+local state writes.
+
 .. _ring_manager_sync_options:
 
 ===================
@@ -374,7 +392,8 @@ Command-line options override values from this section.
        writes.
    * - ``state_change_hook_timeout``
      - ``30``
-     - Seconds to wait for ``state_change_hook``. Use ``0`` for no timeout.
+     - Seconds to wait for ``state_change_hook``. Use ``0`` for the default
+       timeout; hooks never wait forever.
 
 Upstream credentials are explicit to ``[ring-manager-sync]``.
 The syncer never borrows credentials from ``[filter:ring-manager-auth]``,

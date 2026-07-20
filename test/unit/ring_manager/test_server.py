@@ -4287,6 +4287,10 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
         os.chmod(hook_path, 0o755)
         return hook_path, log_path
 
+    def _wait_state_change_hooks(self, app):
+        if app.state_change_hook_queue is not None:
+            app.state_change_hook_queue.join()
+
     def test_store_uses_unique_temp_paths_for_same_state_file(self):
         path = os.path.join(self.state_dir, 'index.json')
         fd1, temp_path1 = self.store._temporary_state_file(path)
@@ -4389,6 +4393,128 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
         self.assertEqual(
             1, logger.statsd_client.get_stats_counts()[
                 'state_change_hook.failures'])
+
+    def test_state_change_hook_runs_off_request_path(self):
+        hook_path, log_path = self._make_state_hook()
+        app = RingManagerApplication(
+            {
+                'ring_manager_state_dir': self.state_dir,
+                'ring_artifact_dir': self.testdir,
+                'ring_manager_state_change_hook':
+                    '%s %s' % (hook_path, log_path),
+                'ring_manager_state_change_hook_timeout': '5',
+            },
+            logger=debug_logger())
+        hook_started = Event()
+        hook_blocked = Event()
+
+        def block_hook_worker(func, *args):
+            hook_started.send(True)
+            hook_blocked.wait()
+
+        with mock.patch(
+                'swift.ring_manager.server.tpool.execute',
+                side_effect=block_hook_worker):
+            req = Request.blank(
+                '/api/v1/rings/', method='POST',
+                body=json.dumps({
+                    'id': 'object-8',
+                    'ring_type': 'object',
+                    'storage_policy_index': 8,
+                }).encode('ascii'),
+                headers={'Content-Type': 'application/json'})
+            self.assertEqual(201, req.get_response(app).status_int)
+            for _attempt in range(10):
+                if hook_started.ready():
+                    break
+                sleep(0)
+            self.assertTrue(hook_started.ready())
+            self.assertTrue(os.path.exists(os.path.join(
+                self.state_dir, 'rings', 'object-8.json')))
+            self.assertFalse(os.path.exists(log_path))
+            hook_blocked.send(True)
+            self._wait_state_change_hooks(app)
+
+    def test_state_change_hook_worker_continues_after_error(self):
+        hook_path, log_path = self._make_state_hook()
+        logger = debug_logger()
+        app = RingManagerApplication(
+            {
+                'ring_manager_state_dir': self.state_dir,
+                'ring_artifact_dir': self.testdir,
+                'ring_manager_state_change_hook':
+                    '%s %s' % (hook_path, log_path),
+                'ring_manager_state_change_hook_timeout': '5',
+            },
+            logger=logger)
+        calls = []
+
+        def fail_hook(action, path):
+            raise RuntimeError('boom')
+
+        def record_hook(action, path):
+            calls.append((action, path))
+
+        app._queue_state_change_hook(
+            fail_hook, 'write', os.path.join(self.state_dir, 'first.json'))
+        app._queue_state_change_hook(
+            record_hook, 'write', os.path.join(self.state_dir, 'second.json'))
+        self._wait_state_change_hooks(app)
+
+        self.assertEqual([
+            ('write', os.path.join(self.state_dir, 'second.json')),
+        ], calls)
+        self.assertEqual(
+            1, logger.statsd_client.get_stats_counts()[
+                'state_change_hook.failures'])
+
+    def test_state_change_hook_queue_overflow_drops_hook(self):
+        hook_path, log_path = self._make_state_hook()
+        logger = debug_logger()
+        app = RingManagerApplication(
+            {
+                'ring_manager_state_dir': self.state_dir,
+                'ring_artifact_dir': self.testdir,
+                'ring_manager_state_change_hook':
+                    '%s %s' % (hook_path, log_path),
+                'ring_manager_state_change_hook_timeout': '5',
+                'ring_manager_state_change_hook_queue_size': '1',
+            },
+            logger=logger)
+        hook_started = Event()
+        hook_blocked = Event()
+
+        def block_hook_worker(func, *args):
+            if not hook_started.ready():
+                hook_started.send(True)
+            hook_blocked.wait()
+
+        with mock.patch(
+                'swift.ring_manager.server.tpool.execute',
+                side_effect=block_hook_worker):
+            app._queue_state_change_hook(
+                lambda *args: None, 'write',
+                os.path.join(self.state_dir, 'first.json'))
+            for _attempt in range(10):
+                if hook_started.ready():
+                    break
+                sleep(0)
+            self.assertTrue(hook_started.ready())
+
+            app._queue_state_change_hook(
+                lambda *args: None, 'write',
+                os.path.join(self.state_dir, 'second.json'))
+            app._queue_state_change_hook(
+                lambda *args: None, 'write',
+                os.path.join(self.state_dir, 'third.json'))
+
+            self.assertEqual(1, app.state_change_hook_queue.qsize())
+            stats_counts = logger.statsd_client.get_stats_counts()
+            self.assertEqual(1, stats_counts['state_change_hook.failures'])
+            self.assertEqual(1, stats_counts['state_change_hook.dropped'])
+
+            hook_blocked.send(True)
+            self._wait_state_change_hooks(app)
 
     def test_import_existing_ring_preserves_desired_release(self):
         self._set_up_import_app()

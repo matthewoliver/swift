@@ -35,4 +35,7 @@
 # RING_MANAGER_STATE_ACTION, RING_MANAGER_STATE_DIR,
 # RING_MANAGER_STATE_PATH, and RING_MANAGER_STATE_RELPATH.
 # ring_manager_state_change_hook =
+#
+# Seconds to wait for ring_manager_state_change_hook. Use 0 for the default
+# timeout; hooks never wait forever.
 # ring_manager_state_change_hook_timeout = 30

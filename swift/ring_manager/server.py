@@ -55,6 +55,7 @@ RING_MANAGER_API_VERSION = 'v1'
 RING_MANAGER_API_PREFIX = '/api/%s' % RING_MANAGER_API_VERSION
 DEFAULT_MAX_JSON_REQUEST_BODY_SIZE = 1024 * 1024
 DEFAULT_MAX_PARTITIONS_AT_RISK_SELECTORS = 1000
+DEFAULT_STATE_CHANGE_HOOK_QUEUE_SIZE = 1000
 DEFAULT_SYNC_TRIGGER_QUEUE_SIZE = 1
 RING_MANAGER_MODES = ('primary', 'readonly', 'standby')
 READONLY_RING_MANAGER_MODES = ('readonly', 'standby')
@@ -87,14 +88,30 @@ class RingManagerApplication(object):
             'ring_manager_state_dir', DEFAULT_RING_MANAGER_STATE_DIR)
         ring_artifact_dir = conf.get(
             'ring_artifact_dir', DEFAULT_RING_ARTIFACT_DIR)
+        state_change_hook = conf.get('ring_manager_state_change_hook')
+        self.state_change_hook_queue_size = config_positive_int_value(conf.get(
+            'ring_manager_state_change_hook_queue_size',
+            DEFAULT_STATE_CHANGE_HOOK_QUEUE_SIZE))
+        self.state_change_hook_queue = None
+        self.state_change_hook_worker = None
+        state_change_hook_background_runner = None
+        if state_change_hook and store is None:
+            self.state_change_hook_queue = Queue(
+                maxsize=self.state_change_hook_queue_size)
+            self.state_change_hook_worker = spawn(
+                self._run_state_change_hooks)
+            state_change_hook_background_runner = (
+                self._queue_state_change_hook)
         self.store = store or RingManagerStore(
             state_dir=state_dir,
             ring_artifact_dir=ring_artifact_dir,
-            state_change_hook=conf.get('ring_manager_state_change_hook'),
+            state_change_hook=state_change_hook,
             state_change_hook_timeout=non_negative_float(conf.get(
                 'ring_manager_state_change_hook_timeout',
                 DEFAULT_STATE_CHANGE_HOOK_TIMEOUT)),
-            logger=self.logger)
+            logger=self.logger,
+            state_change_hook_background_runner=(
+                state_change_hook_background_runner))
         self.ring_builder_dir = conf.get(
             'ring_builder_dir', DEFAULT_RING_BUILDER_DIR)
         self.builder_lock_timeout = non_negative_float(conf.get(
@@ -168,6 +185,32 @@ class RingManagerApplication(object):
                 self.max_partitions_at_risk_selectors),
             logger=self.logger)
         self.routes = self._make_routes()
+
+    def _queue_state_change_hook(self, func, *args):
+        try:
+            self.state_change_hook_queue.put_nowait((func, args))
+        except Full:
+            stats_increment(self.logger, 'state_change_hook.failures')
+            stats_increment(self.logger, 'state_change_hook.dropped')
+            action = args[0] if len(args) > 0 else 'unknown'
+            path = args[1] if len(args) > 1 else 'unknown'
+            self.logger.warning(
+                'Dropping ring-manager state change hook for %s %s because '
+                'the hook queue is full', action, path)
+
+    def _run_state_change_hooks(self):
+        while True:
+            func, args = self.state_change_hook_queue.get()
+            try:
+                try:
+                    tpool.execute(func, *args)
+                except Exception:
+                    stats_increment(self.logger, 'state_change_hook.failures')
+                    self.logger.exception(
+                        'Unexpected error running ring-manager state change '
+                        'hook')
+            finally:
+                self.state_change_hook_queue.task_done()
 
     @property
     def writable(self):
