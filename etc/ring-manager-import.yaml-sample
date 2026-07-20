@@ -1,0 +1,19 @@
+# Example import request for enrolling an existing Swift cluster in the
+# ring-manager service without rebalancing or rewriting builders.
+
+version: baseline-2026-05-26
+set_latest: true
+rings:
+  - id: account
+    builder_file: /etc/swift/account.builder
+    ring_file: /etc/swift/account.ring.gz
+  - id: container
+    builder_file: /etc/swift/container.builder
+    ring_file: /etc/swift/container.ring.gz
+  - id: object-0
+    builder_file: /etc/swift/object.builder
+    ring_file: /etc/swift/object.ring.gz
+  - id: object-1
+    builder_file: /etc/swift/object-1.builder
+    ring_file: /etc/swift/object-1.ring.gz
+    policy_type: replication

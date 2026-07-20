@@ -30,8 +30,11 @@ from swift.ring_manager.analysis import RingBuilderAnalysisError, \
     RingBuilderAnalyzer, get_query_list
 from swift.ring_manager.builder import RingBuilderManagerConflict, \
     RingBuilderManagerError
+from swift.ring_manager.importer import RingImporter, RingImporterError, \
+    RingImportConflict
 from swift.ring_manager.publisher import RingBuilderPublisherError
-from swift.ring_manager.common import NormalTimestamp, stats_increment
+from swift.ring_manager.common import NormalTimestamp, \
+    RING_API_READONLY_FIELDS, stats_increment
 from swift.ring_manager.routing import Route
 from swift.ring_manager.store import RingAlreadyExists, RingBuildNotFound, \
     RingBuildPublishedVersionConflict, RingBuildStateConflict, \
@@ -48,7 +51,9 @@ RING_FIELDS = [
     'disabled',
     'ever_pushed',
     'is_composite',
+    'imported_at',
     'last_rebalance_time',
+    'latest_swift_ring_version',
     'min_part_hours',
     'name',
     'num_replicas',
@@ -104,6 +109,8 @@ class RingController(object):
             max_partitions_at_risk_selectors
         self._file_iterable_factory = file_iterable_factory
         self._logger = logger
+        self._importer = RingImporter(
+            store, ring_builder_dir=ring_builder_dir, logger=logger)
 
     def routes(self):
         return [
@@ -111,6 +118,8 @@ class RingController(object):
                   ('GET',), self.ring_schema),
             Route(r'^/api/v1/rings/?$',
                   ('GET', 'POST'), self.ring_list),
+            Route(r'^/api/v1/rings/import/?$',
+                  ('POST',), self.rings_import),
             Route(r'^/api/v1/rings/membership/device/'
                   r'(?P<device_id>[0-9]+)/?$',
                   ('GET',), self.ring_membership_device),
@@ -549,12 +558,7 @@ class RingController(object):
     def ring_schema(self, req):
         fields = dict((name, {
             'nullable': True,
-            'readonly': name in ('id', 'resource_uri', 'ever_pushed',
-                                 'last_rebalance_time', 'builder_version',
-                                 'next_part_power',
-                                 'partition_power_increase_state',
-                                 'allowed_partition_power_actions',
-                                 'device_count', 'devices_url'),
+            'readonly': name == 'id' or name in RING_API_READONLY_FIELDS,
             'type': 'string',
         }) for name in RING_FIELDS)
         return self._json_response(req, {
@@ -591,6 +595,23 @@ class RingController(object):
                 req, self._hydrate_builder_metadata(ring), status=201)
         return self._collection_response(
             req, self._store.list_rings(req.params.get('cluster_id')))
+
+    def rings_import(self, req):
+        try:
+            result = self._importer.import_rings(
+                self._json_request_body(req))
+        except RingAlreadyExists:
+            return self._json_error(req, HTTPConflict, 'Ring already exists')
+        except RingImportConflict as err:
+            return self._json_error(req, HTTPConflict, str(err))
+        except (RingImporterError, RingBuilderManagerError) as err:
+            return self._json_error(req, HTTPBadRequest, str(err))
+        headers = {}
+        if result.get('resource_uri'):
+            headers['Location'] = result['resource_uri']
+        status = 200 if result.get('import_status') == 'unchanged' else 201
+        return self._json_response(req, result, status=status,
+                                   headers=headers)
 
     def ring_detail(self, req, ring_id):
         ring_id = unquote(ring_id)

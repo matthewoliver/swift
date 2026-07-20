@@ -54,6 +54,7 @@ Example response::
         "desired_ring_version_manifest": "/api/v1/rings/releases/desired/manifest/",
         "latest_ring_version": "/api/v1/rings/releases/latest/",
         "ring_builds": "/api/v1/rings/builds/",
+        "rings_import": "/api/v1/rings/import/",
         "ring_versions": "/api/v1/rings/releases/",
         "rings": "/api/v1/rings/",
         "status": "/api/v1/ring_manager/status/",
@@ -137,6 +138,59 @@ The response has status ``201`` and includes the settings loaded back from
 the builder.
 A duplicate identifier returns ``409 Conflict``.
 If builder validation or saving fails, the new JSON resource is removed.
+
+``POST /api/v1/rings/import/``
+--------------------------------
+
+Enrolls existing Swift builder files without rebalancing, saving, or rewriting
+them.
+When supplied with matching ``.ring.gz`` files, the service records immutable
+per-ring artefacts and an imported release manifest.
+The request must provide a complete enabled-ring snapshot for the release.
+
+Each supplied ring file is loaded as ``RingData`` and must match the supplied
+builder's partition power, replicas, version, devices, and assignments.
+The service copies verified bytes below ``ring_artifact_dir/<version>/``.
+It may reuse a previously recorded per-ring artefact only when its metadata
+and stored bytes exactly match the incoming file.
+
+Explicit release identifiers are immutable.
+An exact replay returns ``200 OK`` with ``import_status: unchanged`` without
+rewriting metadata or moving the ``latest`` or ``desired`` pointers.
+A missing, extra, or changed ring file for an existing release returns
+``409 Conflict``.
+Imports also reject a per-ring Swift version older than the latest imported
+version for that ring, even with ``force``.
+Select an older known release through the desired-release API for rollback.
+
+``force`` permits a logical-ring metadata update when an existing import has
+changed, such as after a device-count change.
+It cannot overwrite a release, accept stale artefacts, or bypass validation.
+Imports never change ``desired`` and reject ``set_desired`` or
+``expected_desired``.
+
+For example::
+
+    {
+      "version": "baseline-2026-05-26",
+      "set_latest": true,
+      "rings": [
+        {
+          "id": "account",
+          "builder_file": "/etc/swift/account.builder",
+          "ring_file": "/etc/swift/account.ring.gz"
+        },
+        {
+          "id": "object-0",
+          "builder_file": "/etc/swift/object.builder",
+          "ring_file": "/etc/swift/object.ring.gz"
+        }
+      ]
+    }
+
+The equivalent CLI accepts repeated
+``--ring RING_ID:BUILDER_FILE[:RING_FILE]`` arguments or the
+``etc/ring-manager-import.yaml-sample`` request format.
 
 Immutable release downloads
 ===========================

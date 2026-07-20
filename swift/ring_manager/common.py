@@ -32,6 +32,20 @@ DEFAULT_RING_BUILDER_DIR = DEFAULT_SWIFT_DIR
 DEFAULT_BUILDER_LOCK_TIMEOUT = 600
 DEFAULT_RING_BUILD_EXECUTOR = 'external'
 RING_BUILD_EXECUTORS = ('external', 'manager')
+RING_API_READONLY_FIELDS = frozenset((
+    'resource_uri',
+    'ever_pushed',
+    'imported_at',
+    'last_rebalance_time',
+    'latest_swift_ring_version',
+    'latest_version',
+    'builder_version',
+    'next_part_power',
+    'partition_power_increase_state',
+    'allowed_partition_power_actions',
+    'device_count',
+    'devices_url',
+))
 DEFAULT_RING_BUILD_MANAGER_WORKERS = 1
 DEFAULT_BUILD_JOB_LEASE_TIMEOUT = 3600
 DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD = 300

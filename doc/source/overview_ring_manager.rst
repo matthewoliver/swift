@@ -74,6 +74,12 @@ changes the release pointer or promotes the standby.
 Ring-specific resources are owned by an internal controller.
 This keeps HTTP dispatch and process lifecycle in the WSGI application while
 allowing each ring capability to add its routes and state together.
+The controller can also enrol a complete existing builder and ring-file
+snapshot as an immutable imported release without modifying the builders.
+An import is replay-safe only when the entire enabled ring set and every
+artefact identity match exactly.
+It records a known release but leaves desired-release selection to a separate
+validation and promotion step.
 
 Architecture
 ============

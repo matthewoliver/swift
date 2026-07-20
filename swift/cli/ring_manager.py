@@ -364,6 +364,67 @@ def _ring_payload_from_args(args):
     return payload
 
 
+def _ring_import_defaults(ring_id):
+    defaults = {}
+    if ring_id == 'account':
+        defaults['ring_type'] = 'account'
+    elif ring_id == 'container':
+        defaults['ring_type'] = 'container'
+    elif ring_id in ('object', 'object-0'):
+        defaults['ring_type'] = 'object'
+        defaults['storage_policy_index'] = 0
+        defaults['policy_type'] = 'replication'
+    elif ring_id.startswith('object-'):
+        try:
+            policy_index = int(ring_id.split('-', 1)[1])
+        except ValueError:
+            return defaults
+        defaults['ring_type'] = 'object'
+        defaults['storage_policy_index'] = policy_index
+        defaults['policy_type'] = 'replication'
+    return defaults
+
+
+def _parse_import_ring(value):
+    parts = value.split(':', 2)
+    if len(parts) not in (2, 3):
+        raise RingManagerCLIError(
+            '--ring must use RING_ID:BUILDER_FILE[:RING_FILE]: %s' % value)
+    ring_id, builder_file = parts[0], parts[1]
+    if not ring_id or not builder_file:
+        raise RingManagerCLIError(
+            '--ring requires non-empty RING_ID and BUILDER_FILE: %s' % value)
+    ring = {'id': ring_id, 'builder_file': builder_file}
+    ring.update(_ring_import_defaults(ring_id))
+    if len(parts) == 3 and parts[2]:
+        ring['ring_file'] = parts[2]
+    return ring
+
+
+def _rings_import_payload(args):
+    payload = {}
+    if args.from_file:
+        payload.update(_require_object(
+            load_structured_file(args.from_file), args.from_file))
+    if args.ring:
+        rings = payload.get('rings') or []
+        if not isinstance(rings, list):
+            raise RingManagerCLIError('rings in --from-file must be a list')
+        rings = list(rings)
+        rings.extend(_parse_import_ring(value) for value in args.ring)
+        payload['rings'] = rings
+    if args.version is not None:
+        payload['version'] = args.version
+    if args.force:
+        payload['force'] = True
+    if args.set_latest is not None:
+        payload['set_latest'] = args.set_latest
+    payload.update(_parse_key_values(args.set_values))
+    if not payload.get('rings'):
+        raise RingManagerCLIError('No rings specified for import')
+    return payload
+
+
 def _request_or_dry_run(client, args, method, path, body=None,
                         parse_json=True):
     if args.dry_run and method not in ('GET', 'HEAD'):
@@ -763,6 +824,12 @@ def _rings_delete(client, args):
     return _request_or_dry_run(
         client, args, 'DELETE',
         '/api/v1/rings/%s/' % quote(args.ring_id, safe=''))
+
+
+def _rings_import(client, args):
+    return _request_or_dry_run(
+        client, args, 'POST', '/api/v1/rings/import/',
+        _rings_import_payload(args))
 
 
 def _rings_part_power_action(client, args):
@@ -1232,6 +1299,38 @@ def make_parser():
         help='Required acknowledgement that this deletes a logical ring '
              'metadata record.')
     rings_delete.set_defaults(func=_rings_delete)
+    rings_import = ring_sub.add_parser(
+        'import',
+        help='Enroll existing Swift builders and optional ring.gz files.')
+    rings_import.add_argument(
+        '--from-file',
+        help='Read the import request body from a JSON or YAML object file.')
+    rings_import.add_argument(
+        '--ring', action='append',
+        help='Ring to import as RING_ID:BUILDER_FILE[:RING_FILE]. May be '
+             'repeated.')
+    rings_import.add_argument(
+        '--version',
+        help='Published baseline cluster ring version ID when ring files are '
+             'included. Defaults to a generated import ID.')
+    rings_import.add_argument(
+        '--force', action='store_true',
+        help='Update existing logical ring records when imported metadata '
+             'changes, such as device_count after a device add or remove. '
+             'This cannot overwrite an existing baseline version ID.')
+    latest_group = rings_import.add_mutually_exclusive_group()
+    latest_group.add_argument(
+        '--set-latest', dest='set_latest', action='store_true',
+        default=None,
+        help='Set the imported baseline manifest as latest.')
+    latest_group.add_argument(
+        '--no-latest', dest='set_latest', action='store_false',
+        default=None,
+        help='Create the imported baseline manifest without updating latest.')
+    rings_import.add_argument(
+        '--set', dest='set_values', action='append', default=[],
+        help='Set an arbitrary top-level JSON field as KEY=VALUE.')
+    rings_import.set_defaults(func=_rings_import)
     rings_build = ring_sub.add_parser(
         'build',
         help='Build an artifact for one logical ring without a release.')

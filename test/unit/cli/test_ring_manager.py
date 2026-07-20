@@ -587,6 +587,74 @@ nodes:
         self.assertEqual('', stderr)
         self.assertEqual('DELETE', opener.requests[0]['method'])
 
+    def test_rings_import_posts_import_request(self):
+        def import_rings(request):
+            payload = json.loads(request['body'].decode('ascii'))
+            self.assertEqual({
+                'version': 'baseline-1',
+                'set_latest': True,
+                'rings': [
+                    {
+                        'id': 'account',
+                        'ring_type': 'account',
+                        'builder_file': '/etc/swift/account.builder',
+                        'ring_file': '/etc/swift/account.ring.gz',
+                    },
+                    {
+                        'id': 'object-1',
+                        'ring_type': 'object',
+                        'storage_policy_index': 1,
+                        'policy_type': 'replication',
+                        'builder_file': '/etc/swift/object-1.builder',
+                        'ring_file': '/etc/swift/object-1.ring.gz',
+                    },
+                ],
+            }, payload)
+            return json_response({
+                'version': payload['version'],
+                'state': 'imported',
+            })
+
+        opener = FakeOpener({
+            ('POST', '/api/v1/rings/import/'): import_rings,
+        })
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            'rings', 'import',
+            '--version', 'baseline-1',
+            '--set-latest',
+            '--ring', 'account:/etc/swift/account.builder:'
+            '/etc/swift/account.ring.gz',
+            '--ring', 'object-1:/etc/swift/object-1.builder:'
+            '/etc/swift/object-1.ring.gz',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual('baseline-1', json.loads(stdout)['version'])
+
+    def test_rings_import_metadata_only_dry_run(self):
+        opener = FakeOpener({})
+        status, stdout, stderr = self._run([
+            '--url', 'http://primary.example.com:6205',
+            '--dry-run',
+            'rings', 'import',
+            '--ring', 'object-2:/etc/swift/object-2.builder',
+        ], opener)
+        self.assertEqual(0, status)
+        self.assertEqual('', stderr)
+        self.assertEqual([], opener.requests)
+        body = json.loads(stdout)
+        self.assertEqual('POST', body['method'])
+        self.assertEqual('/api/v1/rings/import/', body['path'])
+        self.assertEqual([{
+            'id': 'object-2',
+            'ring_type': 'object',
+            'storage_policy_index': 2,
+            'policy_type': 'replication',
+            'builder_file': '/etc/swift/object-2.builder',
+        }], body['body']['rings'])
+        self.assertNotIn('set_latest', body['body'])
+
     def test_part_power_action_uses_existing_endpoint(self):
         opener = FakeOpener({
             ('POST', '/api/v1/rings/object-0/partition_power_increase/'

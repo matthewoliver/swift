@@ -140,6 +140,11 @@ class TestRingManagerApplication(unittest.TestCase):
         builder.rebalance(seed=1)
         builder.save(path)
 
+    def _write_ring_file(self, builder_path, ring_path):
+        RingBuilder.load(builder_path).get_ring().save(ring_path)
+        with open(ring_path, 'rb') as fp:
+            return fp.read()
+
     def _make_large_device_id_builder(self, path, device_id=70000):
         builder = RingBuilder(4, 3, 1)
         for index, dev_id in enumerate((device_id, 1, 2)):
@@ -314,6 +319,8 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual('/api/v1/ring_manager/sync/trigger/',
                          body['links']['sync_trigger'])
         self.assertEqual('/api/v1/rings/', body['links']['rings'])
+        self.assertEqual('/api/v1/rings/import/',
+                         body['links']['rings_import'])
         self.assertEqual('/api/v1/rings/builds/',
                          body['links']['ring_builds'])
         self.assertEqual('/api/v1/rings/releases/',
@@ -1285,6 +1292,7 @@ class TestRingManagerApplication(unittest.TestCase):
              ('POST',), 'ring_manager_sync_trigger'),
             ('^/api/v1/rings/schema/?$', ('GET',), 'ring_schema'),
             ('^/api/v1/rings/?$', ('GET', 'POST'), 'ring_list'),
+            ('^/api/v1/rings/import/?$', ('POST',), 'rings_import'),
             ('^/api/v1/rings/membership/device/'
              '(?P<device_id>[0-9]+)/?$', ('GET',),
              'ring_membership_device'),
@@ -2514,6 +2522,7 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(['get', 'post'], body['allowed_list_http_methods'])
         for field in ('id', 'name', 'cluster', 'policy_type',
                       'storage_policy_index', 'resource_uri',
+                      'imported_at', 'latest_swift_ring_version',
                       'next_part_power',
                       'partition_power_increase_state',
                       'allowed_partition_power_actions'):
@@ -2521,6 +2530,7 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertEqual(
             True,
             body['fields']['partition_power_increase_state']['readonly'])
+        self.assertEqual(True, body['fields']['imported_at']['readonly'])
 
     def test_ring_list(self):
         resp, body = self.get_json('/api/v1/rings/')
@@ -3861,8 +3871,66 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
         os.makedirs(self.state_dir)
         self.store = RingManagerStore(self.state_dir)
 
+    def _set_up_import_app(self):
+        self.artifact_dir = os.path.join(self.testdir, 'artifacts')
+        os.makedirs(self.artifact_dir)
+        self.latest_version = 'existing-release'
+        self.app = RingManagerApplication({
+            'ring_manager_state_dir': self.state_dir,
+            'ring_artifact_dir': self.artifact_dir,
+            'ring_builder_dir': self.testdir,
+        }, logger=debug_logger())
+        self.store = self.app.store
+
     def tearDown(self):
         shutil.rmtree(self.testdir)
+
+    def _make_builder(self, path):
+        builder = RingBuilder(4, 3, 1)
+        for index in range(3):
+            builder.add_dev({
+                'id': index,
+                'region': 1,
+                'zone': index,
+                'ip': '10.0.1.%d' % index,
+                'port': 6000,
+                'device': 'sd%d' % index,
+                'replication_ip': '10.0.1.%d' % index,
+                'replication_port': 6003,
+                'weight': 100,
+            })
+        builder.rebalance(seed=1)
+        builder.save(path)
+
+    def _write_ring_file(self, builder_path, ring_path):
+        RingBuilder.load(builder_path).get_ring().save(ring_path)
+        with open(ring_path, 'rb') as fp:
+            return fp.read()
+
+    def _read_json(self, relpath):
+        with open(os.path.join(self.state_dir, relpath), 'r') as fp:
+            return json.load(fp)
+
+    def get_json(self, path, method='GET'):
+        req = Request.blank(path, method=method)
+        resp = req.get_response(self.app)
+        try:
+            body = json.loads(resp.body.decode('ascii'))
+        except ValueError:
+            body = None
+        return resp, body
+
+    def json_request(self, path, method, body):
+        req = Request.blank(
+            path, method=method,
+            body=json.dumps(body).encode('ascii'),
+            headers={'Content-Type': 'application/json'})
+        resp = req.get_response(self.app)
+        try:
+            body = json.loads(resp.body.decode('ascii'))
+        except ValueError:
+            body = None
+        return resp, body
 
     def _make_state_hook(self, fail=False):
         hook_path = os.path.join(self.testdir, 'state-hook')
@@ -3980,6 +4048,195 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
         self.assertEqual(
             1, logger.statsd_client.get_stats_counts()[
                 'state_change_hook.failures'])
+
+    def test_import_existing_ring_preserves_desired_release(self):
+        self._set_up_import_app()
+        self.app.store.save_ring_version({
+            'version': self.latest_version,
+            'state': 'approved',
+            'files': [],
+        })
+        self.app.store.set_latest_ring_version(self.latest_version)
+        self.app.store.set_desired_ring_version(
+            self.latest_version, None, timestamp='1779783600.00000')
+        builder_path = os.path.join(self.testdir, 'object-1.builder')
+        ring_path = os.path.join(self.testdir, 'object-1.ring.gz')
+        self._make_builder(builder_path)
+        ring_body = self._write_ring_file(builder_path, ring_path)
+        builder_version = RingBuilder.load(builder_path).version
+
+        resp, body = self.json_request('/api/v1/rings/import/', 'POST', {
+            'version': 'baseline-1',
+            'set_latest': True,
+            'rings': [{
+                'id': 'object-1',
+                'builder_file': builder_path,
+                'ring_file': ring_path,
+            }],
+        })
+
+        self.assertEqual(201, resp.status_int)
+        self.assertEqual('created', body['import_status'])
+        self.assertEqual('baseline-1', body['version'])
+        self.assertTrue(body['latest'])
+        self.assertFalse(body['desired'])
+        self.assertEqual([
+            {'ring_id': 'object-1',
+             'swift_ring_version': builder_version},
+        ], body['rings'])
+        self.assertEqual(
+            self.latest_version, self.app.store.get_desired_ring_version_id())
+        with open(os.path.join(
+                self.artifact_dir, 'baseline-1', 'object-1.ring.gz'),
+                'rb') as fp:
+            self.assertEqual(ring_body, fp.read())
+
+        resp, ring = self.get_json('/api/v1/rings/object-1/')
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('object', ring['ring_type'])
+        self.assertEqual(1, ring['storage_policy_index'])
+        self.assertEqual(builder_version, ring['latest_swift_ring_version'])
+
+    def test_import_replay_is_unchanged_and_complete(self):
+        self._set_up_import_app()
+        builders = []
+        for policy_index in (1, 2):
+            ring_id = 'object-%d' % policy_index
+            builder_path = os.path.join(self.testdir, '%s.builder' % ring_id)
+            ring_path = os.path.join(self.testdir, '%s.ring.gz' % ring_id)
+            self._make_builder(builder_path)
+            self._write_ring_file(builder_path, ring_path)
+            builders.append({
+                'id': ring_id,
+                'builder_file': builder_path,
+                'ring_file': ring_path,
+            })
+        payload = {
+            'version': 'baseline-complete',
+            'set_latest': False,
+            'rings': builders,
+        }
+        resp, first = self.json_request('/api/v1/rings/import/', 'POST',
+                                        payload)
+        self.assertEqual(201, resp.status_int)
+        manifest_path = os.path.join(
+            self.state_dir, 'releases', 'baseline-complete', 'manifest.json')
+        with open(manifest_path, 'rb') as fp:
+            manifest_before = fp.read()
+
+        self.app.store.set_desired_ring_version(
+            'baseline-complete', None, timestamp='1779783600.00000')
+        replay = dict(payload, rings=list(reversed(builders)))
+        resp, body = self.json_request('/api/v1/rings/import/', 'POST',
+                                       replay)
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual('unchanged', body['import_status'])
+        self.assertEqual(first['created_at'], body['created_at'])
+        self.assertTrue(body['desired'])
+        with open(manifest_path, 'rb') as fp:
+            self.assertEqual(manifest_before, fp.read())
+
+        resp, body = self.json_request('/api/v1/rings/import/', 'POST', {
+            'version': 'baseline-complete',
+            'set_latest': False,
+            'rings': builders[:1],
+        })
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('different import artifacts', body['error'])
+
+    def test_import_reuses_verified_ring_artifact(self):
+        self._set_up_import_app()
+        builder_path = os.path.join(self.testdir, 'object-1.builder')
+        ring_path = os.path.join(self.testdir, 'object-1.ring.gz')
+        self._make_builder(builder_path)
+        self._write_ring_file(builder_path, ring_path)
+        payload = {
+            'set_latest': False,
+            'rings': [{
+                'id': 'object-1',
+                'builder_file': builder_path,
+                'ring_file': ring_path,
+            }],
+        }
+        resp, _body = self.json_request('/api/v1/rings/import/', 'POST',
+                                        dict(payload, version='baseline-one'))
+        self.assertEqual(201, resp.status_int)
+        artifact_path = os.path.join(
+            self.artifact_dir, 'baseline-one', 'object-1.ring.gz')
+        before = os.stat(artifact_path)
+
+        resp, body = self.json_request('/api/v1/rings/import/', 'POST',
+                                       dict(payload, version='baseline-two',
+                                            force=True))
+        self.assertEqual(201, resp.status_int)
+        self.assertEqual('created', body['import_status'])
+        self.assertFalse(os.path.exists(os.path.join(
+            self.artifact_dir, 'baseline-two', 'object-1.ring.gz')))
+        self.assertEqual(before.st_ino, os.stat(artifact_path).st_ino)
+
+        manifest = self._read_json(
+            'releases/baseline-two/manifest.json')
+        self.assertEqual('baseline-one/object-1.ring.gz',
+                         manifest['files'][0]['path'])
+
+    def test_import_rejects_stale_artifact_and_desired_update(self):
+        self._set_up_import_app()
+        builder_path = os.path.join(self.testdir, 'object-1.builder')
+        ring_path = os.path.join(self.testdir, 'object-1.ring.gz')
+        self._make_builder(builder_path)
+        self._write_ring_file(builder_path, ring_path)
+        first_version = RingBuilder.load(builder_path).version
+        payload = {
+            'version': 'baseline-old',
+            'set_latest': False,
+            'rings': [{
+                'id': 'object-1',
+                'builder_file': builder_path,
+                'ring_file': ring_path,
+            }],
+        }
+        resp, _body = self.json_request('/api/v1/rings/import/', 'POST',
+                                        payload)
+        self.assertEqual(201, resp.status_int)
+
+        builder = RingBuilder.load(builder_path)
+        builder.set_dev_weight(0, builder.devs[0]['weight'] / 2)
+        builder.save(builder_path)
+        self._write_ring_file(builder_path, ring_path)
+        new_version = RingBuilder.load(builder_path).version
+        resp, _body = self.json_request('/api/v1/rings/import/', 'POST', {
+            'version': 'baseline-new',
+            'force': True,
+            'set_latest': False,
+            'rings': payload['rings'],
+        })
+        self.assertEqual(201, resp.status_int)
+
+        builder = RingBuilder.load(builder_path)
+        builder.version = first_version
+        builder.save(builder_path)
+        self._write_ring_file(builder_path, ring_path)
+        resp, body = self.json_request('/api/v1/rings/import/', 'POST', {
+            'version': 'baseline-stale',
+            'force': True,
+            'set_latest': False,
+            'rings': payload['rings'],
+        })
+        self.assertEqual(409, resp.status_int)
+        self.assertIn('older than latest artifact version', body['error'])
+        self.assertIn('through desired for rollback', body['error'])
+        self.assertFalse(self.app.store.ring_version_exists('baseline-stale'))
+        self.assertGreater(new_version, first_version)
+
+        resp, body = self.json_request('/api/v1/rings/import/', 'POST', {
+            'rings': [{
+                'id': 'object-2',
+                'builder_file': builder_path,
+            }],
+            'set_desired': True,
+        })
+        self.assertEqual(400, resp.status_int)
+        self.assertIn('cannot set the desired release', body['error'])
 
     def test_server_and_builder_configure_state_change_hook(self):
         hook_path, log_path = self._make_state_hook()

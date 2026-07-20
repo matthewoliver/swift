@@ -258,6 +258,7 @@ class RingManagerApplication(object):
             'status': '/api/v1/ring_manager/status/',
             'sync_trigger': '/api/v1/ring_manager/sync/trigger/',
             'rings': '/api/v1/rings/',
+            'rings_import': '/api/v1/rings/import/',
             'ring_builds': '/api/v1/rings/builds/',
             'ring_versions': '/api/v1/rings/releases/',
             'latest_ring_version': '/api/v1/rings/releases/latest/',

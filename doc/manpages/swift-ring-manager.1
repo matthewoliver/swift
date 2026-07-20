@@ -114,6 +114,16 @@ With \fB\-\-replace\fR, use PUT instead of PATCH.
 Delete a logical Swift ring metadata record.
 The explicit confirmation prevents an accidental destructive invocation.
 .TP
+\fBrings import\fR [\fB\-\-from-file\fR \fIFILE\fR] [\fB\-\-version\fR \fIVERSION\fR] [\fB\-\-set-latest\fR|\fB\-\-no-latest\fR] [\fB\-\-force\fR] [\fB\-\-ring\fR \fIRING_ID:BUILDER_FILE[:RING_FILE]\fR]
+Enroll existing Swift builders and optional ring.gz artefacts without
+rebalancing or rewriting builders.
+When ring files are supplied, the service creates an immutable imported
+baseline release.
+Use \fB\-\-force\fR only when an existing logical ring's metadata changed,
+such as device_count after a device add or removal.
+Force cannot overwrite a release, accept stale artefacts, or bypass
+validation.
+.TP
 \fBrings part-power\fR \fIprepare|increase|cancel|finish\fR \fIRING_ID\fR
 Run one step in an object-ring partition-power-increase lifecycle.
 Publishing and relinking remain separate operator actions.
@@ -238,6 +248,16 @@ swift-ring-manager --url http://ring.example.com:6205 \\
   rings create --type object --policy-index 0 \\
   --policy-type replication --part-power 18 --replicas 3 \\
   --min-part-hours 1 --builder-file object.builder
+.fi
+.TP
+Import an existing baseline without selecting it as desired:
+.IP
+.nf
+swift-ring-manager --url http://ring.example.com:6205 \\
+  rings import --version baseline-2026-05-26 --set-latest \\
+  --ring account:/etc/swift/account.builder:/etc/swift/account.ring.gz \\
+  --ring container:/etc/swift/container.builder:/etc/swift/container.ring.gz \\
+  --ring object-0:/etc/swift/object.builder:/etc/swift/object.ring.gz
 .fi
 .TP
 Add a device using ring-builder shorthand:
