@@ -37,7 +37,8 @@ from swift.common.wsgi import run_wsgi
 from swift.ring_manager.builder import DEFAULT_MAX_EXPLICIT_DEVICE_ID, \
     RingBuilderManager, RingBuilderManagerError
 from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
-    DEFAULT_BUILD_JOB_LEASE_TIMEOUT, DEFAULT_RING_ARTIFACT_DIR, \
+    DEFAULT_ARTIFACT_HOOK_TIMEOUT, DEFAULT_BUILD_JOB_LEASE_TIMEOUT, \
+    DEFAULT_RING_ARTIFACT_DIR, \
     DEFAULT_RING_BUILD_EXECUTOR, DEFAULT_RING_BUILD_MANAGER_WORKERS, \
     DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
     DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD, \
@@ -116,6 +117,10 @@ class RingManagerApplication(object):
             'ring_builder_dir', DEFAULT_RING_BUILDER_DIR)
         self.builder_lock_timeout = non_negative_float(conf.get(
             'builder_lock_timeout', DEFAULT_BUILDER_LOCK_TIMEOUT))
+        self.artifact_hook = conf.get('ring_manager_artifact_hook')
+        self.artifact_hook_timeout = non_negative_float(conf.get(
+            'ring_manager_artifact_hook_timeout',
+            DEFAULT_ARTIFACT_HOOK_TIMEOUT))
         self.max_explicit_device_id = config_positive_int_value(conf.get(
             'max_explicit_device_id', DEFAULT_MAX_EXPLICIT_DEVICE_ID))
         self.max_json_request_body_size = config_positive_int_value(conf.get(
@@ -132,7 +137,8 @@ class RingManagerApplication(object):
             self.store, ring_artifact_dir=ring_artifact_dir,
             builder_manager=self.builder_manager,
             builder_lock_timeout=self.builder_lock_timeout,
-            logger=self.logger)
+            logger=self.logger, artifact_hook=self.artifact_hook,
+            artifact_hook_timeout=self.artifact_hook_timeout)
         self.mode = (conf.get('ring_manager_mode') or 'primary').lower()
         if self.mode not in RING_MANAGER_MODES:
             raise ValueError(

@@ -67,6 +67,20 @@ use = egg:swift#ring_manager
 # timeout; hooks never wait forever.
 # ring_manager_state_change_hook_timeout = 30
 #
+# Optional best-effort command after publishing an immutable artifact
+# namespace. It runs in ring_artifact_dir after local artifact files and
+# metadata are durable. RING_MANAGER_ARTIFACT_EVENT is publish for complete
+# releases and artifact-publish for artifact-only builds, so wrappers can
+# opt in to either event. It also receives RING_MANAGER_ARTIFACT_DIR,
+# RING_MANAGER_ARTIFACT_NAMESPACE, RING_MANAGER_ARTIFACT_PATH,
+# RING_MANAGER_ARTIFACT_RELPATH, RING_MANAGER_ARTIFACT_RELEASE,
+# RING_MANAGER_ARTIFACT_RING_ID, and RING_MANAGER_ARTIFACT_VERSION.
+# ring_manager_artifact_hook =
+#
+# Seconds to wait for ring_manager_artifact_hook. Use 0 for the default
+# timeout; hooks never wait forever.
+# ring_manager_artifact_hook_timeout = 30
+#
 # Root directory for relative immutable ring artefact paths referenced by
 # release manifests. Local paths are never exposed by the API.
 # ring_artifact_dir = /etc/swift/ring-manager-artifacts

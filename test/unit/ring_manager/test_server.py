@@ -1869,6 +1869,99 @@ class TestRingManagerApplication(unittest.TestCase):
             self.latest_version,
             self.app.store.get_desired_ring_version_id())
 
+    def test_publish_runs_artifact_hook_after_state_is_visible(self):
+        self._disable_initial_rings()
+        self._make_publishable_object_ring('object-0', 0)
+
+        def assert_published(event, namespace, **kwargs):
+            self.assertEqual('publish', event)
+            self.assertEqual('release-artifact-hook', namespace)
+            self.assertEqual('release-artifact-hook', kwargs['release'])
+            self.assertTrue(self.app.store.ring_version_exists(namespace))
+            self.assertEqual(
+                namespace, self.app.store.get_latest_ring_version_id())
+            self.assertEqual(
+                namespace, self.app.store.get_desired_ring_version_id())
+
+        hook_run = mock.Mock(side_effect=assert_published)
+        self.app.publisher.artifact_hook.run = hook_run
+
+        result = self.app.publisher.publish({
+            'version': 'release-artifact-hook',
+            'rings': ['object-0'],
+        })
+
+        self.assertTrue(self.app.store.ring_version_exists(
+            'release-artifact-hook'))
+        self.assertEqual(
+            'release-artifact-hook',
+            self.app.store.get_latest_ring_version_id())
+        self.assertEqual(
+            'release-artifact-hook',
+            self.app.store.get_desired_ring_version_id())
+        self.assertEqual('release-artifact-hook', result['version'])
+        hook_run.assert_called_once_with(
+            'publish', 'release-artifact-hook',
+            release='release-artifact-hook')
+
+    def test_artifact_publish_runs_artifact_hook_after_state_is_visible(self):
+        self._disable_initial_rings()
+        self._make_publishable_object_ring('object-0', 0)
+
+        def assert_published(event, namespace, **kwargs):
+            self.assertEqual('artifact-publish', event)
+            self.assertTrue(namespace.startswith('artifact-object-0-'))
+            self.assertEqual('object-0', kwargs['ring_id'])
+            self.assertTrue(self.app.store.ring_artifact_version_exists(
+                'object-0', kwargs['version']))
+
+        hook_run = mock.Mock(side_effect=assert_published)
+        self.app.publisher.artifact_hook.run = hook_run
+
+        result = self.app.publisher.publish_artifact({
+            'ring_id': 'object-0',
+        })
+
+        self.assertTrue(self.app.store.ring_artifact_version_exists(
+            'object-0', result['swift_ring_version']))
+        hook_run.assert_called_once_with(
+            'artifact-publish', mock.ANY, ring_id='object-0',
+            version=result['swift_ring_version'])
+        self.assertTrue(hook_run.call_args[0][1].startswith(
+            'artifact-object-0-'))
+
+    def test_artifact_hook_failure_keeps_release_published(self):
+        self._disable_initial_rings()
+        self._make_publishable_object_ring('object-0', 0)
+
+        class FailingHookProcess(object):
+            returncode = 3
+
+            def communicate(self, timeout=None):
+                return b'', b'failed to copy artifact'
+
+        self.app.publisher.artifact_hook.command = '/bin/false'
+        with mock.patch(
+                'swift.ring_manager.common.subprocess.Popen',
+                return_value=FailingHookProcess()):
+            result = self.app.publisher.publish({
+                'version': 'release-artifact-hook-failure',
+                'rings': ['object-0'],
+            })
+
+        self.assertEqual('release-artifact-hook-failure', result['version'])
+        self.assertTrue(self.app.store.ring_version_exists(
+            'release-artifact-hook-failure'))
+        self.assertEqual(
+            'release-artifact-hook-failure',
+            self.app.store.get_latest_ring_version_id())
+        self.assertEqual(
+            'release-artifact-hook-failure',
+            self.app.store.get_desired_ring_version_id())
+        self.assertEqual(
+            1, self.logger.statsd_client.get_stats_counts()[
+                'artifact_hook.failures'])
+
     def test_publish_desired_conflict_keeps_known_release(self):
         self._disable_initial_rings()
         self._make_publishable_object_ring('object-0', 0)
@@ -4714,6 +4807,8 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
             'ring_builder_dir': self.testdir,
             'ring_manager_state_change_hook': command,
             'ring_manager_state_change_hook_timeout': '5',
+            'ring_manager_artifact_hook': command,
+            'ring_manager_artifact_hook_timeout': '5',
         }
 
         app = RingManagerApplication(conf, logger=debug_logger())
@@ -4723,6 +4818,10 @@ class TestRingManagerStateDirApplication(unittest.TestCase):
         self.assertEqual(5, app.store.state_change_hook.timeout)
         self.assertEqual(command, builder.store.state_change_hook.command)
         self.assertEqual(5, builder.store.state_change_hook.timeout)
+        self.assertEqual(command, app.publisher.artifact_hook.command)
+        self.assertEqual(5, app.publisher.artifact_hook.timeout)
+        self.assertEqual(command, builder.publisher.artifact_hook.command)
+        self.assertEqual(5, builder.publisher.artifact_hook.timeout)
 
 
 class TestRingManagerAuthMiddleware(unittest.TestCase):

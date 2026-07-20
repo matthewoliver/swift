@@ -22,9 +22,9 @@ from swift.common.ring.ring import DEFAULT_RING_FORMAT_VERSION, RING_CODECS
 from swift.common.utils import config_true_value, lock_file, md5, mkdirs
 from swift.ring_manager.builder import RingBuilderManager, \
     RingBuilderManagerError, save_builder_durable
-from swift.ring_manager.common import DEFAULT_BUILDER_LOCK_TIMEOUT, \
-    NormalTimestamp, normal_timestamp, stats_increment, stats_timing, \
-    validate_artifact_version_id
+from swift.ring_manager.common import ArtifactLifecycleHook, \
+    DEFAULT_BUILDER_LOCK_TIMEOUT, NormalTimestamp, normal_timestamp, \
+    stats_increment, stats_timing, validate_artifact_version_id
 from swift.ring_manager.store import RingArtifactVersionReserved, \
     RingDesiredVersionConflict, RingVersionNotFound, RingVersionReserved
 
@@ -47,7 +47,8 @@ class RingBuilderPublisher(object):
     def __init__(self, store, ring_builder_dir=None, ring_artifact_dir=None,
                  builder_manager=None,
                  builder_lock_timeout=DEFAULT_BUILDER_LOCK_TIMEOUT,
-                 logger=None, time_func=NormalTimestamp.now):
+                 logger=None, time_func=NormalTimestamp.now,
+                 artifact_hook=None, artifact_hook_timeout=None):
         self.store = store
         self.ring_artifact_dir = ring_artifact_dir or store.ring_artifact_dir
         self.builder_lock_timeout = builder_lock_timeout
@@ -55,6 +56,9 @@ class RingBuilderPublisher(object):
         self.time_func = time_func
         self.builder_manager = builder_manager or RingBuilderManager(
             ring_builder_dir, builder_lock_timeout=builder_lock_timeout)
+        self.artifact_hook = ArtifactLifecycleHook(
+            artifact_hook, artifact_dir=self.ring_artifact_dir,
+            timeout=artifact_hook_timeout, logger=logger)
 
     def _timestamp(self, timestamp=None):
         timestamp = self.time_func() if timestamp is None else timestamp
@@ -427,8 +431,12 @@ class RingBuilderPublisher(object):
         result = self._build_ring(
             ring, artifact_namespace, created_at, seed=seed,
             format_version=format_version)
-        return self.store.get_ring_artifact_version(
+        artifact_version = self.store.get_ring_artifact_version(
             ring_id, result['swift_ring_version'])
+        self.artifact_hook.run(
+            'artifact-publish', artifact_namespace, ring_id=ring_id,
+            version=result['swift_ring_version'])
+        return artifact_version
 
     def publish(self, payload):
         payload = dict(payload or {})
@@ -562,6 +570,8 @@ class RingBuilderPublisher(object):
                 stats_increment(
                     self.logger, 'ring_releases.desired.%s' %
                     desired_update['status'])
+        self.artifact_hook.run(
+            'publish', publish_version, release=publish_version)
         public_manifest = self.store.get_ring_version_manifest(
             publish_version)
         if desired_update is not None:

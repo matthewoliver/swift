@@ -50,6 +50,7 @@ DEFAULT_RING_BUILD_MANAGER_WORKERS = 1
 DEFAULT_BUILD_JOB_LEASE_TIMEOUT = 3600
 DEFAULT_RING_MANAGER_SYNC_FRESHNESS_THRESHOLD = 300
 DEFAULT_STATE_CHANGE_HOOK_TIMEOUT = 30
+DEFAULT_ARTIFACT_HOOK_TIMEOUT = 30
 RESERVED_ARTIFACT_VERSION_IDS = frozenset(('desired', 'latest'))
 RING_MANAGER_SYNC_JOURNAL = '.ring-manager-sync-transaction.json'
 
@@ -185,6 +186,108 @@ class StateChangeHook(object):
         stats_increment(self.logger, 'state_change_hook.successes')
         stats_timing_since(self.logger, 'state_change_hook.timing',
                            started_at)
+
+
+class ArtifactLifecycleHook(object):
+    """Best-effort hook for external immutable artifact publication."""
+
+    def __init__(self, command=None, artifact_dir=None, timeout=None,
+                 logger=None):
+        self.command = command
+        self.artifact_dir = (
+            os.path.abspath(artifact_dir) if artifact_dir else None)
+        self.timeout = self._normal_timeout(timeout)
+        self.logger = logger
+
+    def _normal_timeout(self, timeout):
+        if timeout is None:
+            return DEFAULT_ARTIFACT_HOOK_TIMEOUT
+        timeout = float(timeout)
+        if timeout == 0:
+            return DEFAULT_ARTIFACT_HOOK_TIMEOUT
+        if timeout < 0:
+            raise ValueError(
+                'ring_manager_artifact_hook_timeout must be non-negative')
+        return timeout
+
+    def _log_warning(self, msg, *args):
+        if self.logger:
+            self.logger.warning(msg, *args)
+
+    def run(self, event, namespace, release=None, ring_id=None,
+            version=None):
+        if not self.command:
+            return
+        if not self.artifact_dir:
+            stats_increment(self.logger, 'artifact_hook.failures')
+            self._log_warning(
+                'Unable to run ring-manager artifact hook %r without '
+                'ring_artifact_dir', self.command)
+            return
+        try:
+            argv = shlex.split(self.command)
+        except ValueError as err:
+            stats_increment(self.logger, 'artifact_hook.failures')
+            self._log_warning(
+                'Invalid ring-manager artifact hook command %r: %s',
+                self.command, err)
+            return
+        if not argv:
+            stats_increment(self.logger, 'artifact_hook.failures')
+            self._log_warning(
+                'Invalid empty ring-manager artifact hook command %r',
+                self.command)
+            return
+        namespace = str(namespace)
+        path = os.path.abspath(os.path.join(self.artifact_dir, namespace))
+        relpath = os.path.relpath(path, self.artifact_dir)
+        env = os.environ.copy()
+        env.update({
+            'RING_MANAGER_ARTIFACT_EVENT': str(event),
+            'RING_MANAGER_ARTIFACT_DIR': self.artifact_dir or '',
+            'RING_MANAGER_ARTIFACT_NAMESPACE': namespace,
+            'RING_MANAGER_ARTIFACT_PATH': path,
+            'RING_MANAGER_ARTIFACT_RELPATH': relpath,
+            'RING_MANAGER_ARTIFACT_RELEASE': str(release or ''),
+            'RING_MANAGER_ARTIFACT_RING_ID': str(ring_id or ''),
+            'RING_MANAGER_ARTIFACT_VERSION': str(version or ''),
+        })
+        started_at = float(NormalTimestamp.now())
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=self.artifact_dir, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = proc.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            stats_increment(self.logger, 'artifact_hook.timeouts')
+            stats_increment(self.logger, 'artifact_hook.failures')
+            stats_timing_since(
+                self.logger, 'artifact_hook.timing', started_at)
+            self._log_warning(
+                'Ring-manager artifact hook timed out after %s seconds for '
+                '%s %s', self.timeout, event, relpath)
+            return
+        except (OSError, ValueError) as err:
+            stats_increment(self.logger, 'artifact_hook.failures')
+            stats_timing_since(
+                self.logger, 'artifact_hook.timing', started_at)
+            self._log_warning(
+                'Unable to run ring-manager artifact hook %r for %s %s: %s',
+                self.command, event, relpath, err)
+            return
+        if proc.returncode:
+            stats_increment(self.logger, 'artifact_hook.failures')
+            stats_timing_since(
+                self.logger, 'artifact_hook.timing', started_at)
+            output = (stderr or stdout or b'').decode('utf-8', 'replace')
+            self._log_warning(
+                'Ring-manager artifact hook exited %s for %s %s: %s',
+                proc.returncode, event, relpath, output.strip())
+            return
+        stats_increment(self.logger, 'artifact_hook.successes')
+        stats_timing_since(self.logger, 'artifact_hook.timing', started_at)
 
 
 def validate_path_component(value, field_name):

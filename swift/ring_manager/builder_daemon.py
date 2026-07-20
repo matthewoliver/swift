@@ -21,7 +21,8 @@ from swift.common.utils import config_positive_float_value, \
     config_positive_int_value, get_logger, non_negative_float, parse_options
 from swift.ring_manager.builder import RingBuilderManagerError
 from swift.ring_manager.common import DEFAULT_BUILD_JOB_LEASE_TIMEOUT, \
-    DEFAULT_BUILDER_LOCK_TIMEOUT, DEFAULT_RING_ARTIFACT_DIR, \
+    DEFAULT_ARTIFACT_HOOK_TIMEOUT, DEFAULT_BUILDER_LOCK_TIMEOUT, \
+    DEFAULT_RING_ARTIFACT_DIR, \
     DEFAULT_RING_BUILDER_DIR, DEFAULT_RING_MANAGER_STATE_DIR, \
     DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, NormalTimestamp, normal_timestamp, \
     stats_increment, stats_timing
@@ -236,6 +237,10 @@ class RingManagerBuilder(Daemon):
         self.state_change_hook_timeout = non_negative_float(conf.get(
             'ring_manager_state_change_hook_timeout',
             DEFAULT_STATE_CHANGE_HOOK_TIMEOUT))
+        self.artifact_hook = conf.get('ring_manager_artifact_hook')
+        self.artifact_hook_timeout = non_negative_float(conf.get(
+            'ring_manager_artifact_hook_timeout',
+            DEFAULT_ARTIFACT_HOOK_TIMEOUT))
         self.store = RingManagerStore(
             state_dir=self.state_dir,
             ring_artifact_dir=self.ring_artifact_dir,
@@ -246,7 +251,8 @@ class RingManagerBuilder(Daemon):
             self.store, ring_builder_dir=self.ring_builder_dir,
             ring_artifact_dir=self.ring_artifact_dir,
             builder_lock_timeout=self.builder_lock_timeout,
-            logger=self.logger)
+            logger=self.logger, artifact_hook=self.artifact_hook,
+            artifact_hook_timeout=self.artifact_hook_timeout)
         self.worker = RingBuildWorker(
             self.store, self.publisher, logger=self.logger,
             lease_timeout=self.build_job_lease_timeout)

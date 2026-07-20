@@ -17,7 +17,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from swift.ring_manager.common import DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
+from swift.ring_manager.common import ArtifactLifecycleHook, \
+    DEFAULT_ARTIFACT_HOOK_TIMEOUT, DEFAULT_STATE_CHANGE_HOOK_TIMEOUT, \
     StateChangeHook, load_secret, load_secret_from_conf, read_secret_file, \
     validate_relative_api_url
 
@@ -55,6 +56,70 @@ class TestRingManagerCommon(unittest.TestCase):
                     self.testdir, 'index.json'))
 
         self.assertEqual([DEFAULT_STATE_CHANGE_HOOK_TIMEOUT], seen_timeouts)
+
+    def test_artifact_hook_uses_event_environment(self):
+        seen_timeouts = []
+
+        class FakeHookProcess(object):
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                seen_timeouts.append(timeout)
+                return b'', b''
+
+        with mock.patch(
+                'swift.ring_manager.common.subprocess.Popen',
+                return_value=FakeHookProcess()) as mock_popen:
+            ArtifactLifecycleHook(
+                '/bin/true', artifact_dir=self.testdir, timeout=0).run(
+                'artifact-publish', 'artifact-object-0-1',
+                ring_id='object-0', version=7)
+
+        self.assertEqual([DEFAULT_ARTIFACT_HOOK_TIMEOUT], seen_timeouts)
+        _args, kwargs = mock_popen.call_args
+        self.assertEqual(self.testdir, kwargs['cwd'])
+        self.assertEqual({
+            'RING_MANAGER_ARTIFACT_EVENT': 'artifact-publish',
+            'RING_MANAGER_ARTIFACT_DIR': self.testdir,
+            'RING_MANAGER_ARTIFACT_NAMESPACE': 'artifact-object-0-1',
+            'RING_MANAGER_ARTIFACT_PATH': os.path.join(
+                self.testdir, 'artifact-object-0-1'),
+            'RING_MANAGER_ARTIFACT_RELPATH': 'artifact-object-0-1',
+            'RING_MANAGER_ARTIFACT_RELEASE': '',
+            'RING_MANAGER_ARTIFACT_RING_ID': 'object-0',
+            'RING_MANAGER_ARTIFACT_VERSION': '7',
+        }, dict((key, kwargs['env'][key]) for key in (
+            'RING_MANAGER_ARTIFACT_EVENT',
+            'RING_MANAGER_ARTIFACT_DIR',
+            'RING_MANAGER_ARTIFACT_NAMESPACE',
+            'RING_MANAGER_ARTIFACT_PATH',
+            'RING_MANAGER_ARTIFACT_RELPATH',
+            'RING_MANAGER_ARTIFACT_RELEASE',
+            'RING_MANAGER_ARTIFACT_RING_ID',
+            'RING_MANAGER_ARTIFACT_VERSION',
+        )))
+
+    def test_artifact_hook_marks_complete_release(self):
+        class FakeHookProcess(object):
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return b'', b''
+
+        with mock.patch(
+                'swift.ring_manager.common.subprocess.Popen',
+                return_value=FakeHookProcess()) as mock_popen:
+            ArtifactLifecycleHook(
+                '/bin/true', artifact_dir=self.testdir).run(
+                'publish', 'release-1', release='release-1')
+
+        env = mock_popen.call_args[1]['env']
+        self.assertEqual('publish', env['RING_MANAGER_ARTIFACT_EVENT'])
+        self.assertEqual('release-1',
+                         env['RING_MANAGER_ARTIFACT_NAMESPACE'])
+        self.assertEqual('release-1', env['RING_MANAGER_ARTIFACT_RELEASE'])
+        self.assertEqual('', env['RING_MANAGER_ARTIFACT_RING_ID'])
+        self.assertEqual('', env['RING_MANAGER_ARTIFACT_VERSION'])
 
     def test_read_secret_file_strips_one_trailing_newline(self):
         self.assertEqual('secret', read_secret_file(

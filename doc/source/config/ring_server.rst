@@ -102,6 +102,20 @@ Server options
     The default is ``30``; use ``0`` for the default timeout.
     Hooks never wait forever.
 
+``ring_manager_artifact_hook``
+    Optional best-effort command to run after an immutable artifact namespace
+    is published.
+    The command is split with shell-like quoting and executed without a shell.
+    It runs synchronously in the build worker after local artifacts and their
+    metadata are durable.
+    Complete releases use the ``publish`` event and artifact-only builds use
+    ``artifact-publish``, allowing wrappers to select either event.
+
+``ring_manager_artifact_hook_timeout``
+    Seconds to wait for the artifact hook.
+    The default is ``30``; use ``0`` for the default timeout.
+    Hooks never wait forever.
+
 ``ring_artifact_dir``
     Root directory for immutable ring artefacts referenced by release manifests.
     The default is ``/etc/swift/ring-manager-artifacts``.
@@ -229,6 +243,13 @@ State-change hook metrics include::
     state_change_hook.timeouts
     state_change_hook.timing
 
+Artifact hook metrics include::
+
+    artifact_hook.successes
+    artifact_hook.failures
+    artifact_hook.timeouts
+    artifact_hook.timing
+
 Sync-trigger wrapper metrics include::
 
     sync_trigger.requests
@@ -317,6 +338,76 @@ When the queue is full, newer best-effort hook work is dropped, logged, and
 counted as a hook failure rather than blocking the completed state write.
 The builder daemon and sync command run their hooks synchronously after their
 local state writes.
+
+Artifact lifecycle hooks
+========================
+
+Ring-manager can call an operator-defined command after publishing immutable
+artifacts.
+This supports copying or indexing the immutable namespace without making an
+external artifact system part of the publishing transaction.
+It runs once per completed publication, not once per artifact file.
+
+The hook runs synchronously in the build worker after the local artifact files
+and their metadata are durable.
+For a complete release, it runs after the latest and desired pointer decisions
+are complete.
+For an artifact-only build, it runs after the ring artifact version and ring
+metadata are saved.
+The hook is best effort: invalid commands, launch failures, non-zero exits,
+and timeouts are logged and counted, but do not roll back publication, change
+the latest or desired pointer, or trigger an automatic retry.
+
+The command runs with ``ring_artifact_dir`` as its current directory and
+receives:
+
+``RING_MANAGER_ARTIFACT_EVENT``
+    ``publish`` for a complete release or ``artifact-publish`` for an
+    artifact-only build.
+    Wrappers can ignore either value to opt out of that publication type.
+
+``RING_MANAGER_ARTIFACT_DIR``
+    Absolute configured artifact directory.
+
+``RING_MANAGER_ARTIFACT_NAMESPACE``
+    Immutable namespace that was published.
+    This is the release ID for ``publish`` and the generated artifact namespace
+    for ``artifact-publish``.
+
+``RING_MANAGER_ARTIFACT_PATH``
+    Absolute path to the published namespace.
+
+``RING_MANAGER_ARTIFACT_RELPATH``
+    Path to the published namespace relative to the artifact directory.
+
+``RING_MANAGER_ARTIFACT_RELEASE``
+    Complete release ID for ``publish`` or an empty string for
+    ``artifact-publish``.
+
+``RING_MANAGER_ARTIFACT_RING_ID``
+    Ring ID for ``artifact-publish`` or an empty string for ``publish``.
+
+``RING_MANAGER_ARTIFACT_VERSION``
+    Swift builder version for ``artifact-publish`` or an empty string for
+    ``publish``.
+
+For example, a wrapper that copies only complete releases can select the
+event before copying the namespace:
+
+.. code-block:: sh
+
+    #!/bin/sh
+    set -eu
+    test "$RING_MANAGER_ARTIFACT_EVENT" = publish || exit 0
+    rclone copy -- "$RING_MANAGER_ARTIFACT_PATH" remote:rings/
+
+Configure the wrapper for both the server and builder daemon when either can
+run build workers:
+
+.. code-block:: ini
+
+    ring_manager_artifact_hook = /usr/local/bin/publish-ring-artifacts
+    ring_manager_artifact_hook_timeout = 30
 
 .. _ring_manager_sync_options:
 
