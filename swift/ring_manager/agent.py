@@ -78,6 +78,57 @@ class RingManagerAgentInstallError(RingManagerAgentLocalError):
     pass
 
 
+class RingAgentCapability(object):
+    """Run ring work behind the stable ring-manager agent daemon interface.
+
+    Keeping the current modes together gives a future node-local capability a
+    clear lifecycle boundary without changing the ring agent's configuration
+    or its existing failure and reporting behaviour.
+    """
+
+    def __init__(self, agent):
+        self.agent = agent
+
+    def run_once(self, *args, **kwargs):
+        agent = self.agent
+        if agent.mode == 'observe':
+            result = agent.observe_once()
+            agent.logger.info(
+                'Observed %(files_observed)d local ring files: '
+                '%(files_valid)d valid, %(files_invalid)d invalid' % result)
+            return result
+        if agent.mode == 'validate-only':
+            result = agent.validate_once()
+            agent.logger.info(
+                'Validated ring-manager release %(release)s: '
+                '%(files_matching)d matching, %(files_stale)d stale, '
+                '%(files_missing)d missing, %(files_unknown)d unknown, '
+                '%(files_extra)d extra, %(files_error)d errors' % result)
+            return result
+        result = agent.sync_once()
+        agent.logger.info(
+            'Synced desired ring-manager version %(desired_ring_version)s: '
+            '%(files_downloaded)d files downloaded, '
+            '%(files_unchanged)d unchanged' % result)
+        return result
+
+    def run_forever(self, *args, **kwargs):
+        agent = self.agent
+        if agent.jitter:
+            agent.sleep(agent.random_func() * agent.jitter)
+        while True:
+            started_at = agent._timestamp()
+            try:
+                self.run_once(*args, **kwargs)
+            except Exception:
+                agent.logger.exception('Error running ring-manager agent')
+            elapsed = float(agent._timestamp()) - float(started_at)
+            delay = max(0.0, agent.interval - elapsed)
+            if agent.jitter:
+                delay += agent.random_func() * agent.jitter
+            agent.sleep(delay)
+
+
 class RingManagerAgent(Daemon):
     """
     Observe, validate, or enforce published ring state on a storage node.
@@ -158,6 +209,7 @@ class RingManagerAgent(Daemon):
         self.state_file = conf.get('state_file') or os.path.join(
             self.recon_cache_path, DEFAULT_STATE_FILE)
         self.install_journal = os.path.join(self.swift_dir, INSTALL_JOURNAL)
+        self._ring_capability = RingAgentCapability(self)
 
     def _timestamp(self, timestamp=None):
         timestamp = self.time_func() if timestamp is None else timestamp
@@ -1369,41 +1421,10 @@ class RingManagerAgent(Daemon):
             raise
 
     def run_once(self, *args, **kwargs):
-        if self.mode == 'observe':
-            result = self.observe_once()
-            self.logger.info(
-                'Observed %(files_observed)d local ring files: '
-                '%(files_valid)d valid, %(files_invalid)d invalid' % result)
-            return result
-        if self.mode == 'validate-only':
-            result = self.validate_once()
-            self.logger.info(
-                'Validated ring-manager release %(release)s: '
-                '%(files_matching)d matching, %(files_stale)d stale, '
-                '%(files_missing)d missing, %(files_unknown)d unknown, '
-                '%(files_extra)d extra, %(files_error)d errors' % result)
-            return result
-        result = self.sync_once()
-        self.logger.info(
-            'Synced desired ring-manager version %(desired_ring_version)s: '
-            '%(files_downloaded)d files downloaded, '
-            '%(files_unchanged)d unchanged' % result)
-        return result
+        return self._ring_capability.run_once(*args, **kwargs)
 
     def run_forever(self, *args, **kwargs):
-        if self.jitter:
-            self.sleep(self.random_func() * self.jitter)
-        while True:
-            started_at = self._timestamp()
-            try:
-                self.run_once(*args, **kwargs)
-            except Exception:
-                self.logger.exception('Error running ring-manager agent')
-            elapsed = float(self._timestamp()) - float(started_at)
-            delay = max(0.0, self.interval - elapsed)
-            if self.jitter:
-                delay += self.random_func() * self.jitter
-            self.sleep(delay)
+        self._ring_capability.run_forever(*args, **kwargs)
 
 
 def main():

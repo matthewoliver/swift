@@ -237,6 +237,27 @@ class TestRingManagerAgent(unittest.TestCase):
             json_response(manifest)
         return manifest, routes
 
+    def test_agent_composes_one_ring_capability(self):
+        agent = self._agent(FakeOpener(self._routes()))
+
+        self.assertIsInstance(agent._ring_capability,
+                              agent_mod.RingAgentCapability)
+        self.assertIs(agent, agent._ring_capability.agent)
+
+    def test_agent_delegates_daemon_lifecycle_to_ring_capability(self):
+        agent = self._agent(FakeOpener(self._routes()))
+        capability = mock.Mock()
+        capability.run_once.return_value = {'mode': 'enforce'}
+        agent._ring_capability = capability
+
+        self.assertEqual({'mode': 'enforce'},
+                         agent.run_once('ignored', named='value'))
+        capability.run_once.assert_called_once_with('ignored', named='value')
+
+        agent.run_forever('ignored', named='value')
+        capability.run_forever.assert_called_once_with(
+            'ignored', named='value')
+
     def test_sync_once_downloads_rings_state_and_recon(self):
         opener = FakeOpener(self._routes())
         logger = debug_logger()
