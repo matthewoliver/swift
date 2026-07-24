@@ -404,7 +404,7 @@ class TestRingManagerSync(unittest.TestCase):
         self.assertNotIn('resource_uri', ring)
 
         with open(os.path.join(
-                self.state_dir, 'ring-versions', 'account',
+                self.state_dir, 'versions', 'account',
                 '12.json')) as fp:
             ring_version = json.load(fp)
         self.assertNotIn('latest', ring_version)
@@ -550,7 +550,7 @@ class TestRingManagerSync(unittest.TestCase):
         with open(live_manifest, 'w') as fp:
             json.dump({'version': 'release-old'}, fp)
         live_ring_version = os.path.join(
-            self.state_dir, 'ring-versions', 'account', '11.json')
+            self.state_dir, 'versions', 'account', '11.json')
         os.makedirs(os.path.dirname(live_ring_version))
         with open(live_ring_version, 'w') as fp:
             json.dump({'ring_id': 'account', 'version': '11'}, fp)
@@ -586,7 +586,7 @@ class TestRingManagerSync(unittest.TestCase):
                 'release-old.json')) as fp:
             self.assertEqual(self.tombstones['versions'][0], json.load(fp))
         with open(os.path.join(
-                self.state_dir, 'tombstones', 'ring-versions', 'account',
+                self.state_dir, 'tombstones', 'versions', 'account',
                 '11.json')) as fp:
             self.assertEqual(self.tombstones['ring_versions'][0],
                              json.load(fp))
@@ -965,7 +965,7 @@ class TestRingManagerSync(unittest.TestCase):
 
     def test_sync_rolls_back_transaction_on_index_write_failure(self):
         os.makedirs(os.path.join(self.state_dir, 'rings'))
-        os.makedirs(os.path.join(self.state_dir, 'ring-versions', 'account'))
+        os.makedirs(os.path.join(self.state_dir, 'versions', 'account'))
         os.makedirs(os.path.join(self.state_dir, 'releases', 'old-release'))
         old_ring = {
             'id': 'account',
@@ -1020,7 +1020,7 @@ class TestRingManagerSync(unittest.TestCase):
                 'desired_reason': 'keep this selection',
             }, json.load(fp))
         self.assertFalse(os.path.exists(os.path.join(
-            self.state_dir, 'ring-versions', 'account', '12.json')))
+            self.state_dir, 'versions', 'account', '12.json')))
         self.assertFalse(os.path.exists(os.path.join(
             self.state_dir, 'releases', 'release-1', 'manifest.json')))
         with open(local_builder, 'rb') as fp:
@@ -1807,7 +1807,7 @@ sync_lock_timeout = 9
             lines = [line.rstrip('\n') for line in fp]
         self.assertEqual([
             'write|rings/account.json',
-            'write|ring-versions/account/12.json',
+            'write|versions/account/12.json',
             'write|releases/release-1/manifest.json',
             'write|index.json',
         ], lines)

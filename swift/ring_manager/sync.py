@@ -1061,7 +1061,7 @@ class RingManagerSync(object):
             self._stage_json_write(
                 state_writes,
                 self._state_path(
-                    'ring-versions', self._safe_id(version['ring_id']),
+                    'versions', self._safe_id(version['ring_id']),
                     '%s.json' % self._safe_id(version['version_id'])),
                 version['body'])
 
@@ -1118,7 +1118,7 @@ class RingManagerSync(object):
                     '%s.json' % self._safe_id(tombstone['version']))
             else:
                 path = self._state_path(
-                    'tombstones', 'ring-versions',
+                    'tombstones', 'versions',
                     self._safe_id(tombstone['ring_id']),
                     '%s.json' % self._safe_id(tombstone['version']))
             self._stage_json_write(state_writes, path, tombstone['body'])
@@ -1131,7 +1131,7 @@ class RingManagerSync(object):
                     'manifest.json')
             else:
                 path = self._state_path(
-                    'ring-versions', self._safe_id(tombstone['ring_id']),
+                    'versions', self._safe_id(tombstone['ring_id']),
                     '%s.json' % self._safe_id(tombstone['version']))
             self._stage_state_delete(state_writes, path)
 

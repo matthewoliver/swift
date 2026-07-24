@@ -164,7 +164,7 @@ class RingManagerStore(object):
 
     def _ring_artifact_version_tombstone_file(self, ring_id, version_id):
         return self._state_dir_path(
-            'tombstones', 'ring-versions', self._safe_id(ring_id),
+            'tombstones', 'versions', self._safe_id(ring_id),
             '%s.json' % self._safe_id(version_id))
 
     def _read_json_file(self, path, default=None):
@@ -1853,7 +1853,7 @@ class RingManagerStore(object):
 
         This intentionally prunes only served JSON metadata:
         ``releases/<id>/manifest.json`` and
-        ``ring-versions/<ring-id>/<swift-ring-version>.json``. Ring artifact
+        ``versions/<ring-id>/<swift-ring-version>.json``. Ring artifact
         files are left untouched for a later cleanup phase.
         """
         if not self.state_dir:
@@ -2149,7 +2149,7 @@ class RingManagerStore(object):
         return public_version
 
     def _ring_artifact_versions_dir(self, ring_id):
-        return self._state_dir_path('ring-versions', self._safe_id(ring_id))
+        return self._state_dir_path('versions', self._safe_id(ring_id))
 
     def _ring_artifact_version_file(self, ring_id, version_id):
         directory = self._ring_artifact_versions_dir(ring_id)
@@ -2200,7 +2200,7 @@ class RingManagerStore(object):
         return versions
 
     def _all_ring_artifact_versions(self, include_tombstoned=False):
-        root = self._state_dir_path('ring-versions')
+        root = self._state_dir_path('versions')
         if root is None:
             return []
         try:
@@ -2357,7 +2357,7 @@ class RingManagerStore(object):
         return copy.deepcopy(tombstone)
 
     def _list_ring_artifact_version_tombstones(self):
-        root = self._state_dir_path('tombstones', 'ring-versions')
+        root = self._state_dir_path('tombstones', 'versions')
         if root is None:
             return []
         try:

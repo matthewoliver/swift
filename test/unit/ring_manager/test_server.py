@@ -558,7 +558,7 @@ class TestRingManagerApplication(unittest.TestCase):
             'rings': [],
             'files': [],
         })
-        self._write_json('ring-versions/orphan-ring/99.json', {
+        self._write_json('versions/orphan-ring/99.json', {
             'ring_id': 'orphan-ring',
             'swift_ring_version': '99',
             'created_at': '1779780000.00000',
@@ -610,12 +610,12 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(
             self.state_dir, 'tombstones', 'versions', 'old-release.json')))
         self.assertTrue(os.path.exists(os.path.join(
-            self.state_dir, 'tombstones', 'ring-versions', 'orphan-ring',
+            self.state_dir, 'tombstones', 'versions', 'orphan-ring',
             '99.json')))
         self.assertFalse(os.path.exists(os.path.join(
             self.state_dir, 'releases', 'old-release', 'manifest.json')))
         self.assertFalse(os.path.exists(os.path.join(
-            self.state_dir, 'ring-versions', 'orphan-ring', '99.json')))
+            self.state_dir, 'versions', 'orphan-ring', '99.json')))
         self.assertTrue(os.path.exists(old_path))
         self.assertEqual(
             body['summary'],
@@ -661,7 +661,7 @@ class TestRingManagerApplication(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(
             self.state_dir, 'releases', 'old-release', 'manifest.json')))
         self.assertTrue(os.path.exists(os.path.join(
-            self.state_dir, 'ring-versions', 'orphan-ring', '99.json')))
+            self.state_dir, 'versions', 'orphan-ring', '99.json')))
 
     def test_artifact_cleanup_files_delete_after_metadata(self):
         old_path = self._setup_cleanup_candidates()
